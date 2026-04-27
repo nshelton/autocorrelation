@@ -50,4 +50,18 @@ describe("LineRenderer", () => {
     const pos = ((lr.object3d as Line).geometry as BufferGeometry).getAttribute("position");
     expect(pos.getY(0)).toBeCloseTo(0.9);
   });
+
+  it("reallocates the position attribute when the source length changes", () => {
+    let data = new Float32Array([1, 2, 3]);
+    const lr = new LineRenderer({ source: () => data });
+    lr.update();
+    const geom = (lr.object3d as Line).geometry as BufferGeometry;
+    expect(geom.getAttribute("position").count).toBe(3);
+
+    data = new Float32Array([4, 5]);
+    lr.update();
+    expect(geom.getAttribute("position").count).toBe(2);
+    expect(geom.getAttribute("position").getY(0)).toBeCloseTo(4);
+    expect(geom.getAttribute("position").getY(1)).toBeCloseTo(5);
+  });
 });
