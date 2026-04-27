@@ -2,6 +2,7 @@ import { Vector3 } from "three";
 import { createScene } from "./render/Scene";
 import { CameraRig } from "./render/CameraRig";
 import { LineRenderer } from "./render/LineRenderer";
+import { linearLayout, logSpectrumLayout } from "./render/LineLayouts";
 import dspWorkletUrl from "./audio/dsp-worklet?worker&url";
 import dspWasmUrl from "./wasm-pkg/dsp_bg.wasm?url";
 import { createMicSource } from "./audio/AudioSource";
@@ -9,7 +10,8 @@ import { FeatureStore } from "./store/FeatureStore";
 
 export class App {
   private rig!: CameraRig;
-  private line!: LineRenderer;
+  private waveformLine!: LineRenderer;
+  private spectrumLine!: LineRenderer;
   private store = new FeatureStore();
   private last = 0;
 
@@ -28,12 +30,21 @@ export class App {
     await this.rig.goTo("front", { duration: 0 });
 
     this.store.set("waveform", new Float32Array(2048));
+    this.store.set("spectrum", new Float32Array(1024));
 
-    this.line = new LineRenderer({
+    this.waveformLine = new LineRenderer({
       source: () => this.store.get("waveform"),
+      layout: linearLayout(0.6, 0.5),
       color: 0x66ffcc,
     });
-    scene.add(this.line.object3d);
+    scene.add(this.waveformLine.object3d);
+
+    this.spectrumLine = new LineRenderer({
+      source: () => this.store.get("spectrum"),
+      layout: logSpectrumLayout(0.0, 0.5),
+      color: 0xffaa66,
+    });
+    scene.add(this.spectrumLine.object3d);
 
     let toggled = false;
     window.addEventListener("keydown", (e) => {
@@ -53,17 +64,22 @@ export class App {
     source.connect(node);
 
     node.port.onmessage = (e) => {
-      const msg = e.data as { type: string; waveform?: Float32Array };
-      if (msg.type === "features" && msg.waveform) {
-        this.store.set("waveform", msg.waveform);
-      }
+      const msg = e.data as {
+        type: string;
+        waveform?: Float32Array;
+        spectrum?: Float32Array;
+      };
+      if (msg.type !== "features") return;
+      if (msg.waveform) this.store.set("waveform", msg.waveform);
+      if (msg.spectrum) this.store.set("spectrum", msg.spectrum);
     };
 
     const loop = (now: number) => {
       const dt = this.last === 0 ? 0 : (now - this.last) / 1000;
       this.last = now;
       this.rig.update(dt);
-      this.line.update();
+      this.waveformLine.update();
+      this.spectrumLine.update();
       renderer.render(scene, camera);
       requestAnimationFrame(loop);
     };
