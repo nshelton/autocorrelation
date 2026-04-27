@@ -5,6 +5,7 @@ use wasm_bindgen::prelude::*;
 
 const SMOOTHING_ALPHA: f32 = 0.2;
 const DB_FLOOR: f32 = -100.0;
+const RMS_HISTORY_LEN: usize = 256;
 
 #[wasm_bindgen]
 pub struct Dsp {
@@ -14,6 +15,7 @@ pub struct Dsp {
     freq_buffer: Vec<Complex<f32>>,
     spectrum: Vec<f32>,
     hann: Vec<f32>,
+    rms_history: Vec<f32>,
 }
 
 #[wasm_bindgen]
@@ -36,12 +38,22 @@ impl Dsp {
             freq_buffer,
             spectrum,
             hann,
+            rms_history: vec![0.0; RMS_HISTORY_LEN],
         }
     }
 
     pub fn process(&mut self, input: &[f32]) {
         let n = input.len().min(self.waveform.len());
         self.waveform[..n].copy_from_slice(&input[..n]);
+
+        // RMS over the input window
+        let mean_sq: f32 = input.iter().take(n).map(|&x| x * x).sum::<f32>() / n.max(1) as f32;
+        let rms = mean_sq.sqrt();
+
+        // Shift left and append newest at the end (oldest at index 0)
+        self.rms_history.copy_within(1.., 0);
+        let last = self.rms_history.len() - 1;
+        self.rms_history[last] = rms;
 
         // Apply Hann window
         for i in 0..n {
@@ -80,6 +92,10 @@ impl Dsp {
     pub fn spectrum(&self) -> Vec<f32> {
         self.spectrum.clone()
     }
+
+    pub fn rms_history(&self) -> Vec<f32> {
+        self.rms_history.clone()
+    }
 }
 
 #[cfg(test)]
@@ -111,6 +127,41 @@ mod tests {
         for &v in &spec {
             assert!(v < 0.1, "expected silent → near-zero bin, got {}", v);
         }
+    }
+
+    #[test]
+    fn rms_of_unit_amplitude_constant_is_one() {
+        let mut dsp = Dsp::new(8);
+        let constant = vec![1.0_f32; 8];
+        dsp.process(&constant);
+        let h = dsp.rms_history();
+        assert_eq!(h.len(), RMS_HISTORY_LEN);
+        // Newest sample at the end
+        let last = h[h.len() - 1];
+        assert!((last - 1.0).abs() < 1e-6, "got {}", last);
+    }
+
+    #[test]
+    fn rms_of_silence_is_zero() {
+        let mut dsp = Dsp::new(8);
+        dsp.process(&vec![0.0_f32; 8]);
+        let h = dsp.rms_history();
+        assert_eq!(h[h.len() - 1], 0.0);
+    }
+
+    #[test]
+    fn rms_history_shifts_oldest_out() {
+        let mut dsp = Dsp::new(4);
+        // Push three distinct values
+        dsp.process(&[1.0, 1.0, 1.0, 1.0]); // rms = 1
+        dsp.process(&[2.0, 2.0, 2.0, 2.0]); // rms = 2
+        dsp.process(&[0.0, 0.0, 0.0, 0.0]); // rms = 0
+        let h = dsp.rms_history();
+        let n = h.len();
+        // Newest three values are at the end in the order pushed
+        assert_eq!(h[n - 3], 1.0);
+        assert_eq!(h[n - 2], 2.0);
+        assert_eq!(h[n - 1], 0.0);
     }
 
     #[test]

@@ -12,6 +12,7 @@ export class App {
   private rig!: CameraRig;
   private waveformLine!: LineRenderer;
   private spectrumLine!: LineRenderer;
+  private rmsLine!: LineRenderer;
   private store = new FeatureStore();
   private last = 0;
 
@@ -31,6 +32,7 @@ export class App {
 
     this.store.set("waveform", new Float32Array(2048));
     this.store.set("spectrum", new Float32Array(1024));
+    this.store.set("rms", new Float32Array(256));
 
     this.waveformLine = new LineRenderer({
       source: () => this.store.get("waveform"),
@@ -45,6 +47,13 @@ export class App {
       color: 0xffaa66,
     });
     scene.add(this.spectrumLine.object3d);
+
+    this.rmsLine = new LineRenderer({
+      source: () => this.store.get("rms"),
+      layout: linearLayout(-0.6, 0.5),
+      color: 0xffffff,
+    });
+    scene.add(this.rmsLine.object3d);
 
     let toggled = false;
     window.addEventListener("keydown", (e) => {
@@ -68,10 +77,12 @@ export class App {
         type: string;
         waveform?: Float32Array;
         spectrum?: Float32Array;
+        rms?: Float32Array;
       };
       if (msg.type !== "features") return;
       if (msg.waveform) this.store.set("waveform", msg.waveform);
       if (msg.spectrum) this.store.set("spectrum", msg.spectrum);
+      if (msg.rms) this.store.set("rms", msg.rms);
     };
 
     const loop = (now: number) => {
@@ -80,6 +91,7 @@ export class App {
       this.rig.update(dt);
       this.waveformLine.update();
       this.spectrumLine.update();
+      this.rmsLine.update();
       renderer.render(scene, camera);
       requestAnimationFrame(loop);
     };
