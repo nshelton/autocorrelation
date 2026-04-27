@@ -11,6 +11,7 @@ v2 turns the v1 pipeline-proof into something genuinely useful: a real FFT spect
 ## Goals
 
 - Real-time FFT spectrum, log-frequency, smoothed, rendered as a 3D line below the waveform.
+- Rolling RMS history (per-window loudness over the last ~11s) as a third line below the spectrum. Sets up v4's beat-detection autocorrelation cleanly: the buffer is already there, beat detection just adds an autocorrelation pass over it.
 - Tab audio capture as a first-class audio source alongside the mic.
 - FPS counter visible during development and demo use.
 - Take advantage of the existing `LineRenderer` reusability (no new render component).
@@ -36,13 +37,13 @@ The shape from v1 is unchanged:
 
 ```
 Rust/WASM ──► AudioWorklet ──► Three.js (WebGPURenderer)
-   DSP        Real-time      Scene + camera rig + 2× LineRenderer
+   DSP        Real-time      Scene + camera rig + 3× LineRenderer
               orchestration  + FPS overlay
 ```
 
 Three small structural changes:
 
-1. **DSP output is multi-feature.** The Rust `process()` previously emitted a single `Vec<f32>`. It now emits an aggregate that JS can read multiple named features from. The simplest WASM-friendly shape is a struct with two getter methods: `waveform()` and `spectrum()`, each returning a `Vec<f32>`. JS passes the aggregate's keyed buffers into the `FeatureStore` under `"waveform"` and `"spectrum"` keys.
+1. **DSP output is multi-feature.** The Rust `process()` previously emitted a single `Vec<f32>`. It now emits an aggregate that JS can read multiple named features from. The simplest WASM-friendly shape is a struct with three getter methods: `waveform()`, `spectrum()`, and `rms_history()`, each returning a `Vec<f32>`. JS passes the aggregate's keyed buffers into the `FeatureStore` under `"waveform"`, `"spectrum"`, and `"rms"` keys.
 
 2. **`App.start` becomes parameterized.** It takes an `AudioSourceFactory` — a function returning `Promise<AudioSourceBundle>`. `main.ts` wires two buttons, each calling `App.start` with a different factory.
 
@@ -50,7 +51,7 @@ Three small structural changes:
 
 ## Component changes
 
-### `crates/dsp/src/lib.rs` — add FFT and spectrum smoothing
+### `crates/dsp/src/lib.rs` — add FFT, spectrum smoothing, and rolling RMS
 
 - Depend on `realfft = "3"`.
 - The `Dsp` struct gains:
@@ -58,14 +59,20 @@ Three small structural changes:
   - `fft_buffer: Vec<f32>` (sized 2048 for input)
   - `freq_buffer: Vec<Complex<f32>>` (sized 1025 for output)
   - `spectrum: Vec<f32>` (sized 1024 for the magnitude output, post-smoothing)
+  - `rms_history: Vec<f32>` (sized 256 — ~11s of history at ~23 windows/sec)
+  - `hann: Vec<f32>` (sized 2048, pre-computed at construction)
   - `smoothing_alpha: f32` (default 0.2 — i.e. 20% new, 80% history)
 - `process(input)` now:
-  1. Copies input into `fft_buffer` (with optional Hann window for cleaner spectra).
-  2. Runs the FFT in place.
-  3. Computes magnitude in dB, clipped to `[-100, 0]`, normalized to `[0, 1]`.
-  4. Applies exponential smoothing per bin: `spectrum[i] = α·new + (1−α)·spectrum[i]`.
-  5. Returns a `Features` aggregate exposing `waveform()` and `spectrum()`.
+  1. Computes RMS over the input window: `sqrt(mean(input[i]²))`.
+  2. Shifts `rms_history` left by one and appends the new RMS at the end. Implementation: `rms_history.copy_within(1.., 0); rms_history[N-1] = rms;`. With N=256 this is a trivial memmove (~1KB) per window.
+  3. Copies input × Hann into `fft_buffer`.
+  4. Runs the real FFT in place.
+  5. Computes magnitude in dB from bins 1..1024 (DC dropped), clipped to `[-100, 0]`, normalized to `[0, 1]`.
+  6. Applies exponential smoothing per bin: `spectrum[i] = α·new + (1−α)·spectrum[i]`.
+  7. Returns a `Features` aggregate exposing `waveform()`, `spectrum()`, and `rms_history()`.
 - Window function: Hann. Pre-computed once at construction.
+
+**Why shifted Vec instead of circular buffer for `rms_history`:** the buffer is small (256 floats), the cost of shifting is negligible (~6000 float-moves/sec), and the buffer hands directly to JS in temporal order (oldest → newest) without an unroll step. Autocorrelation in v4 will be the textbook formula `Σᵢ buf[i]·buf[i+lag]` rather than the modulo-indexed version. Simpler code, same math.
 
 ### `src/audio/AudioSource.ts` — add tab audio factory
 
@@ -73,30 +80,30 @@ Three small structural changes:
 - Validates that the returned stream has at least one audio track. If not (user picked a video-only window or a tab with no audio), throws a clear error: `"Selected source has no audio. Please pick a tab that's playing audio."`
 - Returns the same `AudioSourceBundle` shape as `createMicSource` so downstream code is identical.
 
-### `src/audio/dsp-worklet.ts` — post both features
+### `src/audio/dsp-worklet.ts` — post all three features
 
 - Reads the `Features` aggregate from `dsp.process(window)`.
-- Posts `{ type: "features", waveform: Float32Array, spectrum: Float32Array }` (single message with both arrays as transferables).
+- Posts `{ type: "features", waveform: Float32Array, spectrum: Float32Array, rms: Float32Array }` (single message with all three arrays as transferables).
 - Slight rename of message type from `"waveform"` to `"features"` to reflect the new content.
 
 ### `src/store/FeatureStore.ts` — no code change
 
-- Already keyed by string. v2 just sets `"waveform"` and `"spectrum"` instead of just `"waveform"`.
+- Already keyed by string. v2 sets three keys: `"waveform"`, `"spectrum"`, and `"rms"`.
 
 ### `src/render/LineRenderer.ts` — no code change
 
-- v2 just instantiates it twice with different `layout` functions.
+- v2 instantiates it three times with different `layout` functions and Y offsets.
 
 ### `src/render/LineLayouts.ts` — new
 
-A small helper module that exports both layout functions used in v2: the log-frequency layout for the spectrum and a vertically-offset layout for the waveform. Kept separate so they're testable and clearly named.
+A small helper module that exports the layout functions used in v2: linear for the waveform and RMS history, log-frequency for the spectrum. Kept separate so they're testable and clearly named.
 
 ```ts
-export function waveformLayout(yOffset: number, height: number): LineLayoutFn;
+export function linearLayout(yOffset: number, height: number): LineLayoutFn;
 export function logSpectrumLayout(yOffset: number, height: number): LineLayoutFn;
 ```
 
-Both map sample index → x in `[-1, 1]` (linear for waveform, log2 for spectrum), and value → y in `[yOffset, yOffset + height]`. The default `LineRenderer` layout from v1 stays available as the fallback for ad-hoc uses.
+`linearLayout` maps sample index → x in `[-1, 1]`, value → y in `[yOffset, yOffset + height]` — used for both the waveform and the RMS history (same shape, different yOffset and source data). `logSpectrumLayout` does the same but with a log2 mapping on x. The default `LineRenderer` layout from v1 stays available as the fallback for ad-hoc uses.
 
 ### `src/ui/Stats.ts` — new
 
@@ -147,9 +154,13 @@ The "any keypress starts" behavior defaults to mic, since pressing Space or arro
 
 `App.start(canvas, sourceFactory)`. Body unchanged except `await createMicSource()` becomes `await sourceFactory()`. Adds:
 
-- Two more `LineRenderer` instantiations (waveform with `waveformLayout(0.6)`, spectrum with `logSpectrumLayout(-0.6, 0.5)`).
+- Three `LineRenderer` instantiations:
+  - waveform: `linearLayout(0.6, 0.5)`, source `() => store.get("waveform")`
+  - spectrum: `logSpectrumLayout(0.0, 0.5)`, source `() => store.get("spectrum")`
+  - rms history: `linearLayout(-0.6, 0.5)`, source `() => store.get("rms")`
 - `FpsOverlay` mounted before the loop, `begin()` at top of loop, `end()` at bottom.
-- Third camera preset: `"spectrum"` framing the lower line. Keys 1/2/3 jump to "front"/"side"/"spectrum". Existing Space toggle between front and side preserved.
+- Camera presets: `"front"` (overview, all three lines visible), `"side"`, `"spectrum"` (frames the spectrum line), `"rms"` (frames the rms history line). Keys 1/2/3/4 jump to them respectively. Existing Space toggle between front and side preserved.
+- The store needs all three keys primed with empty Float32Arrays before the LineRenderers are constructed (same workaround as v1 for the WebGPU length-change issue): `store.set("waveform", new Float32Array(2048))`, `store.set("spectrum", new Float32Array(1024))`, `store.set("rms", new Float32Array(256))`.
 
 ### `vite.config.ts` — Three.js dedupe
 
@@ -177,15 +188,17 @@ Was `console.error + return`. The throw propagates as a `processorerror` event o
 
 1. Worklet accumulates a 2048-sample window.
 2. Worklet calls `dsp.process(window)`, receives `Features` aggregate.
-3. Worklet reads both `waveform()` and `spectrum()` views, copies into transferable Float32Arrays, posts as one message.
+3. Worklet reads `waveform()`, `spectrum()`, and `rms_history()` views, copies into transferable Float32Arrays, posts as one message.
 4. Main-thread port handler dispatches:
    - `store.set("waveform", msg.waveform)`
    - `store.set("spectrum", msg.spectrum)`
+   - `store.set("rms", msg.rms)`
 5. Render loop:
    - `fps.begin()`
    - `rig.update(dt)`
    - waveform `LineRenderer.update()` — reads `store.get("waveform")`
    - spectrum `LineRenderer.update()` — reads `store.get("spectrum")`
+   - rms `LineRenderer.update()` — reads `store.get("rms")`
    - `renderer.render(scene, camera)`
    - `fps.end()`
 
@@ -197,10 +210,18 @@ Was `console.error + return`. The throw propagates as a `processorerror` event o
 - Window function: Hann, applied to the input copy before FFT.
 - Log frequency layout in JS, not Rust — keeps DSP output canonical so different layouts (linear, mel, etc.) can be tried without rebuilding WASM.
 
+## RMS history specifics
+
+- Buffer size: 256 samples (one per analysis window, ~11s at ~23 windows/sec).
+- Computed in Rust as `sqrt(mean(samples²))` over each 2048-sample window.
+- No additional smoothing applied — each sample is already the integral of 2048 audio samples, which is the smoothing.
+- No transformation in JS; the `LineRenderer` reads the buffer directly and plots oldest-on-left, newest-on-right via `linearLayout`.
+- Frequency resolution: each pixel in x represents one window (~42.7 ms). 60 BPM = 1Hz beat = ~23 samples between consecutive beats; 240 BPM = ~6 samples. Both are clearly visible.
+
 ## Camera additions
 
-- New preset `"spectrum"`: positioned just below the v1 "front" preset, looking at the lower line.
-- Number keys `1`/`2`/`3` jump to `"front"`/`"side"`/`"spectrum"` respectively, all with the existing 0.8s tween.
+- New presets `"spectrum"` and `"rms"`: each frames its respective line tightly. `"front"` shows all three lines.
+- Number keys `1`/`2`/`3`/`4` jump to `"front"`/`"side"`/`"spectrum"`/`"rms"` respectively, all with the existing 0.8s tween.
 - Space still toggles between front and side (preserved from v1).
 
 ## Drive-by cleanup folded in
@@ -213,15 +234,17 @@ These were noted as v2 follow-ups at v1 ship and are small enough to land alongs
 ## v2 milestone — definition of done
 
 - [ ] `realfft` integrated in Rust crate; FFT runs at audio rate without dropouts.
-- [ ] Spectrum line visible below the waveform, log-frequency, visibly responsive to musical input.
+- [ ] Spectrum line visible (middle line), log-frequency, visibly responsive to musical input.
+- [ ] RMS history line visible (bottom line), 256 samples wide, visibly tracking loudness over the last ~11 seconds.
 - [ ] Two buttons in `index.html`: "Mic" and "Tab Audio". Either path works end-to-end.
 - [ ] Tab Audio button reliably captures audio from a tab playing music; clear error if user picks a no-audio source.
 - [ ] FPS counter visible in the top-right corner; reads ~60fps under normal load.
 - [ ] No "Multiple instances of Three.js" warning in console.
 - [ ] Worklet throws (not console.errors) on missing wasmModule.
-- [ ] Camera presets `"front"`, `"side"`, `"spectrum"` exist; keys 1/2/3 jump between them; Space still toggles front/side.
+- [ ] Camera presets `"front"`, `"side"`, `"spectrum"`, `"rms"` exist; keys 1/2/3/4 jump between them; Space still toggles front/side.
 - [ ] All v1 unit tests still pass.
-- [ ] At least one new unit test for `logSpectrumLayout` verifying the bin→x mapping.
+- [ ] New unit tests for `linearLayout` and `logSpectrumLayout` verifying the index→x mapping.
+- [ ] New unit test for the Rust RMS computation (table-driven against known inputs).
 
 ## Out of scope (deferred)
 
