@@ -51,7 +51,6 @@ export class LineRenderer {
   update(): void {
     const buf = this.source();
     if (buf.length !== this.lastLength) {
-      (this.positionAttribute as unknown as { dispose?: () => void }).dispose?.();
       this.positions = new Float32Array(buf.length * 3);
       this.positionAttribute = new BufferAttribute(this.positions, 3);
       this.positionAttribute.setUsage(DynamicDrawUsage);
