@@ -7,6 +7,9 @@ export default defineConfig({
   worker: {
     plugins: () => [wasm()],
   },
+  resolve: {
+    dedupe: ["three"],
+  },
   server: {
     port: 5173,
   },

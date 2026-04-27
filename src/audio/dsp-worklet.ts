@@ -14,8 +14,7 @@ class DSPProcessor extends AudioWorkletProcessor {
     super();
     const wasmModule = (options?.processorOptions as { wasmModule?: WebAssembly.Module } | undefined)?.wasmModule;
     if (!wasmModule) {
-      console.error("[dsp-worklet] missing wasmModule in processorOptions");
-      return;
+      throw new Error("[dsp-worklet] missing wasmModule in processorOptions");
     }
     this.boot(wasmModule);
   }
