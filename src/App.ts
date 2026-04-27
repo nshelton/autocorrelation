@@ -53,9 +53,9 @@ export class App {
     source.connect(node);
 
     node.port.onmessage = (e) => {
-      const msg = e.data as { type: string; buffer: Float32Array };
-      if (msg.type === "waveform") {
-        this.store.set("waveform", msg.buffer);
+      const msg = e.data as { type: string; waveform?: Float32Array };
+      if (msg.type === "features" && msg.waveform) {
+        this.store.set("waveform", msg.waveform);
       }
     };
 

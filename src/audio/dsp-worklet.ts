@@ -41,9 +41,12 @@ class DSPProcessor extends AudioWorkletProcessor {
 
       if (this.filled === WINDOW_SIZE) {
         if (this.ready && this.dsp) {
-          const processed = this.dsp.process(this.window);
-          const out = new Float32Array(processed);
-          this.port.postMessage({ type: "waveform", buffer: out }, [out.buffer]);
+          this.dsp.process(this.window);
+          const wf = new Float32Array(this.dsp.waveform());
+          this.port.postMessage(
+            { type: "features", waveform: wf },
+            [wf.buffer],
+          );
         }
         this.filled = 0;
       }

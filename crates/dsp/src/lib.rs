@@ -1,24 +1,42 @@
 use wasm_bindgen::prelude::*;
 
-/// v1: passthrough. Copies the input window into the output buffer.
-/// Future versions will compute FFT, autocorrelation, RMS, beat phase.
 #[wasm_bindgen]
 pub struct Dsp {
-    out: Vec<f32>,
+    waveform: Vec<f32>,
 }
 
 #[wasm_bindgen]
 impl Dsp {
     #[wasm_bindgen(constructor)]
     pub fn new(window_size: usize) -> Dsp {
-        Dsp { out: vec![0.0; window_size] }
+        Dsp {
+            waveform: vec![0.0; window_size],
+        }
     }
 
-    /// Process one analysis window. Returns a borrowed view of the
-    /// internal output buffer; the caller must copy before the next call.
-    pub fn process(&mut self, input: &[f32]) -> Vec<f32> {
-        let n = input.len().min(self.out.len());
-        self.out[..n].copy_from_slice(&input[..n]);
-        self.out[..n].to_vec()
+    /// Run analysis on one input window. After this returns, the
+    /// `waveform()`, `spectrum()`, and `rms_history()` getters expose
+    /// the latest results.
+    pub fn process(&mut self, input: &[f32]) {
+        let n = input.len().min(self.waveform.len());
+        self.waveform[..n].copy_from_slice(&input[..n]);
+    }
+
+    /// The most recent input window (passthrough in v1; identical in v2).
+    pub fn waveform(&self) -> Vec<f32> {
+        self.waveform.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn process_then_waveform_returns_input() {
+        let mut dsp = Dsp::new(8);
+        let input: Vec<f32> = (0..8).map(|i| i as f32 * 0.1).collect();
+        dsp.process(&input);
+        assert_eq!(dsp.waveform(), input);
     }
 }
