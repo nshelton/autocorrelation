@@ -11,6 +11,7 @@
     "wasm": "cd crates/dsp && wasm-pack build --target web --out-dir ../../src/wasm-pkg"
   },
   "devDependencies": {
+    "@types/audioworklet": "^0.0.98",
     "@types/node": "^22.0.0",
     "happy-dom": "^15.0.0",
     "typescript": "^5.6.0",
@@ -20,7 +21,7 @@
     "vitest": "^2.0.0"
   },
   "dependencies": {
-    "three": "^0.170.0",
-    "@types/three": "^0.170.0"
+    "@types/three": "^0.170.0",
+    "three": "^0.170.0"
   }
 }
