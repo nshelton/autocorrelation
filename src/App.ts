@@ -3,6 +3,7 @@ import { createScene } from "./render/Scene";
 import { CameraRig } from "./render/CameraRig";
 import { LineRenderer } from "./render/LineRenderer";
 import dspWorkletUrl from "./audio/dsp-worklet?worker&url";
+import dspWasmUrl from "./wasm-pkg/dsp_bg.wasm?url";
 import { createMicSource } from "./audio/AudioSource";
 import { FeatureStore } from "./store/FeatureStore";
 
@@ -42,10 +43,12 @@ export class App {
     });
 
     const { context, source } = await createMicSource();
+    const wasmModule = await WebAssembly.compileStreaming(fetch(dspWasmUrl));
     await context.audioWorklet.addModule(dspWorkletUrl);
     const node = new AudioWorkletNode(context, "dsp-processor", {
       numberOfInputs: 1,
       numberOfOutputs: 0,
+      processorOptions: { wasmModule },
     });
     source.connect(node);
 

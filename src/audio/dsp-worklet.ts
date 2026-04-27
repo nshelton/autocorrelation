@@ -1,10 +1,30 @@
 /// <reference types="@types/audioworklet" />
+import "./worklet-polyfills";
+import init, { Dsp } from "../wasm-pkg/dsp";
 
 const WINDOW_SIZE = 2048;
 
 class DSPProcessor extends AudioWorkletProcessor {
   private window = new Float32Array(WINDOW_SIZE);
   private filled = 0;
+  private dsp: Dsp | null = null;
+  private ready = false;
+
+  constructor(options?: AudioWorkletNodeOptions) {
+    super();
+    const wasmModule = (options?.processorOptions as { wasmModule?: WebAssembly.Module } | undefined)?.wasmModule;
+    if (!wasmModule) {
+      console.error("[dsp-worklet] missing wasmModule in processorOptions");
+      return;
+    }
+    this.boot(wasmModule);
+  }
+
+  private async boot(wasmModule: WebAssembly.Module) {
+    await init(wasmModule);
+    this.dsp = new Dsp(WINDOW_SIZE);
+    this.ready = true;
+  }
 
   process(inputs: Float32Array[][]): boolean {
     const input = inputs[0];
@@ -21,8 +41,11 @@ class DSPProcessor extends AudioWorkletProcessor {
       i += take;
 
       if (this.filled === WINDOW_SIZE) {
-        const out = new Float32Array(this.window); // copy
-        this.port.postMessage({ type: "waveform", buffer: out }, [out.buffer]);
+        if (this.ready && this.dsp) {
+          const processed = this.dsp.process(this.window);
+          const out = new Float32Array(processed);
+          this.port.postMessage({ type: "waveform", buffer: out }, [out.buffer]);
+        }
         this.filled = 0;
       }
     }
