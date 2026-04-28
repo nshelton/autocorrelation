@@ -4,9 +4,7 @@ Tracks features that are agreed-on but deferred. Each entry is a candidate for a
 
 ## In progress
 
-### v3 — Autocorrelation
-- Buffer autocorrelation on the audio waveform
-- Beat detection via RMS-envelope autocorrelation (rms_history is already wired)
+(none)
 
 ## Next
 
@@ -24,5 +22,6 @@ Tracks features that are agreed-on but deferred. Each entry is a candidate for a
 
 ## Shipped
 
+- **v3** (tag `v3.0.0`): buffer autocorrelation + RMS-envelope autocorrelation (with mean-subtracted detrending) as two new line strips; two new camera presets (keys 5 and 6); five-line vertical layout
 - **v2** (tag `v2.0.0`): FFT spectrum (log frequency, dB, smoothed), rolling RMS history, tab audio source, internal test source (T key), FPS overlay, four camera presets, overlapped FFT
 - **v1** (tag `v1.0.0`): mic input → AudioWorklet → Rust/WASM → Three.js WebGPU LineRenderer with camera rig
