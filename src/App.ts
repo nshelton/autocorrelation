@@ -1,5 +1,5 @@
 import { Vector3 } from "three";
-import { createScene } from "./render/Scene";
+import { createRenderer, createSceneAndCamera } from "./render/Scene";
 import { CameraRig } from "./render/CameraRig";
 import { LineRenderer } from "./render/LineRenderer";
 import { linearLayout, logSpectrumLayout } from "./render/LineLayouts";
@@ -38,7 +38,8 @@ export class App {
     canvas: HTMLCanvasElement,
     sourceFactory: () => Promise<AudioSourceBundle> = createMicSource,
   ): Promise<void> {
-    const { scene, camera, renderer } = await createScene(canvas);
+    const renderer = await createRenderer(canvas);
+    const { scene, camera } = createSceneAndCamera();
     this.scene = scene;
 
     this.rig = new CameraRig(camera);
