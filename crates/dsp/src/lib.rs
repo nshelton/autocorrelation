@@ -14,6 +14,22 @@ const SMOOTHING_TAU_SECS: f32 = 0.0956;
 const LOW_BAND_HZ_MAX: f32 = 150.0;
 /// Crossover from mid band to high band, in Hz.
 const MID_BAND_HZ_MAX: f32 = 1500.0;
+/// Default time constant for the rms_acf decaying accumulator (seconds).
+/// 4 s gives stable peaks for steady tempo while still tracking gradual
+/// tempo changes within ~10–15 seconds.
+const ACCUM_TAU_DEFAULT_SECS: f32 = 4.0;
+/// Minimum lag (in hops) considered for peak picking. Below this, peaks
+/// imply BPM > ~280 (at hop=1024, sr=48000) which isn't a tempo we care
+/// about, and the very-low-lag region of the ACF is dominated by the
+/// shape of the autocorrelation envelope rather than tempo structure.
+const MIN_PEAK_LAG: usize = 10;
+/// Maximum number of tempo peaks tracked per hop. Drives the fixed length
+/// of `acf_peaks` (= 2 * MAX_PEAKS — interleaved [lag, mag] pairs).
+const MAX_PEAKS: usize = 10;
+/// Minimum integer-lag distance between accepted peaks, in hops. Without
+/// this, the wide lobes of true tempo peaks return multiple "peaks" all
+/// clustered around a single underlying peak.
+const MIN_PEAK_SPACING: usize = 3;
 
 #[wasm_bindgen]
 pub struct Dsp {
@@ -32,6 +48,24 @@ pub struct Dsp {
     rms_history: Vec<f32>,
     buffer_acf: Vec<f32>,
     rms_acf: Vec<f32>,
+    /// Decaying EMA accumulator over `rms_acf`. Same length. Used as the
+    /// signal for tempo peak picking — the EMA suppresses per-frame noise
+    /// in the instantaneous ACF so true tempo peaks build up.
+    rms_acf_accum: Vec<f32>,
+    /// Per-process EMA coefficient for `rms_acf_accum`. Computed from
+    /// `accum_tau_secs` and the same `dt` used for `smoothing_alpha`:
+    /// `alpha = 1 - exp(-dt / tau)`. Tunable via `set_accum_tau_secs`.
+    accum_alpha: f32,
+    /// Detected tempo peaks in `rms_acf_accum`, as interleaved
+    /// [lag_frac, mag] pairs. Length = 2 * MAX_PEAKS. Unused slots filled
+    /// with `f32::NAN` so the renderer can detect "no peak" with a single
+    /// `isNaN` check (0.0 would collide with a valid lag).
+    acf_peaks: Vec<f32>,
+    /// Preallocated scratch for peak-candidate collection. Capacity is
+    /// reserved at construction (`rms_acf_len / 2` — worst case every other
+    /// lag is a local max). Cleared (not freed) each `process()` call so
+    /// peak picking is allocation-free.
+    peak_candidates: Vec<(usize, f32)>,
     rms_detrended: Vec<f32>,
     /// Per-process-call EMA coefficient for the spectrum. Computed from
     /// `SMOOTHING_TAU_SECS` and the wall-clock dt between hops
@@ -83,6 +117,7 @@ impl Dsp {
         let mid_band_bin_end = bin_for_hz(MID_BAND_HZ_MAX, sample_rate, window_size);
         let hann_energy: f32 = hann.iter().map(|h| h * h).sum();
         let parseval_band_scale = 2.0 / (window_size as f32 * hann_energy);
+        let accum_alpha = 1.0 - (-dt / ACCUM_TAU_DEFAULT_SECS).exp();
         Dsp {
             waveform: vec![0.0; window_size],
             fft,
@@ -95,6 +130,10 @@ impl Dsp {
             rms_history: vec![0.0; rms_history_len],
             buffer_acf: vec![0.0; window_size / 2],
             rms_acf: vec![0.0; rms_history_len / 2],
+            rms_acf_accum: vec![0.0; rms_history_len / 2],
+            accum_alpha,
+            acf_peaks: vec![f32::NAN; 2 * MAX_PEAKS],
+            peak_candidates: Vec::with_capacity((rms_history_len / 2) / 2 + 1),
             rms_detrended: vec![0.0; rms_history_len],
             smoothing_alpha,
             dt,
@@ -117,6 +156,15 @@ impl Dsp {
     pub fn set_smoothing_tau(&mut self, tau_secs: f32) {
         let tau = tau_secs.clamp(0.001, 10.0);
         self.smoothing_alpha = 1.0 - (-self.dt / tau).exp();
+    }
+
+    /// Set the time constant (seconds) for the rms_acf decaying accumulator.
+    /// `accum_alpha` is recomputed as `1 - exp(-dt / tau)`. Smaller tau →
+    /// faster response, less stable peaks. Clamped to [0.05, 60.0] to avoid
+    /// divide-by-zero and runaway settling.
+    pub fn set_accum_tau_secs(&mut self, tau_secs: f32) {
+        let tau = tau_secs.clamp(0.05, 60.0);
+        self.accum_alpha = 1.0 - (-self.dt / tau).exp();
     }
 
     pub fn set_db_floor(&mut self, floor: f32) {
@@ -204,6 +252,15 @@ impl Dsp {
         }
         autocorrelate(&self.rms_detrended, &mut self.rms_acf);
 
+        // EMA-decayed accumulator over the instantaneous full-band ACF.
+        // Builds up steady tempo peaks across many hops; suppresses
+        // per-frame noise. Same alpha pattern as `smoothing_alpha`.
+        for i in 0..self.rms_acf_accum.len() {
+            self.rms_acf_accum[i] = self.accum_alpha * self.rms_acf[i]
+                + (1.0 - self.accum_alpha) * self.rms_acf_accum[i];
+        }
+        self.pick_acf_peaks();
+
         let low_mean = (self.low_rms_history.iter().map(|&x| x as f64).sum::<f64>()
             / self.low_rms_history.len() as f64) as f32;
         for (dst, src) in self.low_rms_detrended.iter_mut().zip(self.low_rms_history.iter()) {
@@ -243,6 +300,10 @@ impl Dsp {
         self.rms_acf.clone()
     }
 
+    pub fn rms_acf_accum(&self) -> Vec<f32> {
+        self.rms_acf_accum.clone()
+    }
+
     pub fn low_rms_acf(&self) -> Vec<f32> {
         self.low_rms_acf.clone()
     }
@@ -261,6 +322,84 @@ impl Dsp {
 
     pub fn high_rms_history(&self) -> Vec<f32> {
         self.high_rms_history.clone()
+    }
+
+    pub fn acf_peaks(&self) -> Vec<f32> {
+        self.acf_peaks.clone()
+    }
+
+    /// Pick top-`MAX_PEAKS` tempo peaks in `rms_acf_accum` and write them
+    /// into `acf_peaks` as interleaved `[lag_frac, mag]` pairs (NaN-padded).
+    ///
+    /// Algorithm:
+    ///   1. Scan lags `MIN_PEAK_LAG..len-1` for positive local maxima.
+    ///   2. Sort candidates by integer-lag magnitude, descending.
+    ///   3. Greedy-select with `MIN_PEAK_SPACING` integer-lag separation.
+    ///   4. Parabolic sub-bin interpolation on each accepted peak.
+    ///
+    /// Allocation-free: uses the preallocated `peak_candidates` scratch
+    /// (cleared, not freed) and a stack-bounded accepted set.
+    fn pick_acf_peaks(&mut self) {
+        // Reset output to all-NaN sentinels.
+        for slot in self.acf_peaks.iter_mut() {
+            *slot = f32::NAN;
+        }
+
+        let n = self.rms_acf_accum.len();
+        if n < MIN_PEAK_LAG + 2 {
+            return;
+        }
+
+        // 1. Scan candidates.
+        self.peak_candidates.clear();
+        for k in MIN_PEAK_LAG..(n - 1) {
+            let y1 = self.rms_acf_accum[k];
+            if y1 > 0.0 && y1 > self.rms_acf_accum[k - 1] && y1 > self.rms_acf_accum[k + 1] {
+                self.peak_candidates.push((k, y1));
+            }
+        }
+
+        // 2. Sort by magnitude descending.
+        self.peak_candidates
+            .sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        // 3. Greedy select with min-spacing.
+        let mut accepted: [u32; MAX_PEAKS] = [0; MAX_PEAKS];
+        let mut accepted_count: usize = 0;
+        for &(k, _mag) in self.peak_candidates.iter() {
+            if accepted_count == MAX_PEAKS {
+                break;
+            }
+            let mut too_close = false;
+            for i in 0..accepted_count {
+                let dist = (k as i32 - accepted[i] as i32).unsigned_abs() as usize;
+                if dist < MIN_PEAK_SPACING {
+                    too_close = true;
+                    break;
+                }
+            }
+            if !too_close {
+                accepted[accepted_count] = k as u32;
+                accepted_count += 1;
+            }
+        }
+
+        // 4. Sub-bin parabolic refinement, write output.
+        for i in 0..accepted_count {
+            let k = accepted[i] as usize;
+            let y0 = self.rms_acf_accum[k - 1];
+            let y1 = self.rms_acf_accum[k];
+            let y2 = self.rms_acf_accum[k + 1];
+            let denom = y0 - 2.0 * y1 + y2;
+            let (lag_frac, mag) = if denom.abs() < 1e-12 {
+                (k as f32, y1)
+            } else {
+                let delta = (0.5 * (y0 - y2) / denom).clamp(-0.5, 0.5);
+                (k as f32 + delta, y1 - 0.25 * (y0 - y2) * delta)
+            };
+            self.acf_peaks[2 * i] = lag_frac;
+            self.acf_peaks[2 * i + 1] = mag;
+        }
     }
 }
 
@@ -294,6 +433,21 @@ fn autocorrelate(input: &[f32], output: &mut [f32]) {
 fn bin_for_hz(hz: f32, sample_rate: f32, n: usize) -> usize {
     let bin = (hz * n as f32 / sample_rate).round() as usize;
     bin.clamp(1, n / 2 - 1)
+}
+
+#[cfg(test)]
+impl Dsp {
+    pub fn test_set_rms_acf_accum(&mut self, src: &[f32]) {
+        let n = src.len().min(self.rms_acf_accum.len());
+        self.rms_acf_accum[..n].copy_from_slice(&src[..n]);
+        for v in self.rms_acf_accum.iter_mut().skip(n) {
+            *v = 0.0;
+        }
+    }
+
+    pub fn test_run_peak_picking(&mut self) {
+        self.pick_acf_peaks();
+    }
 }
 
 #[cfg(test)]
@@ -772,5 +926,259 @@ mod tests {
                 v
             );
         }
+    }
+
+    #[test]
+    fn accum_alpha_matches_formula() {
+        // alpha = 1 - exp(-dt / tau) at default tau (4.0 s), dt = 1024/48000
+        let dsp = Dsp::new(2048, 48000.0, 1024, 512);
+        let dt = 1024.0_f32 / 48000.0;
+        let expected = 1.0 - (-dt / ACCUM_TAU_DEFAULT_SECS).exp();
+        assert!(
+            (dsp.accum_alpha - expected).abs() < 1e-6,
+            "got {}, expected {}",
+            dsp.accum_alpha,
+            expected
+        );
+    }
+
+    #[test]
+    fn set_accum_tau_secs_clamps_and_recomputes() {
+        let mut dsp = Dsp::new(2048, 48000.0, 1024, 512);
+        let before = dsp.accum_alpha;
+        dsp.set_accum_tau_secs(20.0);
+        assert!(dsp.accum_alpha < before, "longer tau should yield smaller alpha");
+
+        // Below clamp: 0.001 should clamp up to 0.05.
+        dsp.set_accum_tau_secs(0.001);
+        let dt = 1024.0_f32 / 48000.0;
+        let expected = 1.0 - (-dt / 0.05).exp();
+        assert!((dsp.accum_alpha - expected).abs() < 1e-6, "lower clamp not applied");
+
+        // Above clamp: 1000.0 should clamp down to 60.0.
+        dsp.set_accum_tau_secs(1000.0);
+        let expected = 1.0 - (-dt / 60.0).exp();
+        assert!((dsp.accum_alpha - expected).abs() < 1e-6, "upper clamp not applied");
+    }
+
+    #[test]
+    fn rms_acf_accum_silent_input_is_zero() {
+        let mut dsp = Dsp::new(2048, 48000.0, 1024, 512);
+        let silent = vec![0.0_f32; 2048];
+        for _ in 0..200 {
+            dsp.process(&silent);
+        }
+        let accum = dsp.rms_acf_accum();
+        assert_eq!(accum.len(), 256);
+        for &v in &accum {
+            assert_eq!(v, 0.0, "silent → accumulator must stay zero, got {}", v);
+        }
+    }
+
+    #[test]
+    fn acf_peaks_silent_input_all_nan() {
+        let mut dsp = Dsp::new(2048, 48000.0, 1024, 512);
+        let silent = vec![0.0_f32; 2048];
+        for _ in 0..50 {
+            dsp.process(&silent);
+        }
+        let peaks = dsp.acf_peaks();
+        assert_eq!(peaks.len(), 2 * MAX_PEAKS);
+        for (i, &v) in peaks.iter().enumerate() {
+            assert!(v.is_nan(), "slot {} should be NaN, got {}", i, v);
+        }
+    }
+
+    #[test]
+    fn acf_peaks_min_lag_enforced() {
+        let mut dsp = Dsp::new(2048, 48000.0, 1024, 512);
+        // Synthetic accumulator: a single isolated peak at lag 5 (below MIN_PEAK_LAG=10).
+        let mut accum = vec![0.0_f32; 256];
+        accum[5] = 0.9;
+        dsp.test_set_rms_acf_accum(&accum);
+        dsp.test_run_peak_picking();
+        let peaks = dsp.acf_peaks();
+        // No peak should be picked; all slots NaN.
+        for &v in &peaks {
+            assert!(v.is_nan(), "expected no peak below MIN_PEAK_LAG, got {}", v);
+        }
+    }
+
+    #[test]
+    fn acf_peaks_finds_isolated_peak_with_subbin_offset() {
+        let mut dsp = Dsp::new(2048, 48000.0, 1024, 512);
+        // Asymmetric triangular peak at integer lag 50:
+        //   y0 = accum[49] = 0.6, y1 = accum[50] = 1.0, y2 = accum[51] = 0.8
+        // Parabolic interp: δ = 0.5*(y0-y2)/(y0 - 2*y1 + y2) = 0.5*(-0.2)/(-0.6) ≈ 0.1667
+        let mut accum = vec![0.0_f32; 256];
+        accum[49] = 0.6;
+        accum[50] = 1.0;
+        accum[51] = 0.8;
+        dsp.test_set_rms_acf_accum(&accum);
+        dsp.test_run_peak_picking();
+        let peaks = dsp.acf_peaks();
+        let lag0 = peaks[0];
+        assert!(!lag0.is_nan(), "expected a peak in slot 0");
+        assert!(
+            (lag0 - 50.1667).abs() < 0.01,
+            "expected sub-bin lag ≈ 50.1667, got {}",
+            lag0
+        );
+        // Slots 1..MAX_PEAKS must be NaN.
+        for i in 1..MAX_PEAKS {
+            assert!(peaks[2 * i].is_nan(), "slot {} lag should be NaN", i);
+            assert!(peaks[2 * i + 1].is_nan(), "slot {} mag should be NaN", i);
+        }
+    }
+
+    #[test]
+    fn acf_peaks_min_spacing_filters_nearby() {
+        let mut dsp = Dsp::new(2048, 48000.0, 1024, 512);
+        // Two equal-magnitude lobes at lags 50 and 52 (spacing = 2 < MIN_PEAK_SPACING=3).
+        // Both are local maxima individually because lag 51 sits between them with
+        // a slightly lower value.
+        let mut accum = vec![0.0_f32; 256];
+        accum[49] = 0.8;
+        accum[50] = 1.0;
+        accum[51] = 0.85;
+        accum[52] = 1.0;
+        accum[53] = 0.8;
+        dsp.test_set_rms_acf_accum(&accum);
+        dsp.test_run_peak_picking();
+        let peaks = dsp.acf_peaks();
+        // Exactly one of the two lobes should be picked. Its integer lag rounds
+        // to either 50 or 52.
+        let mut accepted = 0;
+        for i in 0..MAX_PEAKS {
+            if !peaks[2 * i].is_nan() {
+                accepted += 1;
+            }
+        }
+        assert_eq!(accepted, 1, "min-spacing should leave only one peak");
+    }
+
+    #[test]
+    fn acf_peaks_top_n_selection_in_descending_magnitude() {
+        let mut dsp = Dsp::new(2048, 48000.0, 1024, 512);
+        // 15 isolated peaks (well-spaced) with strictly decreasing magnitudes.
+        // Spacing = 8 to satisfy MIN_PEAK_SPACING; first peak at lag 16 to clear
+        // MIN_PEAK_LAG. Only the top 10 should be picked, in magnitude order.
+        let mut accum = vec![0.0_f32; 256];
+        for i in 0..15 {
+            let lag = 16 + 8 * i;
+            let mag = 1.0 - 0.05 * i as f32;
+            accum[lag - 1] = mag * 0.5;
+            accum[lag] = mag;
+            accum[lag + 1] = mag * 0.5;
+        }
+        dsp.test_set_rms_acf_accum(&accum);
+        dsp.test_run_peak_picking();
+        let peaks = dsp.acf_peaks();
+        // First 10 slots are real peaks, in descending magnitude order.
+        let mut last_mag = f32::INFINITY;
+        for i in 0..MAX_PEAKS {
+            let lag = peaks[2 * i];
+            let mag = peaks[2 * i + 1];
+            assert!(!lag.is_nan(), "slot {}: expected real peak", i);
+            assert!(mag <= last_mag + 1e-5, "slot {}: mag {} > prev {}", i, mag, last_mag);
+            last_mag = mag;
+        }
+    }
+
+    #[test]
+    fn acf_peaks_negative_correlations_skipped() {
+        let mut dsp = Dsp::new(2048, 48000.0, 1024, 512);
+        // Negative-magnitude local maximum: accum[50] = -0.1, surrounded by -0.5 / -0.5.
+        // Even though -0.1 > -0.5, anti-correlations aren't beats and must be skipped.
+        let mut accum = vec![0.0_f32; 256];
+        accum[49] = -0.5;
+        accum[50] = -0.1;
+        accum[51] = -0.5;
+        dsp.test_set_rms_acf_accum(&accum);
+        dsp.test_run_peak_picking();
+        let peaks = dsp.acf_peaks();
+        for &v in &peaks {
+            assert!(v.is_nan(), "negative peak must be skipped, got {}", v);
+        }
+    }
+
+    #[test]
+    fn rms_acf_accum_converges_to_instantaneous_for_steady_periodic() {
+        // Each hop receives a 2048-sample sine whose amplitude depends on the
+        // hop index — this produces a non-constant `rms_history` with real
+        // temporal structure (a slow envelope), so the detrended ACF has
+        // non-trivial values. Without this, every hop has the same RMS, the
+        // detrended history is all zeros, and the convergence assertion holds
+        // trivially because both sides are zero.
+        let mut dsp = Dsp::new(2048, 48000.0, 1024, 512);
+        let sr = 48000.0_f32;
+        // Convergence rule of thumb: ~5τ at default 4 s tau, dt ≈ 21.33 ms → ~940 hops.
+        // Use 1500 hops for headroom.
+        for k in 0..1500 {
+            // Slow amplitude envelope across hops (~ one cycle per ~63 hops).
+            let amp = 0.5 + 0.3 * (k as f32 * 0.1).sin();
+            let signal: Vec<f32> = (0..2048)
+                .map(|i| {
+                    let t = i as f32 / sr;
+                    amp * (2.0 * std::f32::consts::PI * 1000.0 * t).sin()
+                })
+                .collect();
+            dsp.process(&signal);
+        }
+        let inst = dsp.rms_acf();
+        let accum = dsp.rms_acf_accum();
+        // After convergence, accum tracks inst. Tighter tolerance is fine because
+        // the EMA at 5τ has ~99% reached steady state.
+        for (i, (a, b)) in accum.iter().zip(inst.iter()).enumerate() {
+            assert!(
+                (a - b).abs() < 0.05,
+                "lag {}: accum {} should track inst {}",
+                i, a, b
+            );
+        }
+        // Sanity: at least *some* lag must be non-trivially non-zero — otherwise
+        // the test is vacuous again.
+        let max_abs = inst.iter().map(|v| v.abs()).fold(0.0_f32, f32::max);
+        assert!(max_abs > 0.01, "expected non-trivial ACF; max |inst| = {}", max_abs);
+    }
+
+    #[test]
+    fn process_pipeline_finds_periodic_peak_via_acf_peaks() {
+        // End-to-end integration test: drive process() with a known per-hop
+        // amplitude period, then verify acf_peaks()[0] reports that period as
+        // the dominant tempo lag. Catches integration bugs in process() that
+        // unit-tested individual stages would miss (e.g., pick_acf_peaks
+        // not called, called before EMA update, etc.).
+        let mut dsp = Dsp::new(2048, 48000.0, 1024, 512);
+        let sr = 48000.0_f32;
+        let period_hops = 32usize;
+        // 1500 hops covers both rms_history fill (512) and accumulator
+        // convergence at default tau=4s (~940 hops).
+        for k in 0..1500 {
+            // Sinusoidal envelope across hops with period `period_hops`.
+            // Add a constant offset of 0.6 so amplitude stays positive — RMS is
+            // |signal|-symmetric, so a zero-crossing envelope would create a
+            // doubled-frequency artifact.
+            let amp = 0.6 + 0.3 * (2.0 * std::f32::consts::PI * (k as f32) / (period_hops as f32)).sin();
+            let signal: Vec<f32> = (0..2048)
+                .map(|i| {
+                    let t = i as f32 / sr;
+                    amp * (2.0 * std::f32::consts::PI * 1000.0 * t).sin()
+                })
+                .collect();
+            dsp.process(&signal);
+        }
+        let peaks = dsp.acf_peaks();
+        let lag0 = peaks[0];
+        assert!(!lag0.is_nan(), "expected at least one peak after convergence");
+        assert!(
+            (lag0 - period_hops as f32).abs() < 1.0,
+            "expected peak near lag {}, got {}",
+            period_hops, lag0
+        );
+        // The peak's magnitude (ACF normalized to [0,1] roughly) should be
+        // meaningfully positive, not just barely above zero.
+        let mag0 = peaks[1];
+        assert!(mag0 > 0.1, "expected significant peak magnitude, got {}", mag0);
     }
 }

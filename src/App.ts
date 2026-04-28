@@ -2,6 +2,7 @@ import { Vector3 } from "three";
 import { createSceneAndCamera } from "./render/Scene";
 import { CameraRig } from "./render/CameraRig";
 import { LineRenderer } from "./render/LineRenderer";
+import { PeakMarkers } from "./render/PeakMarkers";
 import { linearLayout, logSpectrumLayout } from "./render/LineLayouts";
 import { FeatureStore } from "./store/FeatureStore";
 import { FpsOverlay } from "./ui/Stats";
@@ -23,6 +24,8 @@ export class App {
   private rmsLine?: LineRenderer;
   private bufferAcfLine?: LineRenderer;
   private rmsAcfLine?: LineRenderer;
+  private rmsAcfAccumLine?: LineRenderer;
+  private peakMarkers?: PeakMarkers;
   private lowRmsLine?: LineRenderer;
   private midRmsLine?: LineRenderer;
   private highRmsLine?: LineRenderer;
@@ -91,6 +94,8 @@ export class App {
             rms?: Float32Array;
             bufferAcf?: Float32Array;
             rmsAcf?: Float32Array;
+            rmsAcfAccum?: Float32Array;
+            acfPeaks?: Float32Array;
             rmsLow?: Float32Array;
             rmsMid?: Float32Array;
             rmsHigh?: Float32Array;
@@ -103,6 +108,7 @@ export class App {
             bufferAcfLen: number;
             rmsLen: number;
             rmsAcfLen: number;
+            acfPeaksLen: number;
           };
       if (msg.type === "features") {
         if (msg.waveform) this.store.set("waveform", msg.waveform);
@@ -110,6 +116,8 @@ export class App {
         if (msg.rms) this.store.set("rms", msg.rms);
         if (msg.bufferAcf) this.store.set("bufferAcf", msg.bufferAcf);
         if (msg.rmsAcf) this.store.set("rmsAcf", msg.rmsAcf);
+        if (msg.rmsAcfAccum) this.store.set("rmsAcfAccum", msg.rmsAcfAccum);
+        if (msg.acfPeaks) this.store.set("acfPeaks", msg.acfPeaks);
         if (msg.rmsLow) this.store.set("rmsLow", msg.rmsLow);
         if (msg.rmsMid) this.store.set("rmsMid", msg.rmsMid);
         if (msg.rmsHigh) this.store.set("rmsHigh", msg.rmsHigh);
@@ -135,6 +143,8 @@ export class App {
       this.rmsLine?.update();
       this.lowRmsAcfLine?.update();
       this.rmsAcfLine?.update();
+      this.rmsAcfAccumLine?.update();
+      this.peakMarkers?.update();
       renderer.render(scene, camera);
       this.fps.end();
       this.rafHandle = requestAnimationFrame(loop);
@@ -148,6 +158,7 @@ export class App {
     bufferAcfLen: number;
     rmsLen: number;
     rmsAcfLen: number;
+    acfPeaksLen: number;
   }): void {
     for (const line of [
       this.waveformLine,
@@ -159,15 +170,21 @@ export class App {
       this.rmsLine,
       this.lowRmsAcfLine,
       this.rmsAcfLine,
+      this.rmsAcfAccumLine,
     ]) {
       line?.dispose();
     }
+    this.peakMarkers?.dispose();
 
     this.store.set("waveform", new Float32Array(sizes.waveformLen));
     this.store.set("spectrum", new Float32Array(sizes.spectrumLen));
     this.store.set("rms", new Float32Array(sizes.rmsLen));
     this.store.set("bufferAcf", new Float32Array(sizes.bufferAcfLen));
     this.store.set("rmsAcf", new Float32Array(sizes.rmsAcfLen));
+    this.store.set("rmsAcfAccum", new Float32Array(sizes.rmsAcfLen));
+    const peaksInit = new Float32Array(sizes.acfPeaksLen);
+    peaksInit.fill(NaN);
+    this.store.set("acfPeaks", peaksInit);
     this.store.set("rmsLow", new Float32Array(sizes.rmsLen));
     this.store.set("rmsMid", new Float32Array(sizes.rmsLen));
     this.store.set("rmsHigh", new Float32Array(sizes.rmsLen));
@@ -235,6 +252,27 @@ export class App {
       color: 0xff99cc,
     });
     this.scene.add(this.rmsAcfLine.object3d);
+
+    this.rmsAcfAccumLine = new LineRenderer({
+      source: () => this.store.get("rmsAcfAccum"),
+      layout: linearLayout(-1.0, 0.4),
+      color: 0x66ffff,
+    });
+    this.scene.add(this.rmsAcfAccumLine.object3d);
+
+    this.peakMarkers = new PeakMarkers({
+      source: () => this.store.get("acfPeaks"),
+      maxPeaks: 10,
+      lagDomain: sizes.rmsAcfLen,
+      yCenter: -1.0,
+      ySpan: 0.4,
+      // Mirrors linearLayout's x-formula. If you change one, change the other —
+      // markers must sit on the exact x-positions of the accumulator line they
+      // annotate, or peaks will visually drift off the line they describe.
+      xForLag: (lag, n) => (n <= 1 ? 0 : (lag / (n - 1)) * 2 - 1),
+      baseColor: 0xffff66,
+    });
+    this.scene.add(this.peakMarkers.object3d);
   }
 
   dispose(): void {
@@ -254,9 +292,11 @@ export class App {
       this.rmsLine,
       this.lowRmsAcfLine,
       this.rmsAcfLine,
+      this.rmsAcfAccumLine,
     ]) {
       line?.dispose();
     }
+    this.peakMarkers?.dispose();
     this.fps.unmount();
     this.deps.workletNode.port.onmessage = null;
   }

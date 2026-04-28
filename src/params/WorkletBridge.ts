@@ -1,6 +1,6 @@
 import type { ParamStore } from "./ParamStore";
 
-const HOT_KEYS = ["hopSize", "smoothingTauSecs", "dbFloor"] as const;
+const HOT_KEYS = ["hopSize", "smoothingTauSecs", "dbFloor", "accumTauSecs"] as const;
 
 export class WorkletBridge {
   private unsubscribe: () => void;
