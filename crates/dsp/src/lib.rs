@@ -859,26 +859,31 @@ mod tests {
 
     #[test]
     fn rms_acf_accum_converges_to_instantaneous_for_steady_periodic() {
-        // Feed a steady periodic signal long enough for both rms_history to fill
-        // AND the accumulator to converge. After convergence,
-        // rms_acf_accum[k] ≈ rms_acf[k] for all k.
+        // Each hop receives a 2048-sample sine whose amplitude depends on the
+        // hop index — this produces a non-constant `rms_history` with real
+        // temporal structure (a slow envelope), so the detrended ACF has
+        // non-trivial values. Without this, every hop has the same RMS, the
+        // detrended history is all zeros, and the convergence assertion holds
+        // trivially because both sides are zero.
         let mut dsp = Dsp::new(2048, 48000.0, 1024, 512);
         let sr = 48000.0_f32;
-        // Use a slowly-modulated signal so RMS history has structure (not flat).
-        let signal: Vec<f32> = (0..2048)
-            .map(|i| {
-                let t = i as f32 / sr;
-                0.5 * (2.0 * std::f32::consts::PI * 1000.0 * t).sin()
-                    * (1.0 + 0.3 * (2.0 * std::f32::consts::PI * 4.0 * t).sin())
-            })
-            .collect();
         // Convergence rule of thumb: ~5τ at default 4 s tau, dt ≈ 21.33 ms → ~940 hops.
         // Use 1500 hops for headroom.
-        for _ in 0..1500 {
+        for k in 0..1500 {
+            // Slow amplitude envelope across hops (~ one cycle per ~63 hops).
+            let amp = 0.5 + 0.3 * (k as f32 * 0.1).sin();
+            let signal: Vec<f32> = (0..2048)
+                .map(|i| {
+                    let t = i as f32 / sr;
+                    amp * (2.0 * std::f32::consts::PI * 1000.0 * t).sin()
+                })
+                .collect();
             dsp.process(&signal);
         }
         let inst = dsp.rms_acf();
         let accum = dsp.rms_acf_accum();
+        // After convergence, accum tracks inst. Tighter tolerance is fine because
+        // the EMA at 5τ has ~99% reached steady state.
         for (i, (a, b)) in accum.iter().zip(inst.iter()).enumerate() {
             assert!(
                 (a - b).abs() < 0.05,
@@ -886,5 +891,9 @@ mod tests {
                 i, a, b
             );
         }
+        // Sanity: at least *some* lag must be non-trivially non-zero — otherwise
+        // the test is vacuous again.
+        let max_abs = inst.iter().map(|v| v.abs()).fold(0.0_f32, f32::max);
+        assert!(max_abs > 0.01, "expected non-trivial ACF; max |inst| = {}", max_abs);
     }
 }
