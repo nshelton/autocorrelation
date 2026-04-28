@@ -20,6 +20,10 @@ export class App {
   private rmsLine?: LineRenderer;
   private bufferAcfLine?: LineRenderer;
   private rmsAcfLine?: LineRenderer;
+  private lowRmsLine?: LineRenderer;
+  private midRmsLine?: LineRenderer;
+  private highRmsLine?: LineRenderer;
+  private lowRmsAcfLine?: LineRenderer;
   private store = new FeatureStore();
   private last = 0;
   private fps = new FpsOverlay();
@@ -116,7 +120,7 @@ export class App {
 
     node.port.onmessage = (e) => {
       const msg = e.data as
-        | { type: "features"; waveform?: Float32Array; spectrum?: Float32Array; rms?: Float32Array; bufferAcf?: Float32Array; rmsAcf?: Float32Array }
+        | { type: "features"; waveform?: Float32Array; spectrum?: Float32Array; rms?: Float32Array; bufferAcf?: Float32Array; rmsAcf?: Float32Array; rmsLow?: Float32Array; rmsMid?: Float32Array; rmsHigh?: Float32Array; rmsAcfLow?: Float32Array }
         | { type: "configured"; waveformLen: number; spectrumLen: number; bufferAcfLen: number; rmsLen: number; rmsAcfLen: number };
       if (msg.type === "features") {
         if (msg.waveform) this.store.set("waveform", msg.waveform);
@@ -124,6 +128,10 @@ export class App {
         if (msg.rms) this.store.set("rms", msg.rms);
         if (msg.bufferAcf) this.store.set("bufferAcf", msg.bufferAcf);
         if (msg.rmsAcf) this.store.set("rmsAcf", msg.rmsAcf);
+        if (msg.rmsLow) this.store.set("rmsLow", msg.rmsLow);
+        if (msg.rmsMid) this.store.set("rmsMid", msg.rmsMid);
+        if (msg.rmsHigh) this.store.set("rmsHigh", msg.rmsHigh);
+        if (msg.rmsAcfLow) this.store.set("rmsAcfLow", msg.rmsAcfLow);
         return;
       }
       if (msg.type === "configured") {
@@ -141,7 +149,11 @@ export class App {
       this.waveformLine?.update();
       this.bufferAcfLine?.update();
       this.spectrumLine?.update();
+      this.lowRmsLine?.update();
+      this.midRmsLine?.update();
+      this.highRmsLine?.update();
       this.rmsLine?.update();
+      this.lowRmsAcfLine?.update();
       this.rmsAcfLine?.update();
       renderer.render(scene, camera);
       this.fps.end();
@@ -157,7 +169,17 @@ export class App {
     rmsLen: number;
     rmsAcfLen: number;
   }): void {
-    for (const line of [this.waveformLine, this.bufferAcfLine, this.spectrumLine, this.rmsLine, this.rmsAcfLine]) {
+    for (const line of [
+      this.waveformLine,
+      this.bufferAcfLine,
+      this.spectrumLine,
+      this.lowRmsLine,
+      this.midRmsLine,
+      this.highRmsLine,
+      this.rmsLine,
+      this.lowRmsAcfLine,
+      this.rmsAcfLine,
+    ]) {
       line?.dispose();
     }
 
@@ -166,6 +188,10 @@ export class App {
     this.store.set("rms", new Float32Array(sizes.rmsLen));
     this.store.set("bufferAcf", new Float32Array(sizes.bufferAcfLen));
     this.store.set("rmsAcf", new Float32Array(sizes.rmsAcfLen));
+    this.store.set("rmsLow", new Float32Array(sizes.rmsLen));
+    this.store.set("rmsMid", new Float32Array(sizes.rmsLen));
+    this.store.set("rmsHigh", new Float32Array(sizes.rmsLen));
+    this.store.set("rmsAcfLow", new Float32Array(sizes.rmsAcfLen));
 
     this.waveformLine = new LineRenderer({
       source: () => this.store.get("waveform"),
@@ -188,12 +214,40 @@ export class App {
     });
     this.scene.add(this.spectrumLine.object3d);
 
+    this.lowRmsLine = new LineRenderer({
+      source: () => this.store.get("rmsLow"),
+      layout: linearLayout(-0.5, 0.4),
+      color: 0xff4444,
+    });
+    this.scene.add(this.lowRmsLine.object3d);
+
+    this.midRmsLine = new LineRenderer({
+      source: () => this.store.get("rmsMid"),
+      layout: linearLayout(-0.5, 0.4),
+      color: 0x44ff44,
+    });
+    this.scene.add(this.midRmsLine.object3d);
+
+    this.highRmsLine = new LineRenderer({
+      source: () => this.store.get("rmsHigh"),
+      layout: linearLayout(-0.5, 0.4),
+      color: 0x4488ff,
+    });
+    this.scene.add(this.highRmsLine.object3d);
+
     this.rmsLine = new LineRenderer({
       source: () => this.store.get("rms"),
       layout: linearLayout(-0.5, 0.4),
       color: 0xffffff,
     });
     this.scene.add(this.rmsLine.object3d);
+
+    this.lowRmsAcfLine = new LineRenderer({
+      source: () => this.store.get("rmsAcfLow"),
+      layout: linearLayout(-1.0, 0.4),
+      color: 0xff4444,
+    });
+    this.scene.add(this.lowRmsAcfLine.object3d);
 
     this.rmsAcfLine = new LineRenderer({
       source: () => this.store.get("rmsAcf"),
