@@ -14,6 +14,10 @@ const SMOOTHING_TAU_SECS: f32 = 0.0956;
 const LOW_BAND_HZ_MAX: f32 = 150.0;
 /// Crossover from mid band to high band, in Hz.
 const MID_BAND_HZ_MAX: f32 = 1500.0;
+/// Default time constant for the rms_acf decaying accumulator (seconds).
+/// 4 s gives stable peaks for steady tempo while still tracking gradual
+/// tempo changes within ~10–15 seconds.
+const ACCUM_TAU_DEFAULT_SECS: f32 = 4.0;
 
 #[wasm_bindgen]
 pub struct Dsp {
@@ -32,6 +36,14 @@ pub struct Dsp {
     rms_history: Vec<f32>,
     buffer_acf: Vec<f32>,
     rms_acf: Vec<f32>,
+    /// Decaying EMA accumulator over `rms_acf`. Same length. Used as the
+    /// signal for tempo peak picking — the EMA suppresses per-frame noise
+    /// in the instantaneous ACF so true tempo peaks build up.
+    rms_acf_accum: Vec<f32>,
+    /// Per-process EMA coefficient for `rms_acf_accum`. Computed from
+    /// `accum_tau_secs` and the same `dt` used for `smoothing_alpha`:
+    /// `alpha = 1 - exp(-dt / tau)`. Tunable via `set_accum_tau_secs`.
+    accum_alpha: f32,
     rms_detrended: Vec<f32>,
     /// Per-process-call EMA coefficient for the spectrum. Computed from
     /// `SMOOTHING_TAU_SECS` and the wall-clock dt between hops
@@ -83,6 +95,7 @@ impl Dsp {
         let mid_band_bin_end = bin_for_hz(MID_BAND_HZ_MAX, sample_rate, window_size);
         let hann_energy: f32 = hann.iter().map(|h| h * h).sum();
         let parseval_band_scale = 2.0 / (window_size as f32 * hann_energy);
+        let accum_alpha = 1.0 - (-dt / ACCUM_TAU_DEFAULT_SECS).exp();
         Dsp {
             waveform: vec![0.0; window_size],
             fft,
@@ -95,6 +108,8 @@ impl Dsp {
             rms_history: vec![0.0; rms_history_len],
             buffer_acf: vec![0.0; window_size / 2],
             rms_acf: vec![0.0; rms_history_len / 2],
+            rms_acf_accum: vec![0.0; rms_history_len / 2],
+            accum_alpha,
             rms_detrended: vec![0.0; rms_history_len],
             smoothing_alpha,
             dt,
@@ -117,6 +132,15 @@ impl Dsp {
     pub fn set_smoothing_tau(&mut self, tau_secs: f32) {
         let tau = tau_secs.clamp(0.001, 10.0);
         self.smoothing_alpha = 1.0 - (-self.dt / tau).exp();
+    }
+
+    /// Set the time constant (seconds) for the rms_acf decaying accumulator.
+    /// `accum_alpha` is recomputed as `1 - exp(-dt / tau)`. Smaller tau →
+    /// faster response, less stable peaks. Clamped to [0.05, 60.0] to avoid
+    /// divide-by-zero and runaway settling.
+    pub fn set_accum_tau_secs(&mut self, tau_secs: f32) {
+        let tau = tau_secs.clamp(0.05, 60.0);
+        self.accum_alpha = 1.0 - (-self.dt / tau).exp();
     }
 
     pub fn set_db_floor(&mut self, floor: f32) {
@@ -204,6 +228,14 @@ impl Dsp {
         }
         autocorrelate(&self.rms_detrended, &mut self.rms_acf);
 
+        // EMA-decayed accumulator over the instantaneous full-band ACF.
+        // Builds up steady tempo peaks across many hops; suppresses
+        // per-frame noise. Same alpha pattern as `smoothing_alpha`.
+        for i in 0..self.rms_acf_accum.len() {
+            self.rms_acf_accum[i] = self.accum_alpha * self.rms_acf[i]
+                + (1.0 - self.accum_alpha) * self.rms_acf_accum[i];
+        }
+
         let low_mean = (self.low_rms_history.iter().map(|&x| x as f64).sum::<f64>()
             / self.low_rms_history.len() as f64) as f32;
         for (dst, src) in self.low_rms_detrended.iter_mut().zip(self.low_rms_history.iter()) {
@@ -241,6 +273,10 @@ impl Dsp {
 
     pub fn rms_acf(&self) -> Vec<f32> {
         self.rms_acf.clone()
+    }
+
+    pub fn rms_acf_accum(&self) -> Vec<f32> {
+        self.rms_acf_accum.clone()
     }
 
     pub fn low_rms_acf(&self) -> Vec<f32> {
@@ -770,6 +806,84 @@ mod tests {
                 v.abs() < 1e-4,
                 "expected near-zero detrended ACF for constant input, got {}",
                 v
+            );
+        }
+    }
+
+    #[test]
+    fn accum_alpha_matches_formula() {
+        // alpha = 1 - exp(-dt / tau) at default tau (4.0 s), dt = 1024/48000
+        let dsp = Dsp::new(2048, 48000.0, 1024, 512);
+        let dt = 1024.0_f32 / 48000.0;
+        let expected = 1.0 - (-dt / ACCUM_TAU_DEFAULT_SECS).exp();
+        assert!(
+            (dsp.accum_alpha - expected).abs() < 1e-6,
+            "got {}, expected {}",
+            dsp.accum_alpha,
+            expected
+        );
+    }
+
+    #[test]
+    fn set_accum_tau_secs_clamps_and_recomputes() {
+        let mut dsp = Dsp::new(2048, 48000.0, 1024, 512);
+        let before = dsp.accum_alpha;
+        dsp.set_accum_tau_secs(20.0);
+        assert!(dsp.accum_alpha < before, "longer tau should yield smaller alpha");
+
+        // Below clamp: 0.001 should clamp up to 0.05.
+        dsp.set_accum_tau_secs(0.001);
+        let dt = 1024.0_f32 / 48000.0;
+        let expected = 1.0 - (-dt / 0.05).exp();
+        assert!((dsp.accum_alpha - expected).abs() < 1e-6, "lower clamp not applied");
+
+        // Above clamp: 1000.0 should clamp down to 60.0.
+        dsp.set_accum_tau_secs(1000.0);
+        let expected = 1.0 - (-dt / 60.0).exp();
+        assert!((dsp.accum_alpha - expected).abs() < 1e-6, "upper clamp not applied");
+    }
+
+    #[test]
+    fn rms_acf_accum_silent_input_is_zero() {
+        let mut dsp = Dsp::new(2048, 48000.0, 1024, 512);
+        let silent = vec![0.0_f32; 2048];
+        for _ in 0..200 {
+            dsp.process(&silent);
+        }
+        let accum = dsp.rms_acf_accum();
+        assert_eq!(accum.len(), 256);
+        for &v in &accum {
+            assert_eq!(v, 0.0, "silent → accumulator must stay zero, got {}", v);
+        }
+    }
+
+    #[test]
+    fn rms_acf_accum_converges_to_instantaneous_for_steady_periodic() {
+        // Feed a steady periodic signal long enough for both rms_history to fill
+        // AND the accumulator to converge. After convergence,
+        // rms_acf_accum[k] ≈ rms_acf[k] for all k.
+        let mut dsp = Dsp::new(2048, 48000.0, 1024, 512);
+        let sr = 48000.0_f32;
+        // Use a slowly-modulated signal so RMS history has structure (not flat).
+        let signal: Vec<f32> = (0..2048)
+            .map(|i| {
+                let t = i as f32 / sr;
+                0.5 * (2.0 * std::f32::consts::PI * 1000.0 * t).sin()
+                    * (1.0 + 0.3 * (2.0 * std::f32::consts::PI * 4.0 * t).sin())
+            })
+            .collect();
+        // Convergence rule of thumb: ~5τ at default 4 s tau, dt ≈ 21.33 ms → ~940 hops.
+        // Use 1500 hops for headroom.
+        for _ in 0..1500 {
+            dsp.process(&signal);
+        }
+        let inst = dsp.rms_acf();
+        let accum = dsp.rms_acf_accum();
+        for (i, (a, b)) in accum.iter().zip(inst.iter()).enumerate() {
+            assert!(
+                (a - b).abs() < 0.05,
+                "lag {}: accum {} should track inst {}",
+                i, a, b
             );
         }
     }
