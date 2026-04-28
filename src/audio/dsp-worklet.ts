@@ -2,14 +2,21 @@
 import "./worklet-polyfills";
 import init, { Dsp } from "../wasm-pkg/dsp";
 
-const WINDOW_SIZE = 2048;
-const HOP_SIZE = 512;
+type WorkletInbound =
+  | { type: "configure"; windowSize: number; rmsHistoryLen: number }
+  | { type: "param"; key: "hopSize" | "smoothingAlpha" | "dbFloor"; value: number };
 
 class DSPProcessor extends AudioWorkletProcessor {
-  private window = new Float32Array(WINDOW_SIZE);
+  private window: Float32Array = new Float32Array(2048);
   private hopCounter = 0;
   private dsp: Dsp | null = null;
   private ready = false;
+  private windowSize = 2048;
+  private hopSize = 1024;
+  private rmsHistoryLen = 512;
+  private smoothingAlpha = 0.2;
+  private dbFloor = -100;
+  private pendingConfigure: { windowSize: number; rmsHistoryLen: number } | null = null;
 
   constructor(options?: AudioWorkletNodeOptions) {
     super();
@@ -17,15 +24,65 @@ class DSPProcessor extends AudioWorkletProcessor {
     if (!wasmModule) {
       throw new Error("[dsp-worklet] missing wasmModule in processorOptions");
     }
+    this.port.onmessage = (e) => this.onMessage(e.data as WorkletInbound);
     this.boot(wasmModule);
   }
 
   private async boot(wasmModule: WebAssembly.Module) {
     await init({ module_or_path: wasmModule });
-    // `sampleRate` is a global in AudioWorkletGlobalScope (typed by
-    // @types/audioworklet, referenced at the top of this file).
-    this.dsp = new Dsp(WINDOW_SIZE, sampleRate, HOP_SIZE);
+    const cfg = this.pendingConfigure ?? { windowSize: this.windowSize, rmsHistoryLen: this.rmsHistoryLen };
+    this.applyConfigure(cfg);
     this.ready = true;
+    if (this.dsp) {
+      this.dsp.set_smoothing_alpha(this.smoothingAlpha);
+      this.dsp.set_db_floor(this.dbFloor);
+    }
+  }
+
+  private onMessage(msg: WorkletInbound) {
+    if (msg.type === "configure") {
+      if (!this.ready) {
+        this.pendingConfigure = { windowSize: msg.windowSize, rmsHistoryLen: msg.rmsHistoryLen };
+        return;
+      }
+      this.applyConfigure(msg);
+      return;
+    }
+    if (msg.type === "param") {
+      if (msg.key === "hopSize") {
+        this.hopSize = Math.min(msg.value, this.windowSize);
+      } else if (msg.key === "smoothingAlpha") {
+        this.smoothingAlpha = msg.value;
+        if (this.ready && this.dsp) this.dsp.set_smoothing_alpha(msg.value);
+      } else if (msg.key === "dbFloor") {
+        this.dbFloor = msg.value;
+        if (this.ready && this.dsp) this.dsp.set_db_floor(msg.value);
+      }
+      return;
+    }
+  }
+
+  private applyConfigure(cfg: { windowSize: number; rmsHistoryLen: number }) {
+    if (this.dsp) {
+      this.dsp.free();
+      this.dsp = null;
+    }
+    this.windowSize = cfg.windowSize;
+    this.rmsHistoryLen = cfg.rmsHistoryLen;
+    this.window = new Float32Array(this.windowSize);
+    this.hopCounter = 0;
+    this.hopSize = Math.min(this.hopSize, this.windowSize);
+    this.dsp = new Dsp(this.windowSize, sampleRate, this.hopSize, this.rmsHistoryLen);
+    this.dsp.set_smoothing_alpha(this.smoothingAlpha);
+    this.dsp.set_db_floor(this.dbFloor);
+    this.port.postMessage({
+      type: "configured",
+      waveformLen: this.windowSize,
+      spectrumLen: this.windowSize / 2,
+      bufferAcfLen: this.windowSize / 2,
+      rmsLen: this.rmsHistoryLen,
+      rmsAcfLen: this.rmsHistoryLen / 2,
+    });
   }
 
   process(inputs: Float32Array[][]): boolean {
@@ -37,19 +94,15 @@ class DSPProcessor extends AudioWorkletProcessor {
 
     const len = channel.length;
 
-    // Slide the window: shift left by `len`, append new samples at the end.
-    // Buffer always holds the most recent WINDOW_SIZE samples; zero-padded at boot.
-    if (len >= WINDOW_SIZE) {
-      // Edge case: chunk is at least as large as the window — just take the tail.
-      this.window.set(channel.subarray(len - WINDOW_SIZE));
+    if (len >= this.windowSize) {
+      this.window.set(channel.subarray(len - this.windowSize));
     } else {
       this.window.copyWithin(0, len);
-      this.window.set(channel, WINDOW_SIZE - len);
+      this.window.set(channel, this.windowSize - len);
     }
 
-    // Fire FFT every HOP_SIZE new samples for ~94 Hz update rate (25% overlap).
     this.hopCounter += len;
-    while (this.hopCounter >= HOP_SIZE) {
+    while (this.hopCounter >= this.hopSize) {
       this.dsp.process(this.window);
       const wf = new Float32Array(this.dsp.waveform());
       const sp = new Float32Array(this.dsp.spectrum());
@@ -60,7 +113,7 @@ class DSPProcessor extends AudioWorkletProcessor {
         { type: "features", waveform: wf, spectrum: sp, rms, bufferAcf: ba, rmsAcf: ra },
         [wf.buffer, sp.buffer, rms.buffer, ba.buffer, ra.buffer],
       );
-      this.hopCounter -= HOP_SIZE;
+      this.hopCounter -= this.hopSize;
     }
 
     return true;
