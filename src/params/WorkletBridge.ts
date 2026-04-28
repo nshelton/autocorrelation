@@ -7,6 +7,16 @@ export class WorkletBridge {
     store.subscribe((key) => this.handleChange(key));
   }
 
+  /**
+   * Send the worklet the current store state as one configure message
+   * + one param message per hot key. Must be called by the App after
+   * constructing the worklet node and wiring `onmessage`. The class
+   * subscribes to the store at construction, so any `store.set()` calls
+   * after construction but before `bootstrap()` will post messages to a
+   * worklet that may not yet be ready (the worklet's pre-boot pending
+   * state covers this for `configure`, but `param` messages received
+   * before `Dsp` is ready are silently dropped).
+   */
   bootstrap(): void {
     this.port.postMessage({
       type: "configure",
@@ -28,8 +38,9 @@ export class WorkletBridge {
       return;
     }
     if (key.startsWith("dsp.")) {
-      const hotKey = key.slice("dsp.".length) as (typeof HOT_KEYS)[number];
-      if (!HOT_KEYS.includes(hotKey)) return;
+      const suffix = key.slice("dsp.".length);
+      if (!(HOT_KEYS as readonly string[]).includes(suffix)) return;
+      const hotKey = suffix as (typeof HOT_KEYS)[number];
       this.port.postMessage({ type: "param", key: hotKey, value: this.resolveHotValue(hotKey) });
     }
   }
