@@ -8,6 +8,13 @@ import dspWorkletUrl from "./audio/dsp-worklet?worker&url";
 import dspWasmUrl from "./wasm-pkg/dsp_bg.wasm?url";
 import type { AudioSourceBundle } from "./audio/AudioSource";
 
+// Constructor refs are mutable so the HMR accept callback can swap them in.
+// Vite's `accept(deps, cb)` does NOT rewire the file's static imports — the
+// callback receives the new module exports and we update these refs.
+let AppCtor: typeof App = App;
+let ParamPanelCtor: typeof ParamPanel = ParamPanel;
+let WorkletBridgeCtor: typeof WorkletBridge = WorkletBridge;
+
 let pageDeps: AppDeps | null = null;
 let app: App | null = null;
 let panel: ParamPanel | null = null;
@@ -65,9 +72,9 @@ async function buildPageDeps(factory: () => Promise<AudioSourceBundle>): Promise
 }
 
 function buildAppLayer(deps: AppDeps): void {
-  app = new App(deps);
-  panel = new ParamPanel(deps.paramStore);
-  bridge = new WorkletBridge(deps.paramStore, deps.workletNode.port);
+  app = new AppCtor(deps);
+  panel = new ParamPanelCtor(deps.paramStore);
+  bridge = new WorkletBridgeCtor(deps.paramStore, deps.workletNode.port);
   app.start();
   if (initialBootstrap) {
     bridge.bootstrap();
@@ -75,7 +82,6 @@ function buildAppLayer(deps: AppDeps): void {
   }
 }
 
-// @ts-expect-error: used in T5 (HMR accept callback) — replace this directive with the actual call site
 function teardownAppLayer(): void {
   app?.dispose();
   panel?.dispose();
@@ -143,3 +149,24 @@ window.addEventListener(
   },
   { once: true },
 );
+
+if (import.meta.hot) {
+  import.meta.hot.accept(
+    ["./App", "./params/ParamPanel", "./params/WorkletBridge"],
+    ([appMod, panelMod, bridgeMod]) => {
+      // Each entry is `Module | undefined`; undefined means the module didn't
+      // change in this update batch — keep the existing constructor ref.
+      if (appMod && appMod.App) AppCtor = appMod.App;
+      if (panelMod && panelMod.ParamPanel) ParamPanelCtor = panelMod.ParamPanel;
+      if (bridgeMod && bridgeMod.WorkletBridge) WorkletBridgeCtor = bridgeMod.WorkletBridge;
+      if (!pageDeps) return;
+      teardownAppLayer();
+      try {
+        buildAppLayer(pageDeps);
+      } catch (err) {
+        console.error("[hmr] failed to rebuild App layer:", err);
+        // app/panel/bridge stay null. Next successful save retries.
+      }
+    },
+  );
+}
