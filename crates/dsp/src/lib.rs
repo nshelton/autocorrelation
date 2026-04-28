@@ -3,7 +3,11 @@ use realfft::{RealFftPlanner, RealToComplex};
 use std::sync::Arc;
 use wasm_bindgen::prelude::*;
 
-const SMOOTHING_ALPHA: f32 = 0.2;
+/// Spectrum smoothing time constant in seconds. Chosen to preserve the
+/// legacy alpha ≈ 0.2 behavior at sr=48000, hop=1024:
+///   alpha = 1 - exp(-dt/tau), dt = 1024/48000 = 21.33 ms
+///   0.2 ≈ 1 - exp(-21.33ms / 95.6ms)
+const SMOOTHING_TAU_SECS: f32 = 0.0956;
 const DB_FLOOR: f32 = -100.0;
 const RMS_HISTORY_LEN: usize = 512;
 const RMS_ACF_LEN: usize = RMS_HISTORY_LEN / 2;
@@ -25,12 +29,17 @@ pub struct Dsp {
     buffer_acf: Vec<f32>,
     rms_acf: Vec<f32>,
     rms_detrended: Vec<f32>,
+    /// Per-process-call EMA coefficient for the spectrum. Computed from
+    /// `SMOOTHING_TAU_SECS` and the wall-clock dt between hops
+    /// (`hop_size / sample_rate`), so changing `hop_size` does NOT change
+    /// perceived smoothing dynamics.
+    smoothing_alpha: f32,
 }
 
 #[wasm_bindgen]
 impl Dsp {
     #[wasm_bindgen(constructor)]
-    pub fn new(window_size: usize) -> Dsp {
+    pub fn new(window_size: usize, sample_rate: f32, hop_size: usize) -> Dsp {
         let mut planner = RealFftPlanner::<f32>::new();
         let fft = planner.plan_fft_forward(window_size);
         let freq_buffer = fft.make_output_vec();
@@ -41,6 +50,8 @@ impl Dsp {
             })
             .collect();
         let mag_scale = 2.0 / hann.iter().sum::<f32>();
+        let dt = hop_size as f32 / sample_rate;
+        let smoothing_alpha = 1.0 - (-dt / SMOOTHING_TAU_SECS).exp();
         Dsp {
             waveform: vec![0.0; window_size],
             fft,
@@ -53,6 +64,7 @@ impl Dsp {
             buffer_acf: vec![0.0; window_size / 2],
             rms_acf: vec![0.0; RMS_ACF_LEN],
             rms_detrended: vec![0.0; RMS_HISTORY_LEN],
+            smoothing_alpha,
         }
     }
 
@@ -105,8 +117,8 @@ impl Dsp {
             };
             let clipped = db.clamp(DB_FLOOR, 0.0);
             let normalized = (clipped - DB_FLOOR) / (-DB_FLOOR); // [0, 1]
-            self.spectrum[out_i] =
-                SMOOTHING_ALPHA * normalized + (1.0 - SMOOTHING_ALPHA) * self.spectrum[out_i];
+            self.spectrum[out_i] = self.smoothing_alpha * normalized
+                + (1.0 - self.smoothing_alpha) * self.spectrum[out_i];
         }
     }
 
@@ -162,7 +174,7 @@ mod tests {
 
     #[test]
     fn process_then_waveform_returns_input() {
-        let mut dsp = Dsp::new(8);
+        let mut dsp = Dsp::new(8, 48000.0, 4);
         let input: Vec<f32> = (0..8).map(|i| i as f32 * 0.1).collect();
         dsp.process(&input);
         assert_eq!(dsp.waveform(), input);
@@ -170,13 +182,13 @@ mod tests {
 
     #[test]
     fn spectrum_has_window_size_div_2_bins() {
-        let dsp = Dsp::new(2048);
+        let dsp = Dsp::new(2048, 48000.0, 1024);
         assert_eq!(dsp.spectrum().len(), 1024);
     }
 
     #[test]
     fn silent_input_yields_low_spectrum() {
-        let mut dsp = Dsp::new(2048);
+        let mut dsp = Dsp::new(2048, 48000.0, 1024);
         let silent = vec![0.0; 2048];
         for _ in 0..30 {
             dsp.process(&silent);
@@ -189,7 +201,7 @@ mod tests {
 
     #[test]
     fn rms_of_unit_amplitude_constant_is_one() {
-        let mut dsp = Dsp::new(8);
+        let mut dsp = Dsp::new(8, 48000.0, 4);
         let constant = vec![1.0_f32; 8];
         dsp.process(&constant);
         let h = dsp.rms_history();
@@ -201,7 +213,7 @@ mod tests {
 
     #[test]
     fn rms_of_silence_is_zero() {
-        let mut dsp = Dsp::new(8);
+        let mut dsp = Dsp::new(8, 48000.0, 4);
         dsp.process(&vec![0.0_f32; 8]);
         let h = dsp.rms_history();
         assert_eq!(h[h.len() - 1], 0.0);
@@ -209,7 +221,7 @@ mod tests {
 
     #[test]
     fn rms_history_shifts_oldest_out() {
-        let mut dsp = Dsp::new(4);
+        let mut dsp = Dsp::new(4, 48000.0, 4);
         // Push three distinct values
         dsp.process(&[1.0, 1.0, 1.0, 1.0]); // rms = 1
         dsp.process(&[2.0, 2.0, 2.0, 2.0]); // rms = 2
@@ -224,7 +236,7 @@ mod tests {
 
     #[test]
     fn loud_sine_produces_a_peak() {
-        let mut dsp = Dsp::new(2048);
+        let mut dsp = Dsp::new(2048, 48000.0, 1024);
         let sr = 48000.0_f32;
         let freq = 1000.0_f32;
         let signal: Vec<f32> = (0..2048)
@@ -267,13 +279,13 @@ mod tests {
 
     #[test]
     fn buffer_acf_has_correct_length() {
-        let dsp = Dsp::new(2048);
+        let dsp = Dsp::new(2048, 48000.0, 1024);
         assert_eq!(dsp.buffer_acf().len(), 1024);
     }
 
     #[test]
     fn buffer_acf_zero_lag_is_one_for_nonzero_signal() {
-        let mut dsp = Dsp::new(2048);
+        let mut dsp = Dsp::new(2048, 48000.0, 1024);
         let signal: Vec<f32> = (0..2048)
             .map(|i| ((i as f32) * 0.1).sin())
             .collect();
@@ -284,7 +296,7 @@ mod tests {
 
     #[test]
     fn buffer_acf_of_sine_peaks_at_period() {
-        let mut dsp = Dsp::new(2048);
+        let mut dsp = Dsp::new(2048, 48000.0, 1024);
         let sr = 48000.0_f32;
         let freq = 1000.0_f32;
         // Period at this sr/freq is exactly 48 samples.
@@ -303,13 +315,13 @@ mod tests {
 
     #[test]
     fn rms_acf_has_correct_length() {
-        let dsp = Dsp::new(2048);
+        let dsp = Dsp::new(2048, 48000.0, 1024);
         assert_eq!(dsp.rms_acf().len(), 256);
     }
 
     #[test]
     fn acf_of_silence_is_zero() {
-        let mut dsp = Dsp::new(2048);
+        let mut dsp = Dsp::new(2048, 48000.0, 1024);
         dsp.process(&vec![0.0_f32; 2048]);
         for &v in dsp.buffer_acf().iter() {
             assert_eq!(v, 0.0);
@@ -323,7 +335,7 @@ mod tests {
     fn rms_acf_constant_input_is_zero() {
         // Fill rms_history with a constant rms value, then verify the
         // detrended (mean-subtracted) ACF is zero everywhere.
-        let mut dsp = Dsp::new(8);
+        let mut dsp = Dsp::new(8, 48000.0, 4);
         let constant = vec![0.5_f32; 8];
         // RMS of [0.5; 8] is 0.5; need >= RMS_HISTORY_LEN (512) calls to fully fill.
         for _ in 0..512 {
@@ -334,5 +346,51 @@ mod tests {
         for &v in &acf {
             assert!(v.abs() < 1e-5, "expected near-zero ACF for constant rms, got {}", v);
         }
+    }
+
+    #[test]
+    fn smoothing_alpha_matches_time_constant_formula() {
+        // alpha = 1 - exp(-dt/tau) where dt = hop_size / sample_rate
+        let dsp = Dsp::new(2048, 48000.0, 1024);
+        let dt = 1024.0_f32 / 48000.0;
+        let expected = 1.0 - (-dt / SMOOTHING_TAU_SECS).exp();
+        assert!(
+            (dsp.smoothing_alpha - expected).abs() < 1e-6,
+            "alpha {} != expected {}",
+            dsp.smoothing_alpha,
+            expected
+        );
+    }
+
+    #[test]
+    fn smoothing_alpha_at_legacy_settings_is_approximately_0_2() {
+        // SMOOTHING_TAU_SECS is chosen so that at sr=48000, hop=1024
+        // alpha ≈ 0.2 — i.e., the legacy hard-coded value is preserved.
+        let dsp = Dsp::new(2048, 48000.0, 1024);
+        assert!(
+            (dsp.smoothing_alpha - 0.2).abs() < 0.005,
+            "expected alpha ≈ 0.2 at legacy settings, got {}",
+            dsp.smoothing_alpha
+        );
+    }
+
+    #[test]
+    fn smoothing_alpha_shrinks_at_smaller_hop() {
+        // Halving hop ≈ halves alpha (small-dt regime: 1 - exp(-x) ≈ x).
+        // Wall-clock dynamics stay the same; per-call coefficient changes.
+        let large = Dsp::new(2048, 48000.0, 1024);
+        let small = Dsp::new(2048, 48000.0, 512);
+        assert!(
+            small.smoothing_alpha < large.smoothing_alpha,
+            "small {} should be < large {}",
+            small.smoothing_alpha,
+            large.smoothing_alpha
+        );
+        let ratio = small.smoothing_alpha / large.smoothing_alpha;
+        assert!(
+            (0.45..=0.55).contains(&ratio),
+            "expected ratio ≈ 0.5, got {}",
+            ratio
+        );
     }
 }
