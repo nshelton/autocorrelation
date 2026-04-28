@@ -2,7 +2,7 @@ import Stats from "stats.js";
 
 /**
  * Thin wrapper around stats.js. Mounts a small DOM panel in the
- * top-right corner; begin/end called per render frame.
+ * top-left corner; begin/end called per render frame.
  */
 export class FpsOverlay {
   private stats: Stats;
@@ -16,8 +16,8 @@ export class FpsOverlay {
     const dom = this.stats.dom;
     dom.style.position = "fixed";
     dom.style.top = "1rem";
-    dom.style.right = "1rem";
-    dom.style.left = "auto";
+    dom.style.right = "auto";
+    dom.style.left = "1rem";
     dom.style.zIndex = "10";
     parent.appendChild(dom);
   }
