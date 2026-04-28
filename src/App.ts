@@ -7,6 +7,7 @@ import dspWorkletUrl from "./audio/dsp-worklet?worker&url";
 import dspWasmUrl from "./wasm-pkg/dsp_bg.wasm?url";
 import { createMicSource, type AudioSourceBundle } from "./audio/AudioSource";
 import { FeatureStore } from "./store/FeatureStore";
+import { FpsOverlay } from "./ui/Stats";
 
 export class App {
   private rig!: CameraRig;
@@ -15,6 +16,7 @@ export class App {
   private rmsLine!: LineRenderer;
   private store = new FeatureStore();
   private last = 0;
+  private fps = new FpsOverlay();
 
   async start(
     canvas: HTMLCanvasElement,
@@ -66,6 +68,8 @@ export class App {
     });
     scene.add(this.rmsLine.object3d);
 
+    this.fps.mount();
+
     let toggled = false;
     const presetKeys: Record<string, string> = {
       "1": "front",
@@ -109,6 +113,7 @@ export class App {
     };
 
     const loop = (now: number) => {
+      this.fps.begin();
       const dt = this.last === 0 ? 0 : (now - this.last) / 1000;
       this.last = now;
       this.rig.update(dt);
@@ -116,6 +121,7 @@ export class App {
       this.spectrumLine.update();
       this.rmsLine.update();
       renderer.render(scene, camera);
+      this.fps.end();
       requestAnimationFrame(loop);
     };
     requestAnimationFrame(loop);
