@@ -13,6 +13,16 @@ function makePort() {
   return { postMessage: vi.fn() } as unknown as MessagePort;
 }
 
+function makeMockPort() {
+  const posted: unknown[] = [];
+  const port = {
+    postMessage: (msg: unknown) => {
+      posted.push(msg);
+    },
+  } as unknown as MessagePort;
+  return { port, posted };
+}
+
 describe("WorkletBridge", () => {
   beforeEach(() => {
     localStorage.clear();
@@ -69,5 +79,19 @@ describe("WorkletBridge", () => {
       key: "hopSize",
       value: 512,
     });
+  });
+
+  it("dispose() unsubscribes from the store", () => {
+    const store = new ParamStore();
+    for (const s of analysisSchemas) store.register(s);
+    const port = makeMockPort();
+    const bridge = new WorkletBridge(store, port.port);
+    port.posted.length = 0; // ignore subscription-time messages, if any
+
+    bridge.dispose();
+
+    // Mutate the store; after dispose, no further messages should be posted.
+    store.set("dsp.smoothingTauSecs", 0.05);
+    expect(port.posted).toHaveLength(0);
   });
 });

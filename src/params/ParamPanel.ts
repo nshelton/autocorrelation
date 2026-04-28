@@ -4,6 +4,7 @@ import { ParamStore, type ParamSchema, type ParamValue } from "./ParamStore";
 export class ParamPanel {
   private pane: Pane;
   private bindings: Record<string, ParamValue> = {};
+  private unsubscribe: () => void;
 
   constructor(store: ParamStore, container?: HTMLElement) {
     this.pane = new Pane({ title: "Analysis", container });
@@ -15,7 +16,7 @@ export class ParamPanel {
       widget.on("change", (e: { value: ParamValue }) => store.set(schema.key, e.value));
     }
 
-    store.subscribe((key, value) => {
+    this.unsubscribe = store.subscribe((key, value) => {
       if (this.bindings[key] !== value) {
         this.bindings[key] = value;
         this.pane.refresh();
@@ -26,6 +27,7 @@ export class ParamPanel {
   }
 
   dispose(): void {
+    this.unsubscribe();
     this.pane.dispose();
   }
 

@@ -3,8 +3,14 @@ import type { ParamStore } from "./ParamStore";
 const HOT_KEYS = ["hopSize", "smoothingTauSecs", "dbFloor"] as const;
 
 export class WorkletBridge {
+  private unsubscribe: () => void;
+
   constructor(private store: ParamStore, private port: MessagePort) {
-    store.subscribe((key) => this.handleChange(key));
+    this.unsubscribe = store.subscribe((key) => this.handleChange(key));
+  }
+
+  dispose(): void {
+    this.unsubscribe();
   }
 
   /**
