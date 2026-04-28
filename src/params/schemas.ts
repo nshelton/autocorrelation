@@ -45,4 +45,14 @@ export const analysisSchemas: ParamSchema[] = [
     default: -100,
     reconfig: false,
   },
+  {
+    key: "dsp.accumTauSecs",
+    label: "ACF accumulator τ (s)",
+    kind: "continuous",
+    min: 0.05,
+    max: 60.0,
+    step: 0.1,
+    default: 4.0,
+    reconfig: false,
+  },
 ];
