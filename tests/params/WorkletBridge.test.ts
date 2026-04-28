@@ -28,7 +28,7 @@ describe("WorkletBridge", () => {
     localStorage.clear();
   });
 
-  it("bootstrap posts one configure + three param messages with current store values", () => {
+  it("bootstrap posts one configure + four param messages with current store values", () => {
     const store = makeStore();
     const port = makePort();
     const bridge = new WorkletBridge(store, port);
@@ -38,7 +38,8 @@ describe("WorkletBridge", () => {
     expect(calls).toContainEqual({ type: "param", key: "hopSize", value: 1024 });
     expect(calls).toContainEqual({ type: "param", key: "smoothingTauSecs", value: 0.0956 });
     expect(calls).toContainEqual({ type: "param", key: "dbFloor", value: -100 });
-    expect(calls.length).toBe(4);
+    expect(calls).toContainEqual({ type: "param", key: "accumTauSecs", value: 4.0 });
+    expect(calls.length).toBe(5);
   });
 
   it("windowSize change posts a configure message with both reconfig params", () => {
@@ -64,6 +65,19 @@ describe("WorkletBridge", () => {
       type: "param",
       key: "smoothingTauSecs",
       value: 0.5,
+    });
+  });
+
+  it("accumTauSecs change posts a param message with the hot key (no dsp prefix)", () => {
+    const store = makeStore();
+    const port = makePort();
+    new WorkletBridge(store, port);
+    (port.postMessage as ReturnType<typeof vi.fn>).mockClear();
+    store.set("dsp.accumTauSecs", 8.0);
+    expect(port.postMessage).toHaveBeenCalledWith({
+      type: "param",
+      key: "accumTauSecs",
+      value: 8.0,
     });
   });
 
