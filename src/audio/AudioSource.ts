@@ -1,7 +1,7 @@
 export interface AudioSourceBundle {
   context: AudioContext;
-  source: MediaStreamAudioSourceNode;
-  stream: MediaStream;
+  source: AudioNode;
+  stream?: MediaStream;
 }
 
 export async function createMicSource(): Promise<AudioSourceBundle> {
@@ -37,14 +37,12 @@ export async function createTabSource(): Promise<AudioSourceBundle> {
 
   const audioTracks = stream.getAudioTracks();
   if (audioTracks.length === 0) {
-    // Stop any video tracks we accidentally got
     stream.getTracks().forEach((t) => t.stop());
     throw new Error(
       "Selected source has no audio. Please pick a tab that's playing audio (and check the 'Share tab audio' box).",
     );
   }
 
-  // Drop video tracks; we only want audio.
   stream.getVideoTracks().forEach((t) => {
     t.stop();
     stream.removeTrack(t);
@@ -55,4 +53,23 @@ export async function createTabSource(): Promise<AudioSourceBundle> {
   const source = context.createMediaStreamSource(stream);
 
   return { context, source, stream };
+}
+
+/**
+ * Synthesize a known signal inside a fresh AudioContext for fast
+ * debug iteration. No browser dialogs, no permissions, no picker.
+ * Returns a pure tone at the given frequency.
+ */
+export async function createTestSource(
+  frequency: number = 440,
+): Promise<AudioSourceBundle> {
+  const context = new AudioContext();
+  if (context.state === "suspended") await context.resume();
+
+  const oscillator = context.createOscillator();
+  oscillator.frequency.value = frequency;
+  oscillator.type = "sine";
+  oscillator.start();
+
+  return { context, source: oscillator };
 }
