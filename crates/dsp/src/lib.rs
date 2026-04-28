@@ -15,6 +15,11 @@ pub struct Dsp {
     freq_buffer: Vec<Complex<f32>>,
     spectrum: Vec<f32>,
     hann: Vec<f32>,
+    /// Magnitude scale factor that converts raw FFT bin magnitude to
+    /// amplitude-equivalent units (so a unit-amplitude sine peaks at ~1.0).
+    /// Equals 2/sum(hann) — the 2 accounts for the one-sided real spectrum,
+    /// and sum(hann) ≈ N/2 corrects for window attenuation.
+    mag_scale: f32,
     rms_history: Vec<f32>,
 }
 
@@ -26,11 +31,12 @@ impl Dsp {
         let fft = planner.plan_fft_forward(window_size);
         let freq_buffer = fft.make_output_vec();
         let spectrum = vec![0.0; freq_buffer.len() - 1]; // drop DC
-        let hann = (0..window_size)
+        let hann: Vec<f32> = (0..window_size)
             .map(|i| {
                 0.5 - 0.5 * (2.0 * std::f32::consts::PI * i as f32 / (window_size as f32 - 1.0)).cos()
             })
             .collect();
+        let mag_scale = 2.0 / hann.iter().sum::<f32>();
         Dsp {
             waveform: vec![0.0; window_size],
             fft,
@@ -38,6 +44,7 @@ impl Dsp {
             freq_buffer,
             spectrum,
             hann,
+            mag_scale,
             rms_history: vec![0.0; RMS_HISTORY_LEN],
         }
     }
@@ -72,7 +79,7 @@ impl Dsp {
         // Magnitude → dB → normalized [0, 1] → smoothed
         // Skip bin 0 (DC); use bins 1..=spectrum.len()
         for (out_i, bin) in self.freq_buffer[1..=self.spectrum.len()].iter().enumerate() {
-            let mag = (bin.re * bin.re + bin.im * bin.im).sqrt();
+            let mag = (bin.re * bin.re + bin.im * bin.im).sqrt() * self.mag_scale;
             let db = if mag > 0.0 {
                 20.0 * mag.log10()
             } else {
