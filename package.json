@@ -11,6 +11,7 @@
     "wasm": "cd crates/dsp && wasm-pack build --target web --out-dir ../../src/wasm-pkg"
   },
   "devDependencies": {
+    "@tweakpane/core": "^2.0.5",
     "@types/audioworklet": "^0.0.98",
     "@types/node": "^22.0.0",
     "@types/stats.js": "^0.17.4",
@@ -24,6 +25,7 @@
   "dependencies": {
     "@types/three": "^0.170.0",
     "stats.js": "^0.17.0",
-    "three": "^0.170.0"
+    "three": "^0.170.0",
+    "tweakpane": "^4.0.0"
   }
 }
