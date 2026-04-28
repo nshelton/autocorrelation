@@ -6,6 +6,7 @@ use wasm_bindgen::prelude::*;
 const SMOOTHING_ALPHA: f32 = 0.2;
 const DB_FLOOR: f32 = -100.0;
 const RMS_HISTORY_LEN: usize = 512;
+const RMS_ACF_LEN: usize = RMS_HISTORY_LEN / 2;
 
 #[wasm_bindgen]
 pub struct Dsp {
@@ -22,6 +23,8 @@ pub struct Dsp {
     mag_scale: f32,
     rms_history: Vec<f32>,
     buffer_acf: Vec<f32>,
+    rms_acf: Vec<f32>,
+    rms_detrended: Vec<f32>,
 }
 
 #[wasm_bindgen]
@@ -48,6 +51,8 @@ impl Dsp {
             mag_scale,
             rms_history: vec![0.0; RMS_HISTORY_LEN],
             buffer_acf: vec![0.0; window_size / 2],
+            rms_acf: vec![0.0; RMS_ACF_LEN],
+            rms_detrended: vec![0.0; RMS_HISTORY_LEN],
         }
     }
 
@@ -65,6 +70,15 @@ impl Dsp {
         self.rms_history[last] = rms;
 
         autocorrelate(&self.waveform, &mut self.buffer_acf);
+
+        // RMS-envelope ACF: detrend (subtract mean) then autocorrelate.
+        // Without detrending, average loudness creates a DC bias that
+        // drowns out tempo peaks.
+        let mean = self.rms_history.iter().sum::<f32>() / self.rms_history.len() as f32;
+        for (dst, src) in self.rms_detrended.iter_mut().zip(self.rms_history.iter()) {
+            *dst = src - mean;
+        }
+        autocorrelate(&self.rms_detrended, &mut self.rms_acf);
 
         // Apply Hann window
         for i in 0..n {
@@ -106,6 +120,10 @@ impl Dsp {
 
     pub fn buffer_acf(&self) -> Vec<f32> {
         self.buffer_acf.clone()
+    }
+
+    pub fn rms_acf(&self) -> Vec<f32> {
+        self.rms_acf.clone()
     }
 
     pub fn rms_history(&self) -> Vec<f32> {
@@ -281,5 +299,40 @@ mod tests {
         assert!(acf[48] > acf[47], "expected acf[48]={} > acf[47]={}", acf[48], acf[47]);
         assert!(acf[48] > acf[49], "expected acf[48]={} > acf[49]={}", acf[48], acf[49]);
         assert!(acf[48] > 0.9, "expected strong peak at period, got acf[48]={}", acf[48]);
+    }
+
+    #[test]
+    fn rms_acf_has_correct_length() {
+        let dsp = Dsp::new(2048);
+        assert_eq!(dsp.rms_acf().len(), 256);
+    }
+
+    #[test]
+    fn acf_of_silence_is_zero() {
+        let mut dsp = Dsp::new(2048);
+        dsp.process(&vec![0.0_f32; 2048]);
+        for &v in dsp.buffer_acf().iter() {
+            assert_eq!(v, 0.0);
+        }
+        for &v in dsp.rms_acf().iter() {
+            assert_eq!(v, 0.0);
+        }
+    }
+
+    #[test]
+    fn rms_acf_constant_input_is_zero() {
+        // Fill rms_history with a constant rms value, then verify the
+        // detrended (mean-subtracted) ACF is zero everywhere.
+        let mut dsp = Dsp::new(8);
+        let constant = vec![0.5_f32; 8];
+        // RMS of [0.5; 8] is 0.5; need >= RMS_HISTORY_LEN (512) calls to fully fill.
+        for _ in 0..512 {
+            dsp.process(&constant);
+        }
+        let acf = dsp.rms_acf();
+        assert_eq!(acf.len(), 256);
+        for &v in &acf {
+            assert!(v.abs() < 1e-5, "expected near-zero ACF for constant rms, got {}", v);
+        }
     }
 }
