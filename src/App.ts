@@ -33,6 +33,9 @@ export class App {
   // @ts-ignore: noUnusedLocals — field kept alive intentionally
   private panel!: ParamPanel;
   private bridge!: WorkletBridge;
+  private rafHandle: number | null = null;
+  private keydownHandler: (e: KeyboardEvent) => void = () => {};
+  private resizeHandler: () => void = () => {};
 
   async start(
     canvas: HTMLCanvasElement,
@@ -66,7 +69,7 @@ export class App {
       "5": "buffer-acf",
       "6": "rms-acf",
     };
-    window.addEventListener("keydown", (e) => {
+    this.keydownHandler = (e) => {
       const preset = presetKeys[e.key];
       if (preset) {
         this.rig.goTo(preset, { duration: 0.8 });
@@ -76,7 +79,14 @@ export class App {
         toggled = !toggled;
         this.rig.goTo(toggled ? "side" : "front", { duration: 0.8 });
       }
-    });
+    };
+    window.addEventListener("keydown", this.keydownHandler);
+
+    this.resizeHandler = () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+    };
+    window.addEventListener("resize", this.resizeHandler);
 
     const { context, source, stream } = await sourceFactory();
 
@@ -158,9 +168,9 @@ export class App {
       this.rmsAcfLine?.update();
       renderer.render(scene, camera);
       this.fps.end();
-      requestAnimationFrame(loop);
+      this.rafHandle = requestAnimationFrame(loop);
     };
-    requestAnimationFrame(loop);
+    this.rafHandle = requestAnimationFrame(loop);
   }
 
   private rebuildLineRenderers(sizes: {
@@ -256,5 +266,28 @@ export class App {
       color: 0xff99cc,
     });
     this.scene.add(this.rmsAcfLine.object3d);
+  }
+
+  dispose(): void {
+    if (this.rafHandle !== null) {
+      cancelAnimationFrame(this.rafHandle);
+      this.rafHandle = null;
+    }
+    window.removeEventListener("keydown", this.keydownHandler);
+    window.removeEventListener("resize", this.resizeHandler);
+    for (const line of [
+      this.waveformLine,
+      this.bufferAcfLine,
+      this.spectrumLine,
+      this.lowRmsLine,
+      this.midRmsLine,
+      this.highRmsLine,
+      this.rmsLine,
+      this.lowRmsAcfLine,
+      this.rmsAcfLine,
+    ]) {
+      line?.dispose();
+    }
+    this.fps.unmount();
   }
 }
