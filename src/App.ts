@@ -1,17 +1,20 @@
 import { Vector3 } from "three";
-import { createRenderer, createSceneAndCamera } from "./render/Scene";
+import { createSceneAndCamera } from "./render/Scene";
 import { CameraRig } from "./render/CameraRig";
 import { LineRenderer } from "./render/LineRenderer";
 import { linearLayout, logSpectrumLayout } from "./render/LineLayouts";
-import dspWorkletUrl from "./audio/dsp-worklet?worker&url";
-import dspWasmUrl from "./wasm-pkg/dsp_bg.wasm?url";
-import { createMicSource, type AudioSourceBundle } from "./audio/AudioSource";
 import { FeatureStore } from "./store/FeatureStore";
 import { FpsOverlay } from "./ui/Stats";
-import { ParamStore } from "./params/ParamStore";
-import { ParamPanel } from "./params/ParamPanel";
-import { WorkletBridge } from "./params/WorkletBridge";
-import { analysisSchemas } from "./params/schemas";
+import type { ParamStore } from "./params/ParamStore";
+import type { WebGPURenderer } from "three/webgpu";
+
+export interface AppDeps {
+  canvas: HTMLCanvasElement;
+  renderer: WebGPURenderer;
+  audioContext: AudioContext;
+  workletNode: AudioWorkletNode;
+  paramStore: ParamStore;
+}
 
 export class App {
   private rig!: CameraRig;
@@ -28,20 +31,16 @@ export class App {
   private last = 0;
   private fps = new FpsOverlay();
   private scene!: import("three").Scene;
-  private paramStore!: ParamStore;
-  // Retained for its DOM side-effects; never read after construction.
-  // @ts-ignore: noUnusedLocals — field kept alive intentionally
-  private panel!: ParamPanel;
-  private bridge!: WorkletBridge;
   private rafHandle: number | null = null;
   private keydownHandler: (e: KeyboardEvent) => void = () => {};
   private resizeHandler: () => void = () => {};
 
-  async start(
-    canvas: HTMLCanvasElement,
-    sourceFactory: () => Promise<AudioSourceBundle> = createMicSource,
-  ): Promise<void> {
-    const renderer = await createRenderer(canvas);
+  constructor(private deps: AppDeps) {}
+
+  start(): void {
+    const { canvas: _canvas, renderer, audioContext, workletNode, paramStore } = this.deps;
+    void _canvas; void audioContext; void paramStore; // not used in start(), but documented in deps
+
     const { scene, camera } = createSceneAndCamera();
     this.scene = scene;
 
@@ -52,11 +51,7 @@ export class App {
     this.rig.addPreset("rms", { position: new Vector3(0, -0.5, 1.4), target: new Vector3(0, -0.5, 0) });
     this.rig.addPreset("buffer-acf", { position: new Vector3(0, 0.5, 1.4), target: new Vector3(0, 0.5, 0) });
     this.rig.addPreset("rms-acf", { position: new Vector3(0, -1.0, 1.4), target: new Vector3(0, -1.0, 0) });
-    await this.rig.goTo("front", { duration: 0 });
-
-    this.paramStore = new ParamStore();
-    for (const s of analysisSchemas) this.paramStore.register(s);
-    this.panel = new ParamPanel(this.paramStore);
+    void this.rig.goTo("front", { duration: 0 });
 
     this.fps.mount();
 
@@ -88,51 +83,28 @@ export class App {
     };
     window.addEventListener("resize", this.resizeHandler);
 
-    const { context, source, stream } = await sourceFactory();
-
-    console.log("[audio] context.sampleRate:", context.sampleRate, "Hz");
-    console.log("[audio] context.baseLatency:", context.baseLatency, "s");
-    console.log("[audio] source.channelCount:", source.channelCount);
-    const tracks = stream?.getAudioTracks() ?? [];
-    if (tracks.length === 0) {
-      console.log("[audio] no MediaStream tracks (likely internal test source)");
-    }
-    tracks.forEach((t, i) => {
-      console.log(`[audio] track ${i} label:`, t.label);
-      try {
-        const settings = t.getSettings();
-        console.log(`[audio] track ${i} settings:`, settings);
-        console.log(
-          `[audio] track ${i} sampleRate:`,
-          (settings as { sampleRate?: number }).sampleRate ?? "(not reported)",
-        );
-      } catch (err) {
-        console.log(`[audio] track ${i} settings: unavailable`, err);
-      }
-    });
-    const sr = context.sampleRate;
-    const fftSize = this.paramStore.get("dsp.windowSize");
-    console.log(
-      "[audio] FFT bins map: bin0=DC, bin1=" + (sr / fftSize).toFixed(1) + "Hz, " +
-      `bin${fftSize / 2 - 1}=` + (((fftSize / 2 - 1) * sr) / fftSize).toFixed(0) + "Hz, " +
-      "Nyquist=" + (sr / 2).toFixed(0) + "Hz",
-    );
-
-    const wasmModule = await WebAssembly.compileStreaming(fetch(dspWasmUrl));
-    await context.audioWorklet.addModule(dspWorkletUrl);
-    const node = new AudioWorkletNode(context, "dsp-processor", {
-      numberOfInputs: 1,
-      numberOfOutputs: 0,
-      processorOptions: { wasmModule },
-    });
-    source.connect(node);
-
-    this.bridge = new WorkletBridge(this.paramStore, node.port);
-
-    node.port.onmessage = (e) => {
+    workletNode.port.onmessage = (e) => {
       const msg = e.data as
-        | { type: "features"; waveform?: Float32Array; spectrum?: Float32Array; rms?: Float32Array; bufferAcf?: Float32Array; rmsAcf?: Float32Array; rmsLow?: Float32Array; rmsMid?: Float32Array; rmsHigh?: Float32Array; rmsAcfLow?: Float32Array }
-        | { type: "configured"; waveformLen: number; spectrumLen: number; bufferAcfLen: number; rmsLen: number; rmsAcfLen: number };
+        | {
+            type: "features";
+            waveform?: Float32Array;
+            spectrum?: Float32Array;
+            rms?: Float32Array;
+            bufferAcf?: Float32Array;
+            rmsAcf?: Float32Array;
+            rmsLow?: Float32Array;
+            rmsMid?: Float32Array;
+            rmsHigh?: Float32Array;
+            rmsAcfLow?: Float32Array;
+          }
+        | {
+            type: "configured";
+            waveformLen: number;
+            spectrumLen: number;
+            bufferAcfLen: number;
+            rmsLen: number;
+            rmsAcfLen: number;
+          };
       if (msg.type === "features") {
         if (msg.waveform) this.store.set("waveform", msg.waveform);
         if (msg.spectrum) this.store.set("spectrum", msg.spectrum);
@@ -149,8 +121,6 @@ export class App {
         this.rebuildLineRenderers(msg);
       }
     };
-
-    this.bridge.bootstrap();
 
     const loop = (now: number) => {
       this.fps.begin();
@@ -289,5 +259,6 @@ export class App {
       line?.dispose();
     }
     this.fps.unmount();
+    this.deps.workletNode.port.onmessage = null;
   }
 }
