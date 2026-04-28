@@ -3,7 +3,7 @@ import "./worklet-polyfills";
 import init, { Dsp } from "../wasm-pkg/dsp";
 
 const WINDOW_SIZE = 2048;
-const HOP_SIZE = 1024;
+const HOP_SIZE = 512;
 
 class DSPProcessor extends AudioWorkletProcessor {
   private window = new Float32Array(WINDOW_SIZE);
@@ -22,7 +22,9 @@ class DSPProcessor extends AudioWorkletProcessor {
 
   private async boot(wasmModule: WebAssembly.Module) {
     await init({ module_or_path: wasmModule });
-    this.dsp = new Dsp(WINDOW_SIZE);
+    // `sampleRate` is a global in AudioWorkletGlobalScope (typed by
+    // @types/audioworklet, referenced at the top of this file).
+    this.dsp = new Dsp(WINDOW_SIZE, sampleRate, HOP_SIZE);
     this.ready = true;
   }
 
@@ -45,7 +47,7 @@ class DSPProcessor extends AudioWorkletProcessor {
       this.window.set(channel, WINDOW_SIZE - len);
     }
 
-    // Fire FFT every HOP_SIZE new samples for ~47 Hz update rate (50% overlap).
+    // Fire FFT every HOP_SIZE new samples for ~94 Hz update rate (25% overlap).
     this.hopCounter += len;
     while (this.hopCounter >= HOP_SIZE) {
       this.dsp.process(this.window);
