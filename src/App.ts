@@ -5,7 +5,7 @@ import { LineRenderer } from "./render/LineRenderer";
 import { linearLayout, logSpectrumLayout } from "./render/LineLayouts";
 import dspWorkletUrl from "./audio/dsp-worklet?worker&url";
 import dspWasmUrl from "./wasm-pkg/dsp_bg.wasm?url";
-import { createMicSource } from "./audio/AudioSource";
+import { createMicSource, type AudioSourceBundle } from "./audio/AudioSource";
 import { FeatureStore } from "./store/FeatureStore";
 
 export class App {
@@ -16,7 +16,10 @@ export class App {
   private store = new FeatureStore();
   private last = 0;
 
-  async start(canvas: HTMLCanvasElement): Promise<void> {
+  async start(
+    canvas: HTMLCanvasElement,
+    sourceFactory: () => Promise<AudioSourceBundle> = createMicSource,
+  ): Promise<void> {
     const { scene, camera, renderer } = await createScene(canvas);
 
     this.rig = new CameraRig(camera);
@@ -82,7 +85,7 @@ export class App {
       }
     });
 
-    const { context, source } = await createMicSource();
+    const { context, source } = await sourceFactory();
     const wasmModule = await WebAssembly.compileStreaming(fetch(dspWasmUrl));
     await context.audioWorklet.addModule(dspWorkletUrl);
     const node = new AudioWorkletNode(context, "dsp-processor", {
