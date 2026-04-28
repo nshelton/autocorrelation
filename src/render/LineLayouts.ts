@@ -24,6 +24,7 @@ export function logSpectrumLayout(yOffset: number, height: number): LineLayoutFn
     // log2(i + 1) / log2(n) ∈ [0, log2(n) / log2(n)] for i in [0, n-1]
     // Want [0, 1] → [-1, 1]
     const t = Math.log2(i + 1) / Math.log2(n);
-    return new Vector3(t * 2 - 1, yOffset + value * height, 0);
+    const y = yOffset + Math.log2(value + 1) * height
+    return new Vector3(t * 2 - 1, y, 0);
   };
 }

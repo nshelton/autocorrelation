@@ -8,8 +8,37 @@ Tracks features that are agreed-on but deferred. Each entry is a candidate for a
 
 ## Next
 
+
+1. paramter router - route levels and beat saw sine into other parameters, use this as a preset
+2. preset controller, each module with its parameter set can have a bank of presets
+
+## Beatdetector improvements
+3. generate a sawtooth wave -assume 4 beats ? assume we got the measure ? 
+4. onset detection for down beat - this is hard
+
+## modules
+1. camera
+2. postproc
+    hdr? tonemapper
+    glitch
+    halftone
+
+3. physics? orbital mechanics, collisions
+4. lighting
+5. meshes - audio mesh ? Fft history buffer?
+
+
+## autogain
+- should this be on the signal? on on the rms 
+- probably rms; per-level
+
+sketch:
+spawn sphere on beat/ threshold low 
+do physics
+then add little cubes for highs
+
 ### Developer experience
-- Vite HMR so most code edits don't reload the page (biggest dev-loop win — page reload re-prompts for tab-capture permission)
+
 - Synth demo source for debug content richer than a sine (chord, sweep, noise + tone, etc.)
 - Trace the "Multiple instances of Three.js" warning that still appears in dev despite `resolve.dedupe`
 
@@ -18,6 +47,11 @@ Tracks features that are agreed-on but deferred. Each entry is a candidate for a
 
 ### Visual
 - Particle system + post-processing (driven by spectrum / RMS / autocorrelation features)
+
+# Review
+ need to do a code review checkin at some point;
+ - dsp one big file; could it be modular? what are the modules really though
+
 
 ## Shipped
 
