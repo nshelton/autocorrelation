@@ -105,6 +105,31 @@ impl Dsp {
     }
 }
 
+/// Direct time-domain autocorrelation, normalized so output[0] == 1.0
+/// for any nonzero input. For all-zero input the output is filled with
+/// zeros (no NaN from division by zero). The caller chooses how many
+/// lags to compute via the length of `output`.
+fn autocorrelate(input: &[f32], output: &mut [f32]) {
+    let n = input.len();
+    for k in 0..output.len() {
+        let mut sum = 0.0f32;
+        if k < n {
+            for i in 0..(n - k) {
+                sum += input[i] * input[i + k];
+            }
+        }
+        output[k] = sum;
+    }
+    let zero = output[0];
+    if zero > 0.0 {
+        for v in output.iter_mut() {
+            *v /= zero;
+        }
+    } else {
+        output.fill(0.0);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -169,6 +194,21 @@ mod tests {
         assert_eq!(h[n - 3], 1.0);
         assert_eq!(h[n - 2], 2.0);
         assert_eq!(h[n - 1], 0.0);
+    }
+
+    #[test]
+    fn autocorrelate_helper_correctness() {
+        // Hand-computed for input [1, 2, 3, 4] with output length 3:
+        //   raw[0] = 1*1 + 2*2 + 3*3 + 4*4 = 30
+        //   raw[1] = 1*2 + 2*3 + 3*4       = 20
+        //   raw[2] = 1*3 + 2*4             = 11
+        // Normalized by raw[0]=30: [1.0, 20/30, 11/30].
+        let input = [1.0_f32, 2.0, 3.0, 4.0];
+        let mut output = [0.0_f32; 3];
+        autocorrelate(&input, &mut output);
+        assert!((output[0] - 1.0).abs() < 1e-6, "got {}", output[0]);
+        assert!((output[1] - 20.0 / 30.0).abs() < 1e-6, "got {}", output[1]);
+        assert!((output[2] - 11.0 / 30.0).abs() < 1e-6, "got {}", output[2]);
     }
 
     #[test]
