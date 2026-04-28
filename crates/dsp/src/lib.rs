@@ -11,6 +11,12 @@ const SMOOTHING_TAU_SECS: f32 = 0.0956;
 const DB_FLOOR: f32 = -100.0;
 const RMS_HISTORY_LEN: usize = 512;
 const RMS_ACF_LEN: usize = RMS_HISTORY_LEN / 2;
+/// Crossover from low band to mid band, in Hz. Drum-friendly default:
+/// fits the kick fundamental (typically 50–90 Hz) cleanly inside "low"
+/// without bleeding much into snare body.
+const LOW_BAND_HZ_MAX: f32 = 150.0;
+/// Crossover from mid band to high band, in Hz.
+const MID_BAND_HZ_MAX: f32 = 1500.0;
 
 #[wasm_bindgen]
 pub struct Dsp {
@@ -34,6 +40,16 @@ pub struct Dsp {
     /// (`hop_size / sample_rate`), so changing `hop_size` does NOT change
     /// perceived smoothing dynamics.
     smoothing_alpha: f32,
+    /// Inclusive last bin index of the low band. Low band = bins 1..=low_band_bin_end.
+    /// Bin 0 (DC) is always skipped.
+    low_band_bin_end: usize,
+    /// Inclusive last bin index of the mid band. Mid = (low_end+1)..=mid_band_bin_end.
+    /// High = (mid_end+1)..=N/2-1 (Nyquist excluded).
+    mid_band_bin_end: usize,
+    /// Parseval scale: converts Σ|X[k]|² over a band → band RMS² in time-domain
+    /// units. Equals 2 / (N · Σ hann²). The 2 accounts for the one-sided real
+    /// spectrum; Σ hann² is the window's energy correction.
+    parseval_band_scale: f32,
 }
 
 #[wasm_bindgen]
@@ -52,6 +68,10 @@ impl Dsp {
         let mag_scale = 2.0 / hann.iter().sum::<f32>();
         let dt = hop_size as f32 / sample_rate;
         let smoothing_alpha = 1.0 - (-dt / SMOOTHING_TAU_SECS).exp();
+        let low_band_bin_end = bin_for_hz(LOW_BAND_HZ_MAX, sample_rate, window_size);
+        let mid_band_bin_end = bin_for_hz(MID_BAND_HZ_MAX, sample_rate, window_size);
+        let hann_energy: f32 = hann.iter().map(|h| h * h).sum();
+        let parseval_band_scale = 2.0 / (window_size as f32 * hann_energy);
         Dsp {
             waveform: vec![0.0; window_size],
             fft,
@@ -65,6 +85,9 @@ impl Dsp {
             rms_acf: vec![0.0; RMS_ACF_LEN],
             rms_detrended: vec![0.0; RMS_HISTORY_LEN],
             smoothing_alpha,
+            low_band_bin_end,
+            mid_band_bin_end,
+            parseval_band_scale,
         }
     }
 
@@ -166,6 +189,13 @@ fn autocorrelate(input: &[f32], output: &mut [f32]) {
     } else {
         output.fill(0.0);
     }
+}
+
+/// Snap a frequency in Hz to the nearest one-sided real-FFT bin index,
+/// clamped to [1, N/2 - 1] (DC and Nyquist are excluded by design).
+fn bin_for_hz(hz: f32, sample_rate: f32, n: usize) -> usize {
+    let bin = (hz * n as f32 / sample_rate).round() as usize;
+    bin.clamp(1, n / 2 - 1)
 }
 
 #[cfg(test)]
@@ -391,6 +421,41 @@ mod tests {
             (0.45..=0.55).contains(&ratio),
             "expected ratio ≈ 0.5, got {}",
             ratio
+        );
+    }
+
+    #[test]
+    fn bin_for_hz_snaps_at_default_settings() {
+        // 150 Hz at sr=48000, N=2048: 150 * 2048 / 48000 = 6.4 → 6.
+        // 1500 Hz: 1500 * 2048 / 48000 = 64.0 → 64.
+        assert_eq!(bin_for_hz(150.0, 48000.0, 2048), 6);
+        assert_eq!(bin_for_hz(1500.0, 48000.0, 2048), 64);
+    }
+
+    #[test]
+    fn band_bin_ends_at_default_settings() {
+        let dsp = Dsp::new(2048, 48000.0, 1024);
+        assert_eq!(dsp.low_band_bin_end, 6);
+        assert_eq!(dsp.mid_band_bin_end, 64);
+    }
+
+    #[test]
+    fn parseval_band_scale_matches_formula() {
+        // parseval_band_scale = 2 / (N · Σ hann²)
+        let dsp = Dsp::new(2048, 48000.0, 1024);
+        let n = 2048usize;
+        let hann_energy: f32 = (0..n)
+            .map(|i| {
+                let h = 0.5 - 0.5 * (2.0 * std::f32::consts::PI * i as f32 / (n as f32 - 1.0)).cos();
+                h * h
+            })
+            .sum();
+        let expected = 2.0 / (n as f32 * hann_energy);
+        assert!(
+            (dsp.parseval_band_scale - expected).abs() < 1e-10,
+            "got {}, expected {}",
+            dsp.parseval_band_scale,
+            expected
         );
     }
 }
