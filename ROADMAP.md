@@ -15,7 +15,6 @@ Tracks features that are agreed-on but deferred. Each entry is a candidate for a
 
 ### Performance
 - Migrate autocorrelation to FFT-based (Wiener–Khinchin: ACF = IFFT(|FFT(x)|²)) once the v3 direct implementation has proven the visualization is correct. O(N log N) vs O(N²); reuses the existing realfft planner. Folds the RMS-ACF onto the same code path.
-- Drop FFT hop to 25% overlap (HOP_SIZE=512) for ~94 Hz update rate and ~halved head-of-buffer-to-screen latency. Requires retuning `SMOOTHING_ALPHA` (currently 0.2, per-process-call) — preferably convert to a time-based EMA so the constant stops being hop-coupled.
 
 ### Visual
 - Particle system + post-processing (driven by spectrum / RMS / autocorrelation features)
