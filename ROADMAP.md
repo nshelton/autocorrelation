@@ -21,6 +21,7 @@ Tracks features that are agreed-on but deferred. Each entry is a candidate for a
 
 ## Shipped
 
+- **v3.2** (tag pending): rms_acf decaying EMA accumulator + top-10 sub-bin tempo peak picking with PeakMarkers visualization; new `dsp.accumTauSecs` analysis param
 - **v3.1** (tag `v3.1.0`): runtime-tunable analysis parameters via ParamStore + tweakpane (window size, RMS history length, hop size, smoothing τ, dB floor); persisted to localStorage; live worklet reconfiguration with dispose+rebuild of LineRenderers; FPS overlay moved to top-left
 - **v3** (tag `v3.0.0`): buffer autocorrelation + RMS-envelope autocorrelation (with mean-subtracted detrending) as two new line strips; two new camera presets (keys 5 and 6); five-line vertical layout
 - **v2** (tag `v2.0.0`): FFT spectrum (log frequency, dB, smoothed), rolling RMS history, tab audio source, internal test source (T key), FPS overlay, four camera presets, overlapped FFT
