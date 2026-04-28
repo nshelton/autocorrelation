@@ -361,7 +361,7 @@ impl Dsp {
 
         // 2. Sort by magnitude descending.
         self.peak_candidates
-            .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            .sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
         // 3. Greedy select with min-spacing.
         let mut accepted: [u32; MAX_PEAKS] = [0; MAX_PEAKS];
