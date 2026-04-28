@@ -21,6 +21,7 @@ pub struct Dsp {
     /// and sum(hann) ≈ N/2 corrects for window attenuation.
     mag_scale: f32,
     rms_history: Vec<f32>,
+    buffer_acf: Vec<f32>,
 }
 
 #[wasm_bindgen]
@@ -46,6 +47,7 @@ impl Dsp {
             hann,
             mag_scale,
             rms_history: vec![0.0; RMS_HISTORY_LEN],
+            buffer_acf: vec![0.0; window_size / 2],
         }
     }
 
@@ -61,6 +63,8 @@ impl Dsp {
         self.rms_history.copy_within(1.., 0);
         let last = self.rms_history.len() - 1;
         self.rms_history[last] = rms;
+
+        autocorrelate(&self.waveform, &mut self.buffer_acf);
 
         // Apply Hann window
         for i in 0..n {
@@ -98,6 +102,10 @@ impl Dsp {
 
     pub fn spectrum(&self) -> Vec<f32> {
         self.spectrum.clone()
+    }
+
+    pub fn buffer_acf(&self) -> Vec<f32> {
+        self.buffer_acf.clone()
     }
 
     pub fn rms_history(&self) -> Vec<f32> {
@@ -222,6 +230,52 @@ mod tests {
             argmax + 1
         );
         assert!(peak > 0.5, "expected loud peak, got {}", peak);
+    }
+
+    #[test]
+    fn buffer_acf_has_correct_length() {
+        let dsp = Dsp::new(2048);
+        assert_eq!(dsp.buffer_acf().len(), 1024);
+    }
+
+    #[test]
+    fn buffer_acf_zero_lag_is_one_for_nonzero_signal() {
+        let mut dsp = Dsp::new(2048);
+        let signal: Vec<f32> = (0..2048)
+            .map(|i| ((i as f32) * 0.1).sin())
+            .collect();
+        dsp.process(&signal);
+        let acf = dsp.buffer_acf();
+        assert!((acf[0] - 1.0).abs() < 1e-6, "got {}", acf[0]);
+    }
+
+    #[test]
+    fn buffer_acf_of_sine_peaks_at_period() {
+        let mut dsp = Dsp::new(2048);
+        let sr = 48000.0_f32;
+        let freq = 1000.0_f32;
+        // Period at this sr/freq is exactly 48 samples.
+        let signal: Vec<f32> = (0..2048)
+            .map(|i| (2.0 * std::f32::consts::PI * freq * (i as f32 / sr)).sin())
+            .collect();
+        dsp.process(&signal);
+        let acf = dsp.buffer_acf();
+        // Find the argmax in the window [40, 60] around the expected period of 48.
+        // (ACF of a pure sine has its first positive lobe peak at the period;
+        // the global argmax in acf[1..] is lag 1 due to sample-to-sample
+        // correlation, so we search in the expected range.)
+        let search = &acf[40..60];
+        let (argmax_in_window, _) = search
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .unwrap();
+        let lag = argmax_in_window + 40; // re-offset to global lag index
+        assert!(
+            (47..=49).contains(&lag),
+            "expected peak near lag 48, got {}",
+            lag
+        );
     }
 
     #[test]
