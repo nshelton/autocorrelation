@@ -107,9 +107,34 @@ class DSPProcessor extends AudioWorkletProcessor {
       const rms = new Float32Array(this.dsp.rms_history());
       const ba = new Float32Array(this.dsp.buffer_acf());
       const ra = new Float32Array(this.dsp.rms_acf());
+      const rmsLow = new Float32Array(this.dsp.low_rms_history());
+      const rmsMid = new Float32Array(this.dsp.mid_rms_history());
+      const rmsHigh = new Float32Array(this.dsp.high_rms_history());
+      const rmsAcfLow = new Float32Array(this.dsp.low_rms_acf());
       this.port.postMessage(
-        { type: "features", waveform: wf, spectrum: sp, rms, bufferAcf: ba, rmsAcf: ra },
-        [wf.buffer, sp.buffer, rms.buffer, ba.buffer, ra.buffer],
+        {
+          type: "features",
+          waveform: wf,
+          spectrum: sp,
+          rms,
+          bufferAcf: ba,
+          rmsAcf: ra,
+          rmsLow,
+          rmsMid,
+          rmsHigh,
+          rmsAcfLow,
+        },
+        [
+          wf.buffer,
+          sp.buffer,
+          rms.buffer,
+          ba.buffer,
+          ra.buffer,
+          rmsLow.buffer,
+          rmsMid.buffer,
+          rmsHigh.buffer,
+          rmsAcfLow.buffer,
+        ],
       );
       this.hopCounter -= this.hopSize;
     }
