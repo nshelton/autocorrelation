@@ -62,6 +62,13 @@ export class LineRenderer {
     this.writeFromSource(buf);
   }
 
+  dispose(): void {
+    const line = this.object3d as Line;
+    (line.geometry as BufferGeometry).dispose();
+    (line.material as LineBasicMaterial).dispose();
+    line.parent?.remove(line);
+  }
+
   private writeFromSource(buf: Float32Array): void {
     const n = buf.length;
     for (let i = 0; i < n; i++) {
