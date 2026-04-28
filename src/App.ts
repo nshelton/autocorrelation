@@ -38,8 +38,7 @@ export class App {
   constructor(private deps: AppDeps) {}
 
   start(): void {
-    const { canvas: _canvas, renderer, audioContext, workletNode, paramStore } = this.deps;
-    void _canvas; void audioContext; void paramStore; // not used in start(), but documented in deps
+    const { renderer, workletNode } = this.deps;
 
     const { scene, camera } = createSceneAndCamera();
     this.scene = scene;

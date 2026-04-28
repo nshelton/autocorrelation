@@ -75,7 +75,7 @@ function buildAppLayer(deps: AppDeps): void {
   }
 }
 
-// @ts-ignore: used in T5 (HMR accept callback)
+// @ts-expect-error: used in T5 (HMR accept callback) — replace this directive with the actual call site
 function teardownAppLayer(): void {
   app?.dispose();
   panel?.dispose();
