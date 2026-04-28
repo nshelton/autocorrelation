@@ -28,6 +28,14 @@ export class App {
       position: new Vector3(3, 1, 0),
       target: new Vector3(0, 0, 0),
     });
+    this.rig.addPreset("spectrum", {
+      position: new Vector3(0, 0, 1.4),
+      target: new Vector3(0, 0, 0),
+    });
+    this.rig.addPreset("rms", {
+      position: new Vector3(0, -0.6, 1.4),
+      target: new Vector3(0, -0.6, 0),
+    });
     await this.rig.goTo("front", { duration: 0 });
 
     this.store.set("waveform", new Float32Array(2048));
@@ -56,10 +64,22 @@ export class App {
     scene.add(this.rmsLine.object3d);
 
     let toggled = false;
+    const presetKeys: Record<string, string> = {
+      "1": "front",
+      "2": "side",
+      "3": "spectrum",
+      "4": "rms",
+    };
     window.addEventListener("keydown", (e) => {
-      if (e.key !== " ") return;
-      toggled = !toggled;
-      this.rig.goTo(toggled ? "side" : "front", { duration: 0.8 });
+      const preset = presetKeys[e.key];
+      if (preset) {
+        this.rig.goTo(preset, { duration: 0.8 });
+        return;
+      }
+      if (e.key === " ") {
+        toggled = !toggled;
+        this.rig.goTo(toggled ? "side" : "front", { duration: 0.8 });
+      }
     });
 
     const { context, source } = await createMicSource();
