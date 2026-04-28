@@ -266,7 +266,9 @@ export class App {
       lagDomain: sizes.rmsAcfLen,
       yCenter: -1.0,
       ySpan: 0.4,
-      // Match linearLayout's x-mapping exactly (i / (n-1)) * 2 - 1.
+      // Mirrors linearLayout's x-formula. If you change one, change the other —
+      // markers must sit on the exact x-positions of the accumulator line they
+      // annotate, or peaks will visually drift off the line they describe.
       xForLag: (lag, n) => (n <= 1 ? 0 : (lag / (n - 1)) * 2 - 1),
       baseColor: 0xffff66,
     });
