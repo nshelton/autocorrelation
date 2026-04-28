@@ -25,6 +25,8 @@ export class App {
   private fps = new FpsOverlay();
   private scene!: import("three").Scene;
   private paramStore!: ParamStore;
+  // Retained for its DOM side-effects; never read after construction.
+  // @ts-ignore: noUnusedLocals — field kept alive intentionally
   private panel!: ParamPanel;
   private bridge!: WorkletBridge;
 
@@ -97,7 +99,7 @@ export class App {
     const fftSize = this.paramStore.get("dsp.windowSize");
     console.log(
       "[audio] FFT bins map: bin0=DC, bin1=" + (sr / fftSize).toFixed(1) + "Hz, " +
-      "bin1023=" + (((fftSize / 2 - 1) * sr) / fftSize).toFixed(0) + "Hz, " +
+      `bin${fftSize / 2 - 1}=` + (((fftSize / 2 - 1) * sr) / fftSize).toFixed(0) + "Hz, " +
       "Nyquist=" + (sr / 2).toFixed(0) + "Hz",
     );
 
@@ -146,10 +148,6 @@ export class App {
       requestAnimationFrame(loop);
     };
     requestAnimationFrame(loop);
-  }
-
-  dispose(): void {
-    this.panel.dispose();
   }
 
   private rebuildLineRenderers(sizes: {
