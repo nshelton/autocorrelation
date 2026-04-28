@@ -233,6 +233,21 @@ mod tests {
     }
 
     #[test]
+    fn autocorrelate_helper_correctness() {
+        // Hand-computed for input [1, 2, 3, 4] with output length 3:
+        //   raw[0] = 1*1 + 2*2 + 3*3 + 4*4 = 30
+        //   raw[1] = 1*2 + 2*3 + 3*4       = 20
+        //   raw[2] = 1*3 + 2*4             = 11
+        // Normalized by raw[0]=30: [1.0, 20/30, 11/30].
+        let input = [1.0_f32, 2.0, 3.0, 4.0];
+        let mut output = [0.0_f32; 3];
+        autocorrelate(&input, &mut output);
+        assert!((output[0] - 1.0).abs() < 1e-6, "got {}", output[0]);
+        assert!((output[1] - 20.0 / 30.0).abs() < 1e-6, "got {}", output[1]);
+        assert!((output[2] - 11.0 / 30.0).abs() < 1e-6, "got {}", output[2]);
+    }
+
+    #[test]
     fn buffer_acf_has_correct_length() {
         let dsp = Dsp::new(2048);
         assert_eq!(dsp.buffer_acf().len(), 1024);
@@ -260,36 +275,11 @@ mod tests {
             .collect();
         dsp.process(&signal);
         let acf = dsp.buffer_acf();
-        // Find the argmax in the window [40, 60] around the expected period of 48.
-        // (ACF of a pure sine has its first positive lobe peak at the period;
-        // the global argmax in acf[1..] is lag 1 due to sample-to-sample
-        // correlation, so we search in the expected range.)
-        let search = &acf[40..60];
-        let (argmax_in_window, _) = search
-            .iter()
-            .enumerate()
-            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
-            .unwrap();
-        let lag = argmax_in_window + 40; // re-offset to global lag index
-        assert!(
-            (47..=49).contains(&lag),
-            "expected peak near lag 48, got {}",
-            lag
-        );
-    }
-
-    #[test]
-    fn autocorrelate_helper_correctness() {
-        // Hand-computed for input [1, 2, 3, 4] with output length 3:
-        //   raw[0] = 1*1 + 2*2 + 3*3 + 4*4 = 30
-        //   raw[1] = 1*2 + 2*3 + 3*4       = 20
-        //   raw[2] = 1*3 + 2*4             = 11
-        // Normalized by raw[0]=30: [1.0, 20/30, 11/30].
-        let input = [1.0_f32, 2.0, 3.0, 4.0];
-        let mut output = [0.0_f32; 3];
-        autocorrelate(&input, &mut output);
-        assert!((output[0] - 1.0).abs() < 1e-6, "got {}", output[0]);
-        assert!((output[1] - 20.0 / 30.0).abs() < 1e-6, "got {}", output[1]);
-        assert!((output[2] - 11.0 / 30.0).abs() < 1e-6, "got {}", output[2]);
+        // ACF of a sine has local maxima at integer multiples of the period.
+        // Verify lag 48 is a local maximum (greater than its neighbors) AND
+        // the correlation is strong (close to 1.0 after normalization).
+        assert!(acf[48] > acf[47], "expected acf[48]={} > acf[47]={}", acf[48], acf[47]);
+        assert!(acf[48] > acf[49], "expected acf[48]={} > acf[49]={}", acf[48], acf[49]);
+        assert!(acf[48] > 0.9, "expected strong peak at period, got acf[48]={}", acf[48]);
     }
 }
