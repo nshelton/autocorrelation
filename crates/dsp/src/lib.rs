@@ -51,6 +51,9 @@ pub struct Dsp {
     /// units. Equals 2 / (N · Σ hann²). The 2 accounts for the one-sided real
     /// spectrum; Σ hann² is the window's energy correction.
     parseval_band_scale: f32,
+    low_rms_history:  Vec<f32>,
+    mid_rms_history:  Vec<f32>,
+    high_rms_history: Vec<f32>,
 }
 
 #[wasm_bindgen]
@@ -91,6 +94,9 @@ impl Dsp {
             low_band_bin_end,
             mid_band_bin_end,
             parseval_band_scale,
+            low_rms_history:  vec![0.0; rms_history_len],
+            mid_rms_history:  vec![0.0; rms_history_len],
+            high_rms_history: vec![0.0; rms_history_len],
         }
     }
 
@@ -146,6 +152,43 @@ impl Dsp {
             .fft
             .process(&mut self.fft_buffer, &mut self.freq_buffer);
 
+        // --- Per-band RMS via Parseval-correct FFT-bin energy summation. ---
+        // band_rms = sqrt(parseval_band_scale · Σ|X[k]|² over band).
+        // Bands cover bins 1..=low_end, low_end+1..=mid_end, mid_end+1..=N/2-1.
+        // (DC at bin 0 and Nyquist at bin N/2 are excluded by design.)
+        let nyquist_bin = self.freq_buffer.len() - 1; // N/2
+        let mut low_e = 0.0f32;
+        for k in 1..=self.low_band_bin_end {
+            let c = self.freq_buffer[k];
+            low_e += c.re * c.re + c.im * c.im;
+        }
+        let mut mid_e = 0.0f32;
+        for k in (self.low_band_bin_end + 1)..=self.mid_band_bin_end {
+            let c = self.freq_buffer[k];
+            mid_e += c.re * c.re + c.im * c.im;
+        }
+        let mut high_e = 0.0f32;
+        for k in (self.mid_band_bin_end + 1)..nyquist_bin {
+            let c = self.freq_buffer[k];
+            high_e += c.re * c.re + c.im * c.im;
+        }
+        let low_rms  = (low_e  * self.parseval_band_scale).sqrt();
+        let mid_rms  = (mid_e  * self.parseval_band_scale).sqrt();
+        let high_rms = (high_e * self.parseval_band_scale).sqrt();
+
+        // Shift each band history left, append newest at the end (oldest at index 0).
+        // Same pattern as the existing time-domain rms_history.
+        for h in [
+            (&mut self.low_rms_history, low_rms),
+            (&mut self.mid_rms_history, mid_rms),
+            (&mut self.high_rms_history, high_rms),
+        ] {
+            let (history, value) = h;
+            history.copy_within(1.., 0);
+            let last = history.len() - 1;
+            history[last] = value;
+        }
+
         // Magnitude → dB → normalized [0, 1] → smoothed
         // Skip bin 0 (DC); use bins 1..=spectrum.len()
         for (out_i, bin) in self.freq_buffer[1..=self.spectrum.len()].iter().enumerate() {
@@ -180,6 +223,18 @@ impl Dsp {
 
     pub fn rms_history(&self) -> Vec<f32> {
         self.rms_history.clone()
+    }
+
+    pub fn low_rms_history(&self) -> Vec<f32> {
+        self.low_rms_history.clone()
+    }
+
+    pub fn mid_rms_history(&self) -> Vec<f32> {
+        self.mid_rms_history.clone()
+    }
+
+    pub fn high_rms_history(&self) -> Vec<f32> {
+        self.high_rms_history.clone()
     }
 }
 
@@ -550,5 +605,116 @@ mod tests {
         assert_eq!(Dsp::new(2048, 48000.0, 1024, 1024).rms_acf().len(), 512);
         assert_eq!(Dsp::new(2048, 48000.0, 1024, 256).rms_acf().len(), 128);
         assert_eq!(Dsp::new(2048, 48000.0, 1024, 512).rms_acf().len(), 256);
+    }
+
+    #[test]
+    fn pure_low_band_sine_lands_in_low() {
+        // Bin-aligned: 4 × (48000/2048) = 93.75 Hz, in the low band (bins 1..=6).
+        // Hann main lobe is 4 bins wide; bin 4 ± 2 = bins 2..6, all in low.
+        let mut dsp = Dsp::new(2048, 48000.0, 1024, 512);
+        let sr = 48000.0_f32;
+        let freq = 93.75_f32;
+        let signal: Vec<f32> = (0..2048)
+            .map(|i| (2.0 * std::f32::consts::PI * freq * (i as f32 / sr)).sin())
+            .collect();
+        dsp.process(&signal);
+        let low = *dsp.low_rms_history().last().unwrap();
+        let mid = *dsp.mid_rms_history().last().unwrap();
+        let high = *dsp.high_rms_history().last().unwrap();
+        assert!((low - 0.7071).abs() < 0.05, "low {} should be ≈ 0.707", low);
+        assert!(mid < 0.05, "mid {} should be near zero", mid);
+        assert!(high < 0.05, "high {} should be near zero", high);
+    }
+
+    #[test]
+    fn pure_mid_band_sine_lands_in_mid() {
+        // Bin-aligned: 30 × (48000/2048) = 703.125 Hz, in the mid band (bins 7..=64).
+        let mut dsp = Dsp::new(2048, 48000.0, 1024, 512);
+        let sr = 48000.0_f32;
+        let freq = 703.125_f32;
+        let signal: Vec<f32> = (0..2048)
+            .map(|i| (2.0 * std::f32::consts::PI * freq * (i as f32 / sr)).sin())
+            .collect();
+        dsp.process(&signal);
+        let low = *dsp.low_rms_history().last().unwrap();
+        let mid = *dsp.mid_rms_history().last().unwrap();
+        let high = *dsp.high_rms_history().last().unwrap();
+        assert!((mid - 0.7071).abs() < 0.05, "mid {} should be ≈ 0.707", mid);
+        assert!(low < 0.05, "low {} should be near zero", low);
+        assert!(high < 0.05, "high {} should be near zero", high);
+    }
+
+    #[test]
+    fn pure_high_band_sine_lands_in_high() {
+        // Bin-aligned: 100 × (48000/2048) = 2343.75 Hz, in the high band (bins 65..=1023).
+        let mut dsp = Dsp::new(2048, 48000.0, 1024, 512);
+        let sr = 48000.0_f32;
+        let freq = 2343.75_f32;
+        let signal: Vec<f32> = (0..2048)
+            .map(|i| (2.0 * std::f32::consts::PI * freq * (i as f32 / sr)).sin())
+            .collect();
+        dsp.process(&signal);
+        let low = *dsp.low_rms_history().last().unwrap();
+        let mid = *dsp.mid_rms_history().last().unwrap();
+        let high = *dsp.high_rms_history().last().unwrap();
+        assert!((high - 0.7071).abs() < 0.05, "high {} should be ≈ 0.707", high);
+        assert!(low < 0.05, "low {} should be near zero", low);
+        assert!(mid < 0.05, "mid {} should be near zero", mid);
+    }
+
+    #[test]
+    fn parseval_consistency_across_bands() {
+        // Multi-tone: one bin-aligned sine in each band, with different amplitudes.
+        // Expected: sqrt(low² + mid² + high²) ≈ time-domain full RMS within ~5%
+        // (slack for the stationarity approximation in the Parseval derivation).
+        let mut dsp = Dsp::new(2048, 48000.0, 1024, 512);
+        let sr = 48000.0_f32;
+        let signal: Vec<f32> = (0..2048)
+            .map(|i| {
+                let t = i as f32 / sr;
+                let two_pi = 2.0 * std::f32::consts::PI;
+                1.0  * (two_pi * 93.75   * t).sin()  // low,  amp 1.0
+                + 0.5 * (two_pi * 703.125 * t).sin()  // mid,  amp 0.5
+                + 0.25 * (two_pi * 2343.75 * t).sin() // high, amp 0.25
+            })
+            .collect();
+        dsp.process(&signal);
+        let low = *dsp.low_rms_history().last().unwrap();
+        let mid = *dsp.mid_rms_history().last().unwrap();
+        let high = *dsp.high_rms_history().last().unwrap();
+        let full = *dsp.rms_history().last().unwrap();
+        let summed = (low * low + mid * mid + high * high).sqrt();
+        let rel_err = (summed - full).abs() / full;
+        assert!(
+            rel_err < 0.05,
+            "Parseval mismatch: summed={}, full={}, rel_err={}",
+            summed,
+            full,
+            rel_err
+        );
+    }
+
+    #[test]
+    fn band_rms_silence_is_zero() {
+        let mut dsp = Dsp::new(2048, 48000.0, 1024, 512);
+        dsp.process(&vec![0.0_f32; 2048]);
+        assert_eq!(*dsp.low_rms_history().last().unwrap(), 0.0);
+        assert_eq!(*dsp.mid_rms_history().last().unwrap(), 0.0);
+        assert_eq!(*dsp.high_rms_history().last().unwrap(), 0.0);
+    }
+
+    #[test]
+    fn low_rms_history_shifts_oldest_out() {
+        let mut dsp = Dsp::new(2048, 48000.0, 1024, 512);
+        let loud_low: Vec<f32> = (0..2048)
+            .map(|i| (2.0 * std::f32::consts::PI * 93.75 * (i as f32 / 48000.0)).sin())
+            .collect();
+        let silent = vec![0.0_f32; 2048];
+        dsp.process(&loud_low);   // pushes a non-zero into history
+        dsp.process(&silent);     // pushes a zero
+        let h = dsp.low_rms_history();
+        let n = h.len();
+        assert_eq!(h[n - 1], 0.0, "newest should be silent");
+        assert!(h[n - 2] > 0.5, "second-newest should be the loud sine, got {}", h[n - 2]);
     }
 }
