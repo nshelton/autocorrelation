@@ -85,7 +85,7 @@ class DSPProcessor extends AudioWorkletProcessor {
       bufferAcfLen: this.windowSize / 2,
       rmsLen: this.rmsHistoryLen,
       rmsAcfLen: this.rmsHistoryLen / 2,
-      acfPeaksLen: 20,
+      acfPeaksLen: 20, // = 2 * MAX_PEAKS in crates/dsp/src/lib.rs (interleaved [lag, mag] pairs)
     });
   }
 
