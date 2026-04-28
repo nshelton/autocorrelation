@@ -54,6 +54,13 @@ pub struct Dsp {
     low_rms_history:  Vec<f32>,
     mid_rms_history:  Vec<f32>,
     high_rms_history: Vec<f32>,
+    /// Scratch: low_rms_history with its mean subtracted, used as input to
+    /// `autocorrelate`. Without detrending, the average band level creates a
+    /// DC bias that drowns out tempo peaks (same rationale as `rms_detrended`
+    /// for the full-band ACF).
+    low_rms_detrended: Vec<f32>,
+    /// Detrended autocorrelation of `low_rms_history`. Length = rms_history_len / 2.
+    low_rms_acf: Vec<f32>,
 }
 
 #[wasm_bindgen]
@@ -97,6 +104,8 @@ impl Dsp {
             low_rms_history:  vec![0.0; rms_history_len],
             mid_rms_history:  vec![0.0; rms_history_len],
             high_rms_history: vec![0.0; rms_history_len],
+            low_rms_detrended: vec![0.0; rms_history_len],
+            low_rms_acf:       vec![0.0; rms_history_len / 2],
         }
     }
 
@@ -128,15 +137,6 @@ impl Dsp {
         self.rms_history[last] = rms;
 
         autocorrelate(&self.waveform, &mut self.buffer_acf);
-
-        // RMS-envelope ACF: detrend (subtract mean) then autocorrelate.
-        // Without detrending, average loudness creates a DC bias that
-        // drowns out tempo peaks.
-        let mean = self.rms_history.iter().sum::<f32>() / self.rms_history.len() as f32;
-        for (dst, src) in self.rms_detrended.iter_mut().zip(self.rms_history.iter()) {
-            *dst = src - mean;
-        }
-        autocorrelate(&self.rms_detrended, &mut self.rms_acf);
 
         // Apply Hann window
         for i in 0..n {
@@ -189,6 +189,28 @@ impl Dsp {
             history[last] = value;
         }
 
+        // RMS-envelope ACFs: detrend (subtract mean) then autocorrelate.
+        // Computed here, after the FFT and band-RMS updates, so all ACF
+        // computations sit together. Full-band ACF moved here from its
+        // old pre-FFT location; behavior is unchanged.
+        // Mean computed in f64 to avoid summation roundoff: a constant
+        // f32 input of length 512 summed in f32 can drift by ~4e-7,
+        // leaving the detrended buffer with uniform tiny non-zero values
+        // that autocorrelate() then normalizes to ~1.0 instead of 0.
+        let full_mean = (self.rms_history.iter().map(|&x| x as f64).sum::<f64>()
+            / self.rms_history.len() as f64) as f32;
+        for (dst, src) in self.rms_detrended.iter_mut().zip(self.rms_history.iter()) {
+            *dst = src - full_mean;
+        }
+        autocorrelate(&self.rms_detrended, &mut self.rms_acf);
+
+        let low_mean = (self.low_rms_history.iter().map(|&x| x as f64).sum::<f64>()
+            / self.low_rms_history.len() as f64) as f32;
+        for (dst, src) in self.low_rms_detrended.iter_mut().zip(self.low_rms_history.iter()) {
+            *dst = src - low_mean;
+        }
+        autocorrelate(&self.low_rms_detrended, &mut self.low_rms_acf);
+
         // Magnitude → dB → normalized [0, 1] → smoothed
         // Skip bin 0 (DC); use bins 1..=spectrum.len()
         for (out_i, bin) in self.freq_buffer[1..=self.spectrum.len()].iter().enumerate() {
@@ -219,6 +241,10 @@ impl Dsp {
 
     pub fn rms_acf(&self) -> Vec<f32> {
         self.rms_acf.clone()
+    }
+
+    pub fn low_rms_acf(&self) -> Vec<f32> {
+        self.low_rms_acf.clone()
     }
 
     pub fn rms_history(&self) -> Vec<f32> {
@@ -716,5 +742,35 @@ mod tests {
         let n = h.len();
         assert_eq!(h[n - 1], 0.0, "newest should be silent");
         assert!(h[n - 2] > 0.5, "second-newest should be the loud sine, got {}", h[n - 2]);
+    }
+
+    #[test]
+    fn low_rms_acf_has_correct_length() {
+        let dsp = Dsp::new(2048, 48000.0, 1024, 512);
+        assert_eq!(dsp.low_rms_acf().len(), 256);
+    }
+
+    #[test]
+    fn low_rms_acf_constant_input_is_zero() {
+        // Fill low_rms_history with a constant non-zero band-RMS by feeding the
+        // same loud bin-aligned low-frequency sine repeatedly. Detrended ACF on
+        // a constant should be zero everywhere.
+        let mut dsp = Dsp::new(2048, 48000.0, 1024, 512);
+        let sr = 48000.0_f32;
+        let signal: Vec<f32> = (0..2048)
+            .map(|i| (2.0 * std::f32::consts::PI * 93.75 * (i as f32 / sr)).sin())
+            .collect();
+        // 512 calls fully fills the band history with a constant value.
+        for _ in 0..512 {
+            dsp.process(&signal);
+        }
+        let acf = dsp.low_rms_acf();
+        for &v in &acf {
+            assert!(
+                v.abs() < 1e-4,
+                "expected near-zero detrended ACF for constant input, got {}",
+                v
+            );
+        }
     }
 }
