@@ -9,7 +9,7 @@ import {
   Vector3,
 } from "three";
 
-export type LineLayoutFn = (i: number, n: number, value: number) => Vector3;
+export type LineLayoutFn = (i: number, n: number, value: number, z: number) => Vector3;
 
 export interface LineRendererOptions {
   source: () => Float32Array;
@@ -17,9 +17,9 @@ export interface LineRendererOptions {
   color?: ColorRepresentation;
 }
 
-const defaultLayout: LineLayoutFn = (i, n, value) => {
+const defaultLayout: LineLayoutFn = (i, n, value, z) => {
   const x = n <= 1 ? 0 : (i / (n - 1)) * 2 - 1;
-  return new Vector3(x, value, 0);
+  return new Vector3(x, value, z);
 };
 
 export class LineRenderer {
@@ -72,7 +72,7 @@ export class LineRenderer {
   private writeFromSource(buf: Float32Array): void {
     const n = buf.length;
     for (let i = 0; i < n; i++) {
-      const v = this.layout(i, n, buf[i]);
+      const v = this.layout(i, n, buf[i], 0);
       this.positions[i * 3] = v.x;
       this.positions[i * 3 + 1] = v.y;
       this.positions[i * 3 + 2] = v.z;
