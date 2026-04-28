@@ -1141,4 +1141,44 @@ mod tests {
         let max_abs = inst.iter().map(|v| v.abs()).fold(0.0_f32, f32::max);
         assert!(max_abs > 0.01, "expected non-trivial ACF; max |inst| = {}", max_abs);
     }
+
+    #[test]
+    fn process_pipeline_finds_periodic_peak_via_acf_peaks() {
+        // End-to-end integration test: drive process() with a known per-hop
+        // amplitude period, then verify acf_peaks()[0] reports that period as
+        // the dominant tempo lag. Catches integration bugs in process() that
+        // unit-tested individual stages would miss (e.g., pick_acf_peaks
+        // not called, called before EMA update, etc.).
+        let mut dsp = Dsp::new(2048, 48000.0, 1024, 512);
+        let sr = 48000.0_f32;
+        let period_hops = 32usize;
+        // 1500 hops covers both rms_history fill (512) and accumulator
+        // convergence at default tau=4s (~940 hops).
+        for k in 0..1500 {
+            // Sinusoidal envelope across hops with period `period_hops`.
+            // Add a constant offset of 0.6 so amplitude stays positive — RMS is
+            // |signal|-symmetric, so a zero-crossing envelope would create a
+            // doubled-frequency artifact.
+            let amp = 0.6 + 0.3 * (2.0 * std::f32::consts::PI * (k as f32) / (period_hops as f32)).sin();
+            let signal: Vec<f32> = (0..2048)
+                .map(|i| {
+                    let t = i as f32 / sr;
+                    amp * (2.0 * std::f32::consts::PI * 1000.0 * t).sin()
+                })
+                .collect();
+            dsp.process(&signal);
+        }
+        let peaks = dsp.acf_peaks();
+        let lag0 = peaks[0];
+        assert!(!lag0.is_nan(), "expected at least one peak after convergence");
+        assert!(
+            (lag0 - period_hops as f32).abs() < 1.0,
+            "expected peak near lag {}, got {}",
+            period_hops, lag0
+        );
+        // The peak's magnitude (ACF normalized to [0,1] roughly) should be
+        // meaningfully positive, not just barely above zero.
+        let mag0 = peaks[1];
+        assert!(mag0 > 0.1, "expected significant peak magnitude, got {}", mag0);
+    }
 }
