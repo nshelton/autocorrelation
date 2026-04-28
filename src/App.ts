@@ -14,6 +14,8 @@ export class App {
   private waveformLine!: LineRenderer;
   private spectrumLine!: LineRenderer;
   private rmsLine!: LineRenderer;
+  private bufferAcfLine!: LineRenderer;
+  private rmsAcfLine!: LineRenderer;
   private store = new FeatureStore();
   private last = 0;
   private fps = new FpsOverlay();
@@ -46,27 +48,43 @@ export class App {
     this.store.set("waveform", new Float32Array(2048));
     this.store.set("spectrum", new Float32Array(1024));
     this.store.set("rms", new Float32Array(512));
+    this.store.set("bufferAcf", new Float32Array(1024));
+    this.store.set("rmsAcf", new Float32Array(256));
 
     this.waveformLine = new LineRenderer({
       source: () => this.store.get("waveform"),
-      layout: linearLayout(0.6, 0.5),
+      layout: linearLayout(1.0, 0.4),
       color: 0x66ffcc,
     });
     scene.add(this.waveformLine.object3d);
 
+    this.bufferAcfLine = new LineRenderer({
+      source: () => this.store.get("bufferAcf"),
+      layout: linearLayout(0.5, 0.4),
+      color: 0xcc99ff,
+    });
+    scene.add(this.bufferAcfLine.object3d);
+
     this.spectrumLine = new LineRenderer({
       source: () => this.store.get("spectrum"),
-      layout: logSpectrumLayout(0.0, 0.5),
+      layout: logSpectrumLayout(0.0, 0.4),
       color: 0xffaa66,
     });
     scene.add(this.spectrumLine.object3d);
 
     this.rmsLine = new LineRenderer({
       source: () => this.store.get("rms"),
-      layout: linearLayout(-0.6, 0.5),
+      layout: linearLayout(-0.5, 0.4),
       color: 0xffffff,
     });
     scene.add(this.rmsLine.object3d);
+
+    this.rmsAcfLine = new LineRenderer({
+      source: () => this.store.get("rmsAcf"),
+      layout: linearLayout(-1.0, 0.4),
+      color: 0xff99cc,
+    });
+    scene.add(this.rmsAcfLine.object3d);
 
     this.fps.mount();
 
@@ -135,11 +153,15 @@ export class App {
         waveform?: Float32Array;
         spectrum?: Float32Array;
         rms?: Float32Array;
+        bufferAcf?: Float32Array;
+        rmsAcf?: Float32Array;
       };
       if (msg.type !== "features") return;
       if (msg.waveform) this.store.set("waveform", msg.waveform);
       if (msg.spectrum) this.store.set("spectrum", msg.spectrum);
       if (msg.rms) this.store.set("rms", msg.rms);
+      if (msg.bufferAcf) this.store.set("bufferAcf", msg.bufferAcf);
+      if (msg.rmsAcf) this.store.set("rmsAcf", msg.rmsAcf);
     };
 
     const loop = (now: number) => {
@@ -148,8 +170,10 @@ export class App {
       this.last = now;
       this.rig.update(dt);
       this.waveformLine.update();
+      this.bufferAcfLine.update();
       this.spectrumLine.update();
       this.rmsLine.update();
+      this.rmsAcfLine.update();
       renderer.render(scene, camera);
       this.fps.end();
       requestAnimationFrame(loop);
