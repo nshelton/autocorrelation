@@ -15,6 +15,9 @@ export interface PeakMarkersOptions {
   lagDomain: number;
   yCenter: number;
   ySpan: number;
+  /** Maps a lag (possibly fractional, sub-bin) to an x-coordinate. Pass the
+   * same mapping the underlying chart line uses so markers stay pixel-aligned
+   * with the line they annotate, even if the chart's layout fn changes. */
   xForLag: (lag: number, lagDomain: number) => number;
   baseColor?: ColorRepresentation;
 }
@@ -73,6 +76,9 @@ export class PeakMarkers {
       const top = i * 2;
       const bot = i * 2 + 1;
       if (Number.isNaN(lag)) {
+        // LineSegments has a fixed [2*i, 2*i+1] vertex contract per segment;
+        // we can't skip the index. Collapsing both endpoints to the same point
+        // (with black color) hides the segment without geometry resizing.
         this.writeVertex(top, 0, this.yCenter, 0, 0);
         this.writeVertex(bot, 0, this.yCenter, 0, 0);
         continue;
