@@ -197,21 +197,6 @@ mod tests {
     }
 
     #[test]
-    fn autocorrelate_helper_correctness() {
-        // Hand-computed for input [1, 2, 3, 4] with output length 3:
-        //   raw[0] = 1*1 + 2*2 + 3*3 + 4*4 = 30
-        //   raw[1] = 1*2 + 2*3 + 3*4       = 20
-        //   raw[2] = 1*3 + 2*4             = 11
-        // Normalized by raw[0]=30: [1.0, 20/30, 11/30].
-        let input = [1.0_f32, 2.0, 3.0, 4.0];
-        let mut output = [0.0_f32; 3];
-        autocorrelate(&input, &mut output);
-        assert!((output[0] - 1.0).abs() < 1e-6, "got {}", output[0]);
-        assert!((output[1] - 20.0 / 30.0).abs() < 1e-6, "got {}", output[1]);
-        assert!((output[2] - 11.0 / 30.0).abs() < 1e-6, "got {}", output[2]);
-    }
-
-    #[test]
     fn loud_sine_produces_a_peak() {
         let mut dsp = Dsp::new(2048);
         let sr = 48000.0_f32;
@@ -237,5 +222,20 @@ mod tests {
             argmax + 1
         );
         assert!(peak > 0.5, "expected loud peak, got {}", peak);
+    }
+
+    #[test]
+    fn autocorrelate_helper_correctness() {
+        // Hand-computed for input [1, 2, 3, 4] with output length 3:
+        //   raw[0] = 1*1 + 2*2 + 3*3 + 4*4 = 30
+        //   raw[1] = 1*2 + 2*3 + 3*4       = 20
+        //   raw[2] = 1*3 + 2*4             = 11
+        // Normalized by raw[0]=30: [1.0, 20/30, 11/30].
+        let input = [1.0_f32, 2.0, 3.0, 4.0];
+        let mut output = [0.0_f32; 3];
+        autocorrelate(&input, &mut output);
+        assert!((output[0] - 1.0).abs() < 1e-6, "got {}", output[0]);
+        assert!((output[1] - 20.0 / 30.0).abs() < 1e-6, "got {}", output[1]);
+        assert!((output[2] - 11.0 / 30.0).abs() < 1e-6, "got {}", output[2]);
     }
 }
