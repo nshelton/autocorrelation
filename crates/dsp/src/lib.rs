@@ -38,6 +38,9 @@ pub struct Dsp {
     /// (`hop_size / sample_rate`), so changing `hop_size` does NOT change
     /// perceived smoothing dynamics.
     smoothing_alpha: f32,
+    /// dt = hop_size / sample_rate, captured at construction. Used by
+    /// `set_smoothing_tau` to recompute `smoothing_alpha`.
+    dt: f32,
     /// Inclusive last bin index of the low band. Low band = bins 1..=low_band_bin_end.
     /// Bin 0 (DC) is always skipped.
     low_band_bin_end: usize,
@@ -84,14 +87,21 @@ impl Dsp {
             rms_acf: vec![0.0; rms_history_len / 2],
             rms_detrended: vec![0.0; rms_history_len],
             smoothing_alpha,
+            dt,
             low_band_bin_end,
             mid_band_bin_end,
             parseval_band_scale,
         }
     }
 
-    pub fn set_smoothing_alpha(&mut self, alpha: f32) {
-        self.smoothing_alpha = alpha.clamp(0.0, 1.0);
+    /// Set the spectrum smoothing time constant (seconds). The internal
+    /// `smoothing_alpha` is recomputed from `tau` and the dt captured at
+    /// construction: `alpha = 1 - exp(-dt / tau)`. Smaller tau → faster
+    /// response. Clamped to [0.001, 10.0] to avoid divide-by-zero and
+    /// nonsensical multi-second settling times.
+    pub fn set_smoothing_tau(&mut self, tau_secs: f32) {
+        let tau = tau_secs.clamp(0.001, 10.0);
+        self.smoothing_alpha = 1.0 - (-self.dt / tau).exp();
     }
 
     pub fn set_db_floor(&mut self, floor: f32) {
@@ -467,33 +477,46 @@ mod tests {
     }
 
     #[test]
-    fn set_smoothing_alpha_clamps_to_unit_interval() {
+    fn set_smoothing_tau_recomputes_alpha() {
+        // sr=48000, hop=1024 → dt = 21.33 ms
         let mut dsp = Dsp::new(2048, 48000.0, 1024, 512);
-        // Effective alpha controls the spectrum EMA. With alpha=1, one process call
-        // fully replaces the prior value; with alpha=0, the spectrum stays at 0.
+
+        // tau = SMOOTHING_TAU_SECS (0.0956 s) → alpha ≈ 1 - exp(-21.33/95.6) ≈ 0.20
+        dsp.set_smoothing_tau(0.0956);
+        // Drive a steady sine and verify the spectrum stabilizes (i.e. EMA is sane).
         let signal: Vec<f32> = (0..2048)
             .map(|i| (2.0 * std::f32::consts::PI * 1000.0 * (i as f32 / 48000.0)).sin())
             .collect();
-
-        // Below 0 should clamp to 0 → spectrum stays zero forever.
-        dsp.set_smoothing_alpha(-0.5);
-        for _ in 0..5 {
+        for _ in 0..30 {
             dsp.process(&signal);
         }
-        assert!(dsp.spectrum().iter().all(|&v| v == 0.0));
+        let stable = dsp.spectrum();
+        // Find peak — should be a recognizable lobe, not flat.
+        let max = stable.iter().cloned().fold(0.0_f32, f32::max);
+        assert!(max > 0.5, "expected a clear spectrum peak, got max={}", max);
 
-        // Above 1 should clamp to 1 → one process call snaps to the new value.
+        // tau extremely small → alpha → 1 (one-shot replacement).
         let mut dsp = Dsp::new(2048, 48000.0, 1024, 512);
-        dsp.set_smoothing_alpha(1.5);
+        dsp.set_smoothing_tau(0.0001); // clamps to 0.001 → alpha ≈ 1.0 since dt >> tau
         dsp.process(&signal);
         let after_one = dsp.spectrum();
         dsp.process(&signal);
         let after_two = dsp.spectrum();
-        // With alpha=1, the EMA is a no-history replacement; second call should
-        // produce identical output (assuming identical input).
+        // With alpha ≈ 1, EMA fully replaces each call → stable across calls.
         for (a, b) in after_one.iter().zip(after_two.iter()) {
-            assert!((a - b).abs() < 1e-6, "alpha=1 EMA should be stable: {} vs {}", a, b);
+            assert!((a - b).abs() < 1e-5, "alpha≈1 EMA should be stable: {} vs {}", a, b);
         }
+
+        // tau extremely large → alpha → 0 (no update).
+        let mut dsp = Dsp::new(2048, 48000.0, 1024, 512);
+        dsp.set_smoothing_tau(1000.0); // clamps to 10.0 → alpha tiny
+        for _ in 0..3 {
+            dsp.process(&signal);
+        }
+        // Spectrum stays near zero because the EMA barely moves.
+        let small = dsp.spectrum();
+        let max = small.iter().cloned().fold(0.0_f32, f32::max);
+        assert!(max < 0.1, "expected sluggish EMA → near-zero spectrum after 3 calls, got max={}", max);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 import type { ParamStore } from "./ParamStore";
 
-const HOT_KEYS = ["hopSize", "smoothingAlpha", "dbFloor"] as const;
+const HOT_KEYS = ["hopSize", "smoothingTauSecs", "dbFloor"] as const;
 
 export class WorkletBridge {
   constructor(private store: ParamStore, private port: MessagePort) {

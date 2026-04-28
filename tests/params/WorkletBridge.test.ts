@@ -26,7 +26,7 @@ describe("WorkletBridge", () => {
     const calls = (port.postMessage as ReturnType<typeof vi.fn>).mock.calls.map((c) => c[0]);
     expect(calls).toContainEqual({ type: "configure", windowSize: 2048, rmsHistoryLen: 512 });
     expect(calls).toContainEqual({ type: "param", key: "hopSize", value: 1024 });
-    expect(calls).toContainEqual({ type: "param", key: "smoothingAlpha", value: 0.2 });
+    expect(calls).toContainEqual({ type: "param", key: "smoothingTauSecs", value: 0.0956 });
     expect(calls).toContainEqual({ type: "param", key: "dbFloor", value: -100 });
     expect(calls.length).toBe(4);
   });
@@ -44,15 +44,15 @@ describe("WorkletBridge", () => {
     });
   });
 
-  it("smoothingAlpha change posts a param message with the hot key (no dsp prefix)", () => {
+  it("smoothingTauSecs change posts a param message with the hot key (no dsp prefix)", () => {
     const store = makeStore();
     const port = makePort();
     new WorkletBridge(store, port);
     (port.postMessage as ReturnType<typeof vi.fn>).mockClear();
-    store.set("dsp.smoothingAlpha", 0.5);
+    store.set("dsp.smoothingTauSecs", 0.5);
     expect(port.postMessage).toHaveBeenCalledWith({
       type: "param",
-      key: "smoothingAlpha",
+      key: "smoothingTauSecs",
       value: 0.5,
     });
   });

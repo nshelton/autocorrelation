@@ -4,7 +4,7 @@ import init, { Dsp } from "../wasm-pkg/dsp";
 
 type WorkletInbound =
   | { type: "configure"; windowSize: number; rmsHistoryLen: number }
-  | { type: "param"; key: "hopSize" | "smoothingAlpha" | "dbFloor"; value: number };
+  | { type: "param"; key: "hopSize" | "smoothingTauSecs" | "dbFloor"; value: number };
 
 class DSPProcessor extends AudioWorkletProcessor {
   private window: Float32Array = new Float32Array(2048);
@@ -14,7 +14,7 @@ class DSPProcessor extends AudioWorkletProcessor {
   private windowSize = 2048;
   private hopSize = 1024;
   private rmsHistoryLen = 512;
-  private smoothingAlpha = 0.2;
+  private smoothingTauSecs = 0.0956;
   private dbFloor = -100;
   private pendingConfigure: { windowSize: number; rmsHistoryLen: number } | null = null;
 
@@ -33,10 +33,6 @@ class DSPProcessor extends AudioWorkletProcessor {
     const cfg = this.pendingConfigure ?? { windowSize: this.windowSize, rmsHistoryLen: this.rmsHistoryLen };
     this.applyConfigure(cfg);
     this.ready = true;
-    if (this.dsp) {
-      this.dsp.set_smoothing_alpha(this.smoothingAlpha);
-      this.dsp.set_db_floor(this.dbFloor);
-    }
   }
 
   private onMessage(msg: WorkletInbound) {
@@ -51,15 +47,17 @@ class DSPProcessor extends AudioWorkletProcessor {
     if (msg.type === "param") {
       if (msg.key === "hopSize") {
         this.hopSize = Math.min(msg.value, this.windowSize);
-      } else if (msg.key === "smoothingAlpha") {
-        this.smoothingAlpha = msg.value;
-        if (this.ready && this.dsp) this.dsp.set_smoothing_alpha(msg.value);
+      } else if (msg.key === "smoothingTauSecs") {
+        this.smoothingTauSecs = msg.value;
+        if (this.ready && this.dsp) this.dsp.set_smoothing_tau(msg.value);
       } else if (msg.key === "dbFloor") {
         this.dbFloor = msg.value;
         if (this.ready && this.dsp) this.dsp.set_db_floor(msg.value);
       }
       return;
     }
+    const _exhaustive: never = msg;
+    void _exhaustive;
   }
 
   private applyConfigure(cfg: { windowSize: number; rmsHistoryLen: number }) {
@@ -73,7 +71,7 @@ class DSPProcessor extends AudioWorkletProcessor {
     this.hopCounter = 0;
     this.hopSize = Math.min(this.hopSize, this.windowSize);
     this.dsp = new Dsp(this.windowSize, sampleRate, this.hopSize, this.rmsHistoryLen);
-    this.dsp.set_smoothing_alpha(this.smoothingAlpha);
+    this.dsp.set_smoothing_tau(this.smoothingTauSecs);
     this.dsp.set_db_floor(this.dbFloor);
     this.port.postMessage({
       type: "configured",
