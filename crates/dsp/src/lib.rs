@@ -5,7 +5,7 @@ use wasm_bindgen::prelude::*;
 
 const SMOOTHING_ALPHA: f32 = 0.2;
 const DB_FLOOR: f32 = -100.0;
-const RMS_HISTORY_LEN: usize = 256;
+const RMS_HISTORY_LEN: usize = 512;
 
 #[wasm_bindgen]
 pub struct Dsp {

@@ -3,10 +3,11 @@ import "./worklet-polyfills";
 import init, { Dsp } from "../wasm-pkg/dsp";
 
 const WINDOW_SIZE = 2048;
+const HOP_SIZE = 1024;
 
 class DSPProcessor extends AudioWorkletProcessor {
   private window = new Float32Array(WINDOW_SIZE);
-  private filled = 0;
+  private hopCounter = 0;
   private dsp: Dsp | null = null;
   private ready = false;
 
@@ -30,29 +31,34 @@ class DSPProcessor extends AudioWorkletProcessor {
     if (!input || input.length === 0) return true;
     const channel = input[0];
     if (!channel) return true;
+    if (!this.ready || !this.dsp) return true;
 
-    let i = 0;
-    while (i < channel.length) {
-      const space = WINDOW_SIZE - this.filled;
-      const take = Math.min(space, channel.length - i);
-      this.window.set(channel.subarray(i, i + take), this.filled);
-      this.filled += take;
-      i += take;
+    const len = channel.length;
 
-      if (this.filled === WINDOW_SIZE) {
-        if (this.ready && this.dsp) {
-          this.dsp.process(this.window);
-          const wf = new Float32Array(this.dsp.waveform());
-          const sp = new Float32Array(this.dsp.spectrum());
-          const rms = new Float32Array(this.dsp.rms_history());
-          this.port.postMessage(
-            { type: "features", waveform: wf, spectrum: sp, rms },
-            [wf.buffer, sp.buffer, rms.buffer],
-          );
-        }
-        this.filled = 0;
-      }
+    // Slide the window: shift left by `len`, append new samples at the end.
+    // Buffer always holds the most recent WINDOW_SIZE samples; zero-padded at boot.
+    if (len >= WINDOW_SIZE) {
+      // Edge case: chunk is at least as large as the window — just take the tail.
+      this.window.set(channel.subarray(len - WINDOW_SIZE));
+    } else {
+      this.window.copyWithin(0, len);
+      this.window.set(channel, WINDOW_SIZE - len);
     }
+
+    // Fire FFT every HOP_SIZE new samples for ~47 Hz update rate (50% overlap).
+    this.hopCounter += len;
+    while (this.hopCounter >= HOP_SIZE) {
+      this.dsp.process(this.window);
+      const wf = new Float32Array(this.dsp.waveform());
+      const sp = new Float32Array(this.dsp.spectrum());
+      const rms = new Float32Array(this.dsp.rms_history());
+      this.port.postMessage(
+        { type: "features", waveform: wf, spectrum: sp, rms },
+        [wf.buffer, sp.buffer, rms.buffer],
+      );
+      this.hopCounter -= HOP_SIZE;
+    }
+
     return true;
   }
 }

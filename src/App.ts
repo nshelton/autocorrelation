@@ -45,7 +45,7 @@ export class App {
 
     this.store.set("waveform", new Float32Array(2048));
     this.store.set("spectrum", new Float32Array(1024));
-    this.store.set("rms", new Float32Array(256));
+    this.store.set("rms", new Float32Array(512));
 
     this.waveformLine = new LineRenderer({
       source: () => this.store.get("waveform"),
