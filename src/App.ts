@@ -28,11 +28,11 @@ export class App {
 
     this.rig = new CameraRig(camera);
     this.rig.addPreset("front", {
-      position: new Vector3(0, 0, 3),
+      position: new Vector3(0, 0, 4),
       target: new Vector3(0, 0, 0),
     });
     this.rig.addPreset("side", {
-      position: new Vector3(3, 1, 0),
+      position: new Vector3(4, 0, 0),
       target: new Vector3(0, 0, 0),
     });
     this.rig.addPreset("spectrum", {
@@ -40,8 +40,16 @@ export class App {
       target: new Vector3(0, 0, 0),
     });
     this.rig.addPreset("rms", {
-      position: new Vector3(0, -0.6, 1.4),
-      target: new Vector3(0, -0.6, 0),
+      position: new Vector3(0, -0.5, 1.4),
+      target: new Vector3(0, -0.5, 0),
+    });
+    this.rig.addPreset("buffer-acf", {
+      position: new Vector3(0, 0.5, 1.4),
+      target: new Vector3(0, 0.5, 0),
+    });
+    this.rig.addPreset("rms-acf", {
+      position: new Vector3(0, -1.0, 1.4),
+      target: new Vector3(0, -1.0, 0),
     });
     await this.rig.goTo("front", { duration: 0 });
 
@@ -94,6 +102,8 @@ export class App {
       "2": "side",
       "3": "spectrum",
       "4": "rms",
+      "5": "buffer-acf",
+      "6": "rms-acf",
     };
     window.addEventListener("keydown", (e) => {
       const preset = presetKeys[e.key];
