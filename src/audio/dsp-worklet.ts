@@ -4,7 +4,7 @@ import init, { Dsp } from "../wasm-pkg/dsp";
 
 type WorkletInbound =
   | { type: "configure"; windowSize: number; rmsHistoryLen: number }
-  | { type: "param"; key: "hopSize" | "smoothingTauSecs" | "dbFloor"; value: number };
+  | { type: "param"; key: "hopSize" | "smoothingTauSecs" | "dbFloor" | "accumTauSecs"; value: number };
 
 class DSPProcessor extends AudioWorkletProcessor {
   private window: Float32Array = new Float32Array(2048);
@@ -15,6 +15,7 @@ class DSPProcessor extends AudioWorkletProcessor {
   private hopSize = 1024;
   private rmsHistoryLen = 512;
   private smoothingTauSecs = 0.0956;
+  private accumTauSecs = 4.0;
   private dbFloor = -100;
   private pendingConfigure: { windowSize: number; rmsHistoryLen: number } | null = null;
 
@@ -50,6 +51,9 @@ class DSPProcessor extends AudioWorkletProcessor {
       } else if (msg.key === "smoothingTauSecs") {
         this.smoothingTauSecs = msg.value;
         if (this.ready && this.dsp) this.dsp.set_smoothing_tau(msg.value);
+      } else if (msg.key === "accumTauSecs") {
+        this.accumTauSecs = msg.value;
+        if (this.ready && this.dsp) this.dsp.set_accum_tau_secs(msg.value);
       } else if (msg.key === "dbFloor") {
         this.dbFloor = msg.value;
         if (this.ready && this.dsp) this.dsp.set_db_floor(msg.value);
@@ -73,6 +77,7 @@ class DSPProcessor extends AudioWorkletProcessor {
     this.dsp = new Dsp(this.windowSize, sampleRate, this.hopSize, this.rmsHistoryLen);
     this.dsp.set_smoothing_tau(this.smoothingTauSecs);
     this.dsp.set_db_floor(this.dbFloor);
+    this.dsp.set_accum_tau_secs(this.accumTauSecs);
     this.port.postMessage({
       type: "configured",
       waveformLen: this.windowSize,
@@ -80,6 +85,7 @@ class DSPProcessor extends AudioWorkletProcessor {
       bufferAcfLen: this.windowSize / 2,
       rmsLen: this.rmsHistoryLen,
       rmsAcfLen: this.rmsHistoryLen / 2,
+      acfPeaksLen: 20,
     });
   }
 
@@ -107,6 +113,8 @@ class DSPProcessor extends AudioWorkletProcessor {
       const rms = new Float32Array(this.dsp.rms_history());
       const ba = new Float32Array(this.dsp.buffer_acf());
       const ra = new Float32Array(this.dsp.rms_acf());
+      const raAccum = new Float32Array(this.dsp.rms_acf_accum());
+      const peaks = new Float32Array(this.dsp.acf_peaks());
       const rmsLow = new Float32Array(this.dsp.low_rms_history());
       const rmsMid = new Float32Array(this.dsp.mid_rms_history());
       const rmsHigh = new Float32Array(this.dsp.high_rms_history());
@@ -119,6 +127,8 @@ class DSPProcessor extends AudioWorkletProcessor {
           rms,
           bufferAcf: ba,
           rmsAcf: ra,
+          rmsAcfAccum: raAccum,
+          acfPeaks: peaks,
           rmsLow,
           rmsMid,
           rmsHigh,
@@ -130,6 +140,8 @@ class DSPProcessor extends AudioWorkletProcessor {
           rms.buffer,
           ba.buffer,
           ra.buffer,
+          raAccum.buffer,
+          peaks.buffer,
           rmsLow.buffer,
           rmsMid.buffer,
           rmsHigh.buffer,
