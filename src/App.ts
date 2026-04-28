@@ -89,7 +89,37 @@ export class App {
       }
     });
 
-    const { context, source } = await sourceFactory();
+    const { context, source, stream } = await sourceFactory();
+
+    // Audio diagnostics
+    console.log("[audio] context.sampleRate:", context.sampleRate, "Hz");
+    console.log("[audio] context.baseLatency:", context.baseLatency, "s");
+    console.log("[audio] source.channelCount:", source.channelCount);
+    const tracks = stream?.getAudioTracks() ?? [];
+    if (tracks.length === 0) {
+      console.log("[audio] no MediaStream tracks (likely internal test source)");
+    }
+    tracks.forEach((t, i) => {
+      console.log(`[audio] track ${i} label:`, t.label);
+      try {
+        const settings = t.getSettings();
+        console.log(`[audio] track ${i} settings:`, settings);
+        console.log(
+          `[audio] track ${i} sampleRate:`,
+          (settings as { sampleRate?: number }).sampleRate ?? "(not reported)",
+        );
+      } catch (err) {
+        console.log(`[audio] track ${i} settings: unavailable`, err);
+      }
+    });
+    const sr = context.sampleRate;
+    const fftSize = 2048;
+    console.log(
+      "[audio] FFT bins map: bin0=DC, bin1=" + (sr / fftSize).toFixed(1) + "Hz, " +
+      "bin1023=" + ((1023 * sr) / fftSize).toFixed(0) + "Hz, " +
+      "bin1024=Nyquist=" + (sr / 2).toFixed(0) + "Hz",
+    );
+
     const wasmModule = await WebAssembly.compileStreaming(fetch(dspWasmUrl));
     await context.audioWorklet.addModule(dspWorkletUrl);
     const node = new AudioWorkletNode(context, "dsp-processor", {

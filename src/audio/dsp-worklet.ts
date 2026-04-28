@@ -21,7 +21,7 @@ class DSPProcessor extends AudioWorkletProcessor {
   }
 
   private async boot(wasmModule: WebAssembly.Module) {
-    await init(wasmModule);
+    await init({ module_or_path: wasmModule });
     this.dsp = new Dsp(WINDOW_SIZE);
     this.ready = true;
   }
