@@ -55,4 +55,14 @@ export const analysisSchemas: ParamSchema[] = [
     default: 4.0,
     reconfig: false,
   },
+  {
+    key: "dsp.autoGain",
+    label: "AutoGain τ (s)",
+    kind: "continuous",
+    min: 0.05,
+    max: 30.0,
+    step: 0.05,
+    default: 1.0,
+    reconfig: false,
+  },
 ];

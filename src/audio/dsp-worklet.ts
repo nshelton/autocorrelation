@@ -4,7 +4,24 @@ import init, { Dsp } from "../wasm-pkg/dsp";
 
 type WorkletInbound =
   | { type: "configure"; windowSize: number; rmsHistoryLen: number }
-  | { type: "param"; key: "hopSize" | "smoothingTauSecs" | "dbFloor" | "accumTauSecs"; value: number };
+  | { type: "param"; key: "hopSize" | "smoothingTauSecs" | "dbFloor" | "accumTauSecs"; value: number }
+  // HMR: a freshly-built App needs the buffer sizes to construct line renderers,
+  // but the worklet only emits `configured` on boot or on a `configure` request
+  // (the latter resets Dsp state, which we want to preserve across HMR). `sync`
+  // re-emits the cached `configured` payload without touching Dsp.
+  | { type: "sync" };
+
+type ConfiguredOutbound = {
+  type: "configured";
+  waveformLen: number;
+  spectrumLen: number;
+  bufferAcfLen: number;
+  rmsLen: number;
+  rmsAcfLen: number;
+  acfPeaksLen: number;
+  beatGridLen: number;
+  beatPulsesLen: number;
+};
 
 class DSPProcessor extends AudioWorkletProcessor {
   private window: Float32Array = new Float32Array(2048);
@@ -18,6 +35,7 @@ class DSPProcessor extends AudioWorkletProcessor {
   private accumTauSecs = 4.0;
   private dbFloor = -100;
   private pendingConfigure: { windowSize: number; rmsHistoryLen: number } | null = null;
+  private lastConfigured: ConfiguredOutbound | null = null;
 
   constructor(options?: AudioWorkletNodeOptions) {
     super();
@@ -43,6 +61,12 @@ class DSPProcessor extends AudioWorkletProcessor {
         return;
       }
       this.applyConfigure(msg);
+      return;
+    }
+    if (msg.type === "sync") {
+      // If we haven't configured yet, boot() will post `configured` once init
+      // finishes — no need to retain the sync request.
+      if (this.lastConfigured) this.port.postMessage(this.lastConfigured);
       return;
     }
     if (msg.type === "param") {
@@ -78,7 +102,7 @@ class DSPProcessor extends AudioWorkletProcessor {
     this.dsp.set_smoothing_tau(this.smoothingTauSecs);
     this.dsp.set_db_floor(this.dbFloor);
     this.dsp.set_accum_tau_secs(this.accumTauSecs);
-    this.port.postMessage({
+    const payload: ConfiguredOutbound = {
       type: "configured",
       waveformLen: this.windowSize,
       spectrumLen: this.windowSize / 2,
@@ -86,7 +110,11 @@ class DSPProcessor extends AudioWorkletProcessor {
       rmsLen: this.rmsHistoryLen,
       rmsAcfLen: this.rmsHistoryLen / 2,
       acfPeaksLen: 20, // = 2 * MAX_PEAKS in crates/dsp/src/lib.rs (interleaved [lag, mag] pairs)
-    });
+      beatGridLen: 3, // = BEAT_GRID_LEN in crates/dsp/src/lib.rs ([period, phase, score])
+      beatPulsesLen: 4, // = BEAT_PULSES_LEN in crates/dsp/src/lib.rs (saw values for cycles 1, 4, 8, 16)
+    };
+    this.lastConfigured = payload;
+    this.port.postMessage(payload);
   }
 
   process(inputs: Float32Array[][]): boolean {
@@ -115,6 +143,8 @@ class DSPProcessor extends AudioWorkletProcessor {
       const ra = new Float32Array(this.dsp.rms_acf());
       const raAccum = new Float32Array(this.dsp.rms_acf_accum());
       const peaks = new Float32Array(this.dsp.acf_peaks());
+      const beatGrid = new Float32Array(this.dsp.beat_grid());
+      const beatPulses = new Float32Array(this.dsp.beat_pulses());
       const rmsLow = new Float32Array(this.dsp.low_rms_history());
       const rmsMid = new Float32Array(this.dsp.mid_rms_history());
       const rmsHigh = new Float32Array(this.dsp.high_rms_history());
@@ -129,6 +159,8 @@ class DSPProcessor extends AudioWorkletProcessor {
           rmsAcf: ra,
           rmsAcfAccum: raAccum,
           acfPeaks: peaks,
+          beatGrid,
+          beatPulses,
           rmsLow,
           rmsMid,
           rmsHigh,
@@ -142,6 +174,8 @@ class DSPProcessor extends AudioWorkletProcessor {
           ra.buffer,
           raAccum.buffer,
           peaks.buffer,
+          beatGrid.buffer,
+          beatPulses.buffer,
           rmsLow.buffer,
           rmsMid.buffer,
           rmsHigh.buffer,
