@@ -1,5 +1,5 @@
 use realfft::num_complex::Complex;
-use realfft::{RealFftPlanner, RealToComplex};
+use realfft::{ComplexToReal, RealFftPlanner, RealToComplex};
 use std::sync::Arc;
 use wasm_bindgen::prelude::*;
 
@@ -327,6 +327,11 @@ pub struct Dsp {
     /// start of each m-cycle, decaying linearly to 0 just before the next.
     /// NaN-padded if no period fit. Output buffer reused across calls.
     beat_pulses: Vec<f32>,
+    gen_acf_fft_forward: Arc<dyn RealToComplex<f32>>,
+    gen_acf_fft_inverse: Arc<dyn ComplexToReal<f32>>,
+    gen_acf_time_buf: Vec<f32>,
+    gen_acf_freq_buf: Vec<Complex<f32>>,
+    onset_acf: Vec<f32>,
 }
 
 #[wasm_bindgen]
@@ -350,6 +355,11 @@ impl Dsp {
         let hann_energy: f32 = hann.iter().map(|h| h * h).sum();
         let parseval_band_scale = 2.0 / (window_size as f32 * hann_energy);
         let accum_alpha = 1.0 - (-dt / ACCUM_TAU_DEFAULT_SECS).exp();
+        let gen_acf_n = rms_history_len;
+        let gen_acf_fft_forward = planner.plan_fft_forward(2 * gen_acf_n);
+        let gen_acf_fft_inverse = planner.plan_fft_inverse(2 * gen_acf_n);
+        let gen_acf_time_buf = vec![0.0; 2 * gen_acf_n];
+        let gen_acf_freq_buf = vec![Complex::new(0.0, 0.0); gen_acf_n + 1];
         Dsp {
             waveform: vec![0.0; window_size],
             fft,
@@ -387,6 +397,11 @@ impl Dsp {
             beat_state: vec![f32::NAN; BEAT_STATE_LEN],
             beat_position: 0.0,
             beat_pulses: vec![f32::NAN; BEAT_PULSES_LEN],
+            gen_acf_fft_forward,
+            gen_acf_fft_inverse,
+            gen_acf_time_buf,
+            gen_acf_freq_buf,
+            onset_acf: vec![0.0; rms_history_len / 2],
         }
     }
 
@@ -433,6 +448,15 @@ impl Dsp {
         self.onset_history.copy_within(1.., 0);
         let last = self.onset_history.len() - 1;
         self.onset_history[last] = onset;
+
+        compute_gen_acf(
+            &self.onset_history,
+            &mut self.onset_acf,
+            &self.gen_acf_fft_forward,
+            &self.gen_acf_fft_inverse,
+            &mut self.gen_acf_time_buf,
+            &mut self.gen_acf_freq_buf,
+        );
 
         autocorrelate(&self.waveform, &mut self.buffer_acf);
 
@@ -566,6 +590,10 @@ impl Dsp {
 
     pub fn onset_history(&self) -> Vec<f32> {
         self.onset_history.clone()
+    }
+
+    pub fn onset_acf(&self) -> Vec<f32> {
+        self.onset_acf.clone()
     }
 
     pub fn low_rms_history(&self) -> Vec<f32> {
@@ -794,6 +822,48 @@ impl Dsp {
             self.acf_peaks[3 * i + 1] = mag;
             self.acf_peaks[3 * i + 2] = -denom;
         }
+    }
+}
+
+/// Generalized autocorrelation per Percival & Tzanetakis 2014 §II-B.2:
+/// zero-pad input to 2N, forward FFT, magnitude compression `|X|^0.5`, inverse
+/// FFT, take the first N/2 lags, normalize so output[0] == 1.0. Allocation-
+/// free: caller passes scratch buffers (`time_buf` length 2N, `freq_buf`
+/// length N+1) and pre-built `realfft` planners.
+///
+/// `c = 0.5` (the paper's empirically best choice) gives narrower ACF peaks
+/// than `c = 2.0` (regular ACF) — this is what makes downstream peak picking
+/// and pulse-train scoring more discriminative.
+fn compute_gen_acf(
+    input: &[f32],
+    output: &mut [f32],
+    fft_forward: &Arc<dyn RealToComplex<f32>>,
+    fft_inverse: &Arc<dyn ComplexToReal<f32>>,
+    time_buf: &mut [f32],
+    freq_buf: &mut [Complex<f32>],
+) {
+    let n = input.len();
+    debug_assert_eq!(time_buf.len(), 2 * n);
+    debug_assert_eq!(freq_buf.len(), n + 1);
+
+    time_buf[..n].copy_from_slice(input);
+    time_buf[n..].fill(0.0);
+
+    let _ = fft_forward.process(time_buf, freq_buf);
+
+    // |X|^0.5 magnitude compression (Percival & Tzanetakis c=0.5). After
+    // squaring re²+im² this becomes (·)^0.25; the division by time_buf[0]
+    // below cancels realfft's unnormalized IFFT scale.
+    for x in freq_buf.iter_mut() {
+        let compressed = (x.re * x.re + x.im * x.im).powf(0.25);
+        *x = Complex::new(compressed, 0.0);
+    }
+
+    let _ = fft_inverse.process(freq_buf, time_buf);
+
+    let zero = time_buf[0].max(1e-12);
+    for i in 0..output.len() {
+        output[i] = time_buf[i] / zero;
     }
 }
 
@@ -1871,5 +1941,43 @@ mod tests {
         assert!((onset[n - 2] - 0.0).abs() < 1e-3, "newest-1 = {}", onset[n - 2]);
         assert!((onset[n - 3] - 0.5).abs() < 1e-2, "newest-2 = {}", onset[n - 3]);
         assert!((onset[n - 4] - 0.0).abs() < 1e-3, "newest-3 = {}", onset[n - 4]);
+    }
+
+    #[test]
+    fn gen_acf_silent_input_is_zero() {
+        let mut dsp = Dsp::new(2048, 48000.0, 1024, 512);
+        let silent = vec![0.0f32; 2048];
+        for _ in 0..5 { dsp.process(&silent); }
+        let acf = dsp.onset_acf();
+        for &v in acf.iter() {
+            assert!(!v.is_nan(), "silent gen-ACF must not be NaN, got {}", v);
+            assert!(v.abs() < 1e-3, "silent gen-ACF should be ~0, got {}", v);
+        }
+    }
+
+    #[test]
+    fn gen_acf_periodic_onset_peaks_at_period() {
+        // Drive a strongly periodic envelope so onset_history has clear spikes.
+        // Period 32 frames @ default sr/hop ⇒ ~88 BPM.
+        let mut dsp = Dsp::new(2048, 48000.0, 1024, 512);
+        let sr = 48000.0_f32;
+        let period_hops = 32usize;
+        for k in 0..1500 {
+            let amp = 0.6 + 0.3 * (2.0 * std::f32::consts::PI * (k as f32) / (period_hops as f32)).sin();
+            let signal: Vec<f32> = (0..2048)
+                .map(|i| amp * (2.0 * std::f32::consts::PI * 1000.0 * (i as f32 / sr)).sin())
+                .collect();
+            dsp.process(&signal);
+        }
+        let acf = dsp.onset_acf();
+        let p = period_hops;
+        let around = (p - 5..=p + 5).map(|i| acf[i]).fold(f32::NEG_INFINITY, f32::max);
+        // Avoid lags near period/2 = 16 (a natural ACF harmonic of the sine envelope)
+        // and lags very close to 0 (trivially high by normalization). Use lags 5-12
+        // as a "genuinely non-periodic" reference region.
+        let far = (5..=12).map(|i| acf[i]).fold(f32::NEG_INFINITY, f32::max);
+        assert!(around > far,
+            "peak near lag {} ({:.3}) should exceed nearby non-period max ({:.3})",
+            p, around, far);
     }
 }
