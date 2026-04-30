@@ -87,6 +87,13 @@ const HARMONIC_MULTIPLES: [usize; 2] = [2, 4];
 /// enough pulses to span the onset_history window; 4 covers ~4 beats at the
 /// slowest tracked tempo (40 BPM) without wasting work at fast tempos.
 const PULSE_N: usize = 4;
+/// Gaussian kernel width (σ in lag units) for smearing a TEA vote. Wider σ
+/// means the vote from `period_inst` spreads over more lag bins — enough to
+/// bridge sub-bin variation between frames without hiding adjacent peaks.
+const TEA_GAUSSIAN_SIGMA: f32 = 5.0;
+/// Default EMA time constant for the TEA (seconds). 4 s gives stable argmax
+/// for steady tempos while still tracking gradual drift within ~10–15 s.
+const TEA_TAU_DEFAULT_SECS: f32 = 4.0;
 
 /// State estimator for tempo and meter. Consumes the picked `acf_peaks` (with
 /// magnitude and sharpness) each frame and updates four state values:
@@ -361,6 +368,19 @@ pub struct Dsp {
     phase_inst: f32,
     /// Per-frame combined score of the winner. 0 when no candidate wins.
     score_inst: f32,
+    /// Tempo Estimate Accumulator (TEA, Percival & Tzanetakis §II-C). Length =
+    /// onset_acf_len. Each frame, `period_inst` casts a Gaussian-shaped vote at
+    /// its lag index; the EMA decays all bins toward 0. The argmax (with
+    /// parabolic sub-bin refine) gives `tau_smoothed`, the stable period output.
+    tea: Vec<f32>,
+    /// EMA coefficient for the TEA decay/update. Derived from `TEA_TAU_DEFAULT_SECS`
+    /// at construction; tunable via `set_tea_tau_secs`.
+    tea_alpha: f32,
+    /// Smoothed period estimate in lag units — TEA argmax with parabolic
+    /// sub-bin refinement. NaN when TEA has no evidence yet.
+    tau_smoothed: f32,
+    /// Phase offset (in hops) re-scored at `tau_smoothed`. NaN when `tau_smoothed` is NaN.
+    phase_smoothed: f32,
 }
 
 #[wasm_bindgen]
@@ -384,6 +404,7 @@ impl Dsp {
         let hann_energy: f32 = hann.iter().map(|h| h * h).sum();
         let parseval_band_scale = 2.0 / (window_size as f32 * hann_energy);
         let accum_alpha = 1.0 - (-dt / ACCUM_TAU_DEFAULT_SECS).exp();
+        let tea_alpha = 1.0 - (-dt / TEA_TAU_DEFAULT_SECS).exp();
         let gen_acf_n = rms_history_len;
         let gen_acf_fft_forward = planner.plan_fft_forward(2 * gen_acf_n);
         let gen_acf_fft_inverse = planner.plan_fft_inverse(2 * gen_acf_n);
@@ -447,6 +468,10 @@ impl Dsp {
             period_inst: f32::NAN,
             phase_inst:  f32::NAN,
             score_inst:  0.0,
+            tea: vec![0.0; rms_history_len / 2],
+            tea_alpha,
+            tau_smoothed:   f32::NAN,
+            phase_smoothed: f32::NAN,
         }
     }
 
@@ -467,6 +492,13 @@ impl Dsp {
     pub fn set_accum_tau_secs(&mut self, tau_secs: f32) {
         let tau = tau_secs.clamp(0.05, 60.0);
         self.accum_alpha = 1.0 - (-self.dt / tau).exp();
+    }
+
+    /// EMA time constant for the TEA. `alpha = 1 - exp(-dt / tau)`. Smaller
+    /// τ ⇒ faster response, less stable. Clamped to [0.05, 60.0].
+    pub fn set_tea_tau_secs(&mut self, tau_secs: f32) {
+        let tau = tau_secs.clamp(0.05, 60.0);
+        self.tea_alpha = 1.0 - (-self.dt / tau).exp();
     }
 
     pub fn set_db_floor(&mut self, floor: f32) {
@@ -504,6 +536,8 @@ impl Dsp {
         );
         compute_harmonic_enhanced(&self.onset_acf, &mut self.onset_acf_enhanced);
         self.pick_candidates();
+        self.score_candidates();
+        self.update_tea();
 
         autocorrelate(&self.waveform, &mut self.buffer_acf);
 
@@ -649,6 +683,10 @@ impl Dsp {
 
     pub fn candidates(&self) -> Vec<f32> {
         self.candidates.clone()
+    }
+
+    pub fn tea(&self) -> Vec<f32> {
+        self.tea.clone()
     }
 
     pub fn low_rms_history(&self) -> Vec<f32> {
@@ -985,6 +1023,53 @@ impl Dsp {
             self.score_inst  = best_score;
         }
     }
+
+    /// Advance the TEA by one frame (Percival & Tzanetakis §II-C). When this
+    /// frame produced a fit (`score_inst > 0`), cast a Gaussian vote at
+    /// `period_inst` so the lag bin and its σ-neighbourhood accumulate
+    /// evidence; otherwise decay all bins by `(1 - alpha)` — silence drains
+    /// the accumulator toward 0. Then argmax over `[tau_min, tau_max]` with
+    /// parabolic sub-bin refine → `tau_smoothed`; re-score phase at that lag
+    /// for a coherent `phase_smoothed`.
+    fn update_tea(&mut self) {
+        let alpha = self.tea_alpha;
+        if self.score_inst > 0.0 && self.period_inst.is_finite() {
+            let inv_2sig2 = 1.0 / (2.0 * TEA_GAUSSIAN_SIGMA * TEA_GAUSSIAN_SIGMA);
+            for tau in 0..self.tea.len() {
+                let delta = tau as f32 - self.period_inst;
+                let g = (-delta * delta * inv_2sig2).exp();
+                self.tea[tau] = (1.0 - alpha) * self.tea[tau] + alpha * g;
+            }
+        } else {
+            for v in self.tea.iter_mut() { *v *= 1.0 - alpha; }
+        }
+
+        let upper = self.tau_max.min(self.tea.len() - 1);
+        let mut best_i = self.tau_min;
+        let mut best_v = -1.0f32;
+        for i in self.tau_min..=upper {
+            if self.tea[i] > best_v { best_v = self.tea[i]; best_i = i; }
+        }
+        if best_v <= 0.0 {
+            self.tau_smoothed   = f32::NAN;
+            self.phase_smoothed = f32::NAN;
+            return;
+        }
+        let mut tau = best_i as f32;
+        if best_i > self.tau_min && best_i < upper {
+            let y0 = self.tea[best_i - 1];
+            let y1 = self.tea[best_i];
+            let y2 = self.tea[best_i + 1];
+            let denom = y0 - 2.0 * y1 + y2;
+            if denom.abs() > 1e-12 {
+                let delta = (0.5 * (y0 - y2) / denom).clamp(-0.5, 0.5);
+                tau = best_i as f32 + delta;
+            }
+        }
+        self.tau_smoothed = tau;
+        let (phi, _, _, _, _) = score_phase_for_tau(&self.onset_history, tau);
+        self.phase_smoothed = phi as f32;
+    }
 }
 
 /// Generalized autocorrelation per Percival & Tzanetakis 2014 §II-B.2:
@@ -1226,6 +1311,17 @@ impl Dsp {
 
     pub fn test_per_frame_estimate(&self) -> (f32, f32, f32) {
         (self.period_inst, self.phase_inst, self.score_inst)
+    }
+
+    pub fn tea_len(&self) -> usize { self.tea.len() }
+    pub fn tea_alpha(&self) -> f32 { self.tea_alpha }
+    pub fn tea_argmax(&self) -> f32 { self.tau_smoothed }
+    pub fn test_set_tea(&mut self, src: &[f32]) {
+        let n = self.tea.len().min(src.len());
+        self.tea[..n].copy_from_slice(&src[..n]);
+        if n < self.tea.len() {
+            for v in &mut self.tea[n..] { *v = 0.0; }
+        }
     }
 
 }
@@ -2389,5 +2485,59 @@ mod tests {
         let (period_inst, _, _) = dsp.test_per_frame_estimate();
         assert!((period_inst - 36.0).abs() < 1.5,
             "sub-period disambiguation failed: expected 36, got {}", period_inst);
+    }
+
+    #[test]
+    fn tea_silent_input_decays_to_zero() {
+        let mut dsp = Dsp::new(2048, 48000.0, 1024, 512);
+        let n = dsp.tea_len();
+        let pre_charged = vec![0.5f32; n];
+        dsp.test_set_tea(&pre_charged);
+        let silent = vec![0.0f32; 2048];
+        dsp.process(&silent);
+        let after = dsp.tea();
+        for i in 0..n {
+            assert!(after[i] < pre_charged[i] + 1e-6,
+                "tea[{}] should not increase under silence: before={}, after={}",
+                i, pre_charged[i], after[i]);
+        }
+        // 3 × τ at 4 s default, at ~47 Hz hop rate ≈ 565 hops; 600 is safely past that.
+        for _ in 0..600 { dsp.process(&silent); }
+        let later = dsp.tea();
+        for &v in &later {
+            assert!(v < 0.05, "after long silence TEA should be ~0, got {}", v);
+            assert!(!v.is_nan());
+        }
+    }
+
+    #[test]
+    fn tea_periodic_input_locks_to_period() {
+        let mut dsp = Dsp::new(2048, 48000.0, 1024, 512);
+        let sr = 48000.0_f32;
+        let period_hops = 36usize;
+        for k in 0..1500 {
+            let amp = 0.6 + 0.3 * (2.0 * std::f32::consts::PI * (k as f32) / (period_hops as f32)).sin();
+            let signal: Vec<f32> = (0..2048)
+                .map(|i| amp * (2.0 * std::f32::consts::PI * 1000.0 * (i as f32 / sr)).sin())
+                .collect();
+            dsp.process(&signal);
+        }
+        let tau_smoothed = dsp.tea_argmax();
+        assert!(!tau_smoothed.is_nan(), "expected fit");
+        assert!((tau_smoothed - period_hops as f32).abs() < 1.5,
+            "expected ~{}, got {}", period_hops, tau_smoothed);
+    }
+
+    #[test]
+    fn set_tea_tau_secs_clamps_and_recomputes() {
+        let mut dsp = Dsp::new(2048, 48000.0, 1024, 512);
+        let alpha_default = dsp.tea_alpha();
+        dsp.set_tea_tau_secs(0.001);
+        let alpha_low = dsp.tea_alpha();
+        dsp.set_tea_tau_secs(120.0);
+        let alpha_high = dsp.tea_alpha();
+        assert!(alpha_low > alpha_default, "smaller tau ⇒ larger alpha");
+        assert!(alpha_high < alpha_default, "larger tau ⇒ smaller alpha");
+        assert!(!alpha_low.is_nan() && !alpha_high.is_nan());
     }
 }
