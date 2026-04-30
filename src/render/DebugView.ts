@@ -23,6 +23,7 @@ export interface DebugFeatures {
   acfPeaks?: Float32Array;
   beatGrid?: Float32Array;
   beatPulses?: Float32Array;
+  beatState?: Float32Array;
   rmsLow?: Float32Array;
   rmsMid?: Float32Array;
   rmsHigh?: Float32Array;
@@ -38,6 +39,7 @@ export interface DebugSizes {
   acfPeaksLen: number;
   beatGridLen: number;
   beatPulsesLen: number;
+  beatStateLen: number;
 }
 
 /**

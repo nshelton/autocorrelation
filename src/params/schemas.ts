@@ -13,7 +13,7 @@ export const analysisSchemas: ParamSchema[] = [
     key: "dsp.rmsHistoryLen",
     label: "RMS history length",
     kind: "discrete",
-    options: [256, 512, 1024],
+    options: [256, 512, 1024, 2048, 4096],
     default: 512,
     reconfig: true,
   },

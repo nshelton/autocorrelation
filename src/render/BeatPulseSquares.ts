@@ -12,15 +12,6 @@ export interface BeatPulseSquaresOptions {
    * grid in row-major: index 0 = top-left, 1 = top-right, 2 = bottom-left,
    * 3 = bottom-right. */
   source: () => Float32Array;
-  /** Number of squares; layout assumes a sqrt(count)×sqrt(count) grid. */
-  count: number;
-  /** Center of the whole grid in scene space. */
-  centerX: number;
-  centerY: number;
-  /** Edge length of each square (in scene units). */
-  cellSize: number;
-  /** Gap between squares. */
-  gap: number;
 }
 
 export class BeatPulseSquares {
@@ -32,23 +23,14 @@ export class BeatPulseSquares {
 
   constructor(opts: BeatPulseSquaresOptions) {
     this.source = opts.source;
-    this.count = opts.count;
+    this.count = 4;
     this.object3d = new Group();
 
-    const side = Math.round(Math.sqrt(opts.count));
-    if (side * side !== opts.count) {
-      throw new Error(`BeatPulseSquares: count must be a perfect square (got ${opts.count})`);
-    }
-    const stride = opts.cellSize + opts.gap;
-    // Center the grid so the average of all square positions is (centerX, centerY).
-    const half = (side - 1) / 2;
-    for (let i = 0; i < opts.count; i++) {
-      const row = Math.floor(i / side);
-      const col = i % side;
-      const x = opts.centerX + (col - half) * stride;
-      // Row 0 is the TOP row visually, so flip Y.
-      const y = opts.centerY + (half - row) * stride;
-      const geom = new PlaneGeometry(opts.cellSize, opts.cellSize);
+    for (let i = 0; i < this.count; i++) {
+      const x = i * 0.15;
+      const y = 0;
+
+      const geom = new PlaneGeometry(0.1, 0.5);
       const mat = new MeshBasicMaterial({ color: 0x000000 });
       const mesh = new Mesh(geom, mat);
       mesh.position.set(x, y, 0);

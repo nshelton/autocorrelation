@@ -71,8 +71,10 @@ export class PeakMarkers {
   update(): void {
     const src = this.source();
     const denom = this.maxPeaks > 1 ? this.maxPeaks - 1 : 1;
+    // acf_peaks layout is [lag, mag, sharpness] per peak; renderer only needs
+    // lag, but we step in 3s to land on each peak's lag slot.
     for (let i = 0; i < this.maxPeaks; i++) {
-      const lag = src[2 * i];
+      const lag = src[3 * i];
       const top = i * 2;
       const bot = i * 2 + 1;
       if (Number.isNaN(lag)) {

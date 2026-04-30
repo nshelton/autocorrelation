@@ -18,10 +18,6 @@ export interface BeatGridRendererOptions {
    * that covers the densest expected grid (`ceil(lagDomain / minPeriod)`). */
   maxLines: number;
   lagDomain: number;
-  /** Y of the segment's top endpoint. */
-  yTop: number;
-  /** Y of the segment's bottom endpoint. */
-  yBottom: number;
   /** Maps a lag (possibly fractional) to an x-coordinate. Pass the same
    * mapping the underlying chart uses so grid lines stay pixel-aligned with
    * the autocorrelation peaks they describe. */
@@ -44,8 +40,8 @@ export class BeatGridRenderer {
     this.source = opts.source;
     this.maxLines = opts.maxLines;
     this.lagDomain = opts.lagDomain;
-    this.yTop = opts.yTop;
-    this.yBottom = opts.yBottom;
+    this.yTop = -0.6;
+    this.yBottom = -0.8;
     this.xForLag = opts.xForLag;
 
     const vertexCount = 2 * this.maxLines;

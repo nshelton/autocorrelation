@@ -21,6 +21,7 @@ type ConfiguredOutbound = {
   acfPeaksLen: number;
   beatGridLen: number;
   beatPulsesLen: number;
+  beatStateLen: number;
 };
 
 class DSPProcessor extends AudioWorkletProcessor {
@@ -109,9 +110,10 @@ class DSPProcessor extends AudioWorkletProcessor {
       bufferAcfLen: this.windowSize / 2,
       rmsLen: this.rmsHistoryLen,
       rmsAcfLen: this.rmsHistoryLen / 2,
-      acfPeaksLen: 20, // = 2 * MAX_PEAKS in crates/dsp/src/lib.rs (interleaved [lag, mag] pairs)
+      acfPeaksLen: 30, // = 3 * MAX_PEAKS in crates/dsp/src/lib.rs (interleaved [lag, mag, sharpness])
       beatGridLen: 3, // = BEAT_GRID_LEN in crates/dsp/src/lib.rs ([period, phase, score])
       beatPulsesLen: 4, // = BEAT_PULSES_LEN in crates/dsp/src/lib.rs (saw values for cycles 1, 4, 8, 16)
+      beatStateLen: 4, // = BEAT_STATE_LEN in crates/dsp/src/lib.rs ([bpm, bpm_conf, beats_per_measure, measure_conf])
     };
     this.lastConfigured = payload;
     this.port.postMessage(payload);
@@ -145,6 +147,7 @@ class DSPProcessor extends AudioWorkletProcessor {
       const peaks = new Float32Array(this.dsp.acf_peaks());
       const beatGrid = new Float32Array(this.dsp.beat_grid());
       const beatPulses = new Float32Array(this.dsp.beat_pulses());
+      const beatState = new Float32Array(this.dsp.beat_state());
       const rmsLow = new Float32Array(this.dsp.low_rms_history());
       const rmsMid = new Float32Array(this.dsp.mid_rms_history());
       const rmsHigh = new Float32Array(this.dsp.high_rms_history());
@@ -161,6 +164,7 @@ class DSPProcessor extends AudioWorkletProcessor {
           acfPeaks: peaks,
           beatGrid,
           beatPulses,
+          beatState,
           rmsLow,
           rmsMid,
           rmsHigh,
@@ -176,6 +180,7 @@ class DSPProcessor extends AudioWorkletProcessor {
           peaks.buffer,
           beatGrid.buffer,
           beatPulses.buffer,
+          beatState.buffer,
           rmsLow.buffer,
           rmsMid.buffer,
           rmsHigh.buffer,

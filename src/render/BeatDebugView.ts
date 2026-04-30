@@ -9,11 +9,13 @@ export interface BeatDebugSizes {
   rmsAcfLen: number;
   beatGridLen: number;
   beatPulsesLen: number;
+  beatStateLen: number;
 }
 
 export interface BeatDebugFeatures {
   beatGrid?: Float32Array;
   beatPulses?: Float32Array;
+  beatState?: Float32Array;
 }
 
 /**
@@ -37,6 +39,7 @@ export class BeatDebugView {
   applyFeatures(msg: BeatDebugFeatures): void {
     if (msg.beatGrid) this.store.set("beatGrid", msg.beatGrid);
     if (msg.beatPulses) this.store.set("beatPulses", msg.beatPulses);
+    if (msg.beatState) this.store.set("beatState", msg.beatState);
   }
 
   /**
@@ -53,6 +56,9 @@ export class BeatDebugView {
     const beatPulsesInit = new Float32Array(sizes.beatPulsesLen);
     beatPulsesInit.fill(NaN);
     this.store.set("beatPulses", beatPulsesInit);
+    const beatStateInit = new Float32Array(sizes.beatStateLen);
+    beatStateInit.fill(NaN);
+    this.store.set("beatState", beatStateInit);
 
     // Linear x-mapping shared by both grid renderers — matches `linearLayout`
     // and `PeakMarkers` so the grid lines pixel-align with the chart lines.
@@ -65,8 +71,6 @@ export class BeatDebugView {
       // ceil(rmsAcfLen / MIN_PEAK_LAG=10) is the densest possible grid; +headroom.
       maxLines: 32,
       lagDomain: sizes.rmsAcfLen,
-      yTop: -1.0 + 0.4,
-      yBottom: -1.0 + 0.4 - 0.2,
       xForLag: linearX(sizes.rmsAcfLen),
       color: 0xffff66,
     });
@@ -76,7 +80,6 @@ export class BeatDebugView {
     // ySpan ±0.4 ⇒ top edge at -0.1).
     this.gridScrolling = new BeatGridScrollingRenderer({
       source: () => this.store.get("beatGrid"),
-      // Densest possible grid is rmsLen / MIN_PEAK_LAG (~52 at default).
       maxLines: 64,
       domain: sizes.rmsLen,
       yTop: -0.5 + 0.4,
@@ -85,17 +88,12 @@ export class BeatDebugView {
       color: 0xffff66,
     });
     this.scene.add(this.gridScrolling.object3d);
-
-    // 2×2 pulse squares just past the right edge of the rms area (x ∈ [-1, 1]),
-    // vertically centered on the rms section (yCenter = -0.5).
+ 
     this.pulseSquares = new BeatPulseSquares({
-      source: () => this.store.get("beatPulses"),
-      count: 4,
-      centerX: 1.6,
-      centerY: -0.2,
-      cellSize: 0.5,
-      gap: 0.02,
+      source: () => this.store.get("beatPulses")
     });
+
+    this.pulseSquares.object3d.position.set(1.2, -0.5, 0);
     this.scene.add(this.pulseSquares.object3d);
   }
 

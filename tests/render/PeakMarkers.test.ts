@@ -7,7 +7,7 @@ const linearXForLag = (lag: number, lagDomain: number) =>
 
 describe("PeakMarkers", () => {
   it("constructs LineSegments with 2 * maxPeaks vertices", () => {
-    const data = new Float32Array(20).fill(NaN);
+    const data = new Float32Array(30).fill(NaN);
     const pm = new PeakMarkers({
       source: () => data,
       maxPeaks: 10,
@@ -23,7 +23,7 @@ describe("PeakMarkers", () => {
   });
 
   it("update() with all-NaN source collapses every segment to (0, yCenter, 0) with black color", () => {
-    const data = new Float32Array(20).fill(NaN);
+    const data = new Float32Array(30).fill(NaN);
     const pm = new PeakMarkers({
       source: () => data,
       maxPeaks: 10,
@@ -47,12 +47,14 @@ describe("PeakMarkers", () => {
   });
 
   it("update() places real peaks as vertical segments at xForLag(lag)", () => {
-    const data = new Float32Array(20).fill(NaN);
-    // Two peaks: lag 64 (mag 0.9), lag 128 (mag 0.5).
-    data[0] = 64;
-    data[1] = 0.9;
-    data[2] = 128;
-    data[3] = 0.5;
+    const data = new Float32Array(30).fill(NaN);
+    // Two peaks: [lag, mag, sharpness] stride 3.
+    data[0] = 64; // peak 0 lag
+    data[1] = 0.9; // peak 0 mag
+    data[2] = 0.5; // peak 0 sharpness (ignored by renderer)
+    data[3] = 128; // peak 1 lag
+    data[4] = 0.5; // peak 1 mag
+    data[5] = 0.4; // peak 1 sharpness
     const pm = new PeakMarkers({
       source: () => data,
       maxPeaks: 10,
@@ -84,10 +86,11 @@ describe("PeakMarkers", () => {
   });
 
   it("color brightens at slot 0 and dims toward slot maxPeaks-1", () => {
-    const data = new Float32Array(20);
+    const data = new Float32Array(30);
     for (let i = 0; i < 10; i++) {
-      data[2 * i] = 20 + 5 * i;
-      data[2 * i + 1] = 0.9;
+      data[3 * i] = 20 + 5 * i; // lag
+      data[3 * i + 1] = 0.9; // mag
+      data[3 * i + 2] = 0.5; // sharpness (ignored by renderer)
     }
     const pm = new PeakMarkers({
       source: () => data,
@@ -112,7 +115,7 @@ describe("PeakMarkers", () => {
   });
 
   it("dispose() releases geometry + material", () => {
-    const data = new Float32Array(20).fill(NaN);
+    const data = new Float32Array(30).fill(NaN);
     const pm = new PeakMarkers({
       source: () => data,
       maxPeaks: 10,
