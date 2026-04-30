@@ -38,7 +38,7 @@ describe("WorkletBridge", () => {
     expect(calls).toContainEqual({ type: "param", key: "hopSize", value: 1024 });
     expect(calls).toContainEqual({ type: "param", key: "smoothingTauSecs", value: 0.0956 });
     expect(calls).toContainEqual({ type: "param", key: "dbFloor", value: -100 });
-    expect(calls).toContainEqual({ type: "param", key: "accumTauSecs", value: 4.0 });
+    expect(calls).toContainEqual({ type: "param", key: "teaTauSecs", value: 4.0 });
     expect(calls.length).toBe(5);
   });
 
@@ -68,15 +68,15 @@ describe("WorkletBridge", () => {
     });
   });
 
-  it("accumTauSecs change posts a param message with the hot key (no dsp prefix)", () => {
+  it("teaTauSecs change posts a param message with the hot key (no dsp prefix)", () => {
     const store = makeStore();
     const port = makePort();
     new WorkletBridge(store, port);
     (port.postMessage as ReturnType<typeof vi.fn>).mockClear();
-    store.set("dsp.accumTauSecs", 8.0);
+    store.set("dsp.teaTauSecs", 8.0);
     expect(port.postMessage).toHaveBeenCalledWith({
       type: "param",
-      key: "accumTauSecs",
+      key: "teaTauSecs",
       value: 8.0,
     });
   });
