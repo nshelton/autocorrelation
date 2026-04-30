@@ -12,8 +12,6 @@ describe("BeatGridRenderer", () => {
       source: () => data,
       maxLines: 16,
       lagDomain: 256,
-      yTop: -0.6,
-      yBottom: -0.7,
       xForLag: linearXForLag,
     });
     expect(r.object3d).toBeInstanceOf(LineSegments);
@@ -27,8 +25,6 @@ describe("BeatGridRenderer", () => {
       source: () => data,
       maxLines: 8,
       lagDomain: 256,
-      yTop: -0.6,
-      yBottom: -0.7,
       xForLag: linearXForLag,
     });
     r.update();
@@ -47,8 +43,6 @@ describe("BeatGridRenderer", () => {
       source: () => data,
       maxLines: 16,
       lagDomain: 256,
-      yTop: -0.6,
-      yBottom: -0.7,
       xForLag: linearXForLag,
     });
     r.update();
@@ -59,7 +53,7 @@ describe("BeatGridRenderer", () => {
     expect(pos.getX(0)).toBeCloseTo(expectedX1);
     expect(pos.getX(1)).toBeCloseTo(expectedX1);
     expect(pos.getY(0)).toBeCloseTo(-0.6);
-    expect(pos.getY(1)).toBeCloseTo(-0.7);
+    expect(pos.getY(1)).toBeCloseTo(-0.8);
 
     // Second multiple: lag 48.
     const expectedX2 = (48 / 255) * 2 - 1;
@@ -79,8 +73,6 @@ describe("BeatGridRenderer", () => {
       source: () => data,
       maxLines: 8,
       lagDomain: 256,
-      yTop: -0.6,
-      yBottom: -0.7,
       xForLag: linearXForLag,
     });
     r.update();
@@ -111,8 +103,6 @@ describe("BeatGridRenderer", () => {
       source: () => data,
       maxLines: 8,
       lagDomain: 256,
-      yTop: -0.6,
-      yBottom: -0.7,
       xForLag: linearXForLag,
     });
     const geom = (r.object3d as LineSegments).geometry as BufferGeometry;
