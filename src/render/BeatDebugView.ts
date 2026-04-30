@@ -6,7 +6,7 @@ import type { FeatureStore } from "../store/FeatureStore";
 
 export interface BeatDebugSizes {
   rmsLen: number;
-  rmsAcfLen: number;
+  onsetAcfLen: number;
   beatGridLen: number;
   beatPulsesLen: number;
   beatStateLen: number;
@@ -70,8 +70,8 @@ export class BeatDebugView {
       source: () => this.store.get("beatGrid"),
       // ceil(rmsAcfLen / MIN_PEAK_LAG=10) is the densest possible grid; +headroom.
       maxLines: 32,
-      lagDomain: sizes.rmsAcfLen,
-      xForLag: linearX(sizes.rmsAcfLen),
+      lagDomain: sizes.onsetAcfLen,
+      xForLag: linearX(sizes.onsetAcfLen),
       color: 0xffff66,
     });
     this.scene.add(this.grid.object3d);

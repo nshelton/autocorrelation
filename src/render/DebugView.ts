@@ -260,13 +260,7 @@ export class DebugView {
     });
     scene.add(this.peakMarkers.object3d);
 
-    this.beatDebug.applyConfigured({
-      rmsLen: sizes.rmsLen,
-      rmsAcfLen: sizes.onsetAcfLen,
-      beatGridLen: sizes.beatGridLen,
-      beatPulsesLen: sizes.beatPulsesLen,
-      beatStateLen: sizes.beatStateLen,
-    });
+    this.beatDebug.applyConfigured(sizes);
   }
 
   update(): void {
