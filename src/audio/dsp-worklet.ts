@@ -4,27 +4,7 @@ import init, { Dsp } from "../wasm-pkg/dsp";
 
 type WorkletInbound =
   | { type: "configure"; windowSize: number; rmsHistoryLen: number }
-  | { type: "param"; key: "hopSize" | "smoothingTauSecs" | "dbFloor" | "teaTauSecs"; value: number }
-  // HMR: a freshly-built App needs the buffer sizes to construct line renderers,
-  // but the worklet only emits `configured` on boot or on a `configure` request
-  // (the latter resets Dsp state, which we want to preserve across HMR). `sync`
-  // re-emits the cached `configured` payload without touching Dsp.
-  | { type: "sync" };
-
-type ConfiguredOutbound = {
-  type: "configured";
-  waveformLen: number;
-  spectrumLen: number;
-  bufferAcfLen: number;
-  rmsLen: number;
-  onsetLen: number;
-  onsetAcfLen: number;
-  teaLen: number;
-  candidatesLen: number;
-  beatGridLen: number;
-  beatPulsesLen: number;
-  beatStateLen: number;
-};
+  | { type: "param"; key: string; value: number };
 
 class DSPProcessor extends AudioWorkletProcessor {
   private window: Float32Array = new Float32Array(2048);
@@ -37,8 +17,8 @@ class DSPProcessor extends AudioWorkletProcessor {
   private smoothingTauSecs = 0.0956;
   private teaTauSecs = 4.0;
   private dbFloor = -100;
+  private bufferNames: string[] = [];
   private pendingConfigure: { windowSize: number; rmsHistoryLen: number } | null = null;
-  private lastConfigured: ConfiguredOutbound | null = null;
 
   constructor(options?: AudioWorkletNodeOptions) {
     super();
@@ -66,25 +46,20 @@ class DSPProcessor extends AudioWorkletProcessor {
       this.applyConfigure(msg);
       return;
     }
-    if (msg.type === "sync") {
-      // If we haven't configured yet, boot() will post `configured` once init
-      // finishes — no need to retain the sync request.
-      if (this.lastConfigured) this.port.postMessage(this.lastConfigured);
-      return;
-    }
     if (msg.type === "param") {
+      // hopSize is the worklet's own concern (controls when we fire the FFT);
+      // not a Dsp param. Cache so applyConfigure preserves it across rebuilds.
       if (msg.key === "hopSize") {
         this.hopSize = Math.min(msg.value, this.windowSize);
-      } else if (msg.key === "smoothingTauSecs") {
-        this.smoothingTauSecs = msg.value;
-        if (this.ready && this.dsp) this.dsp.set_smoothing_tau(msg.value);
-      } else if (msg.key === "teaTauSecs") {
-        this.teaTauSecs = msg.value;
-        if (this.ready && this.dsp) this.dsp.set_tea_tau_secs(msg.value);
-      } else if (msg.key === "dbFloor") {
-        this.dbFloor = msg.value;
-        if (this.ready && this.dsp) this.dsp.set_db_floor(msg.value);
+        return;
       }
+      // Cache so applyConfigure can re-apply across rebuilds.
+      if (msg.key === "smoothingTauSecs") this.smoothingTauSecs = msg.value;
+      else if (msg.key === "teaTauSecs") this.teaTauSecs = msg.value;
+      else if (msg.key === "dbFloor") this.dbFloor = msg.value;
+      // Forward any other Dsp-recognized key directly. Unknown keys are
+      // silently dropped on the Rust side.
+      if (this.ready && this.dsp) this.dsp.set_param(msg.key, msg.value);
       return;
     }
     const _exhaustive: never = msg;
@@ -102,25 +77,13 @@ class DSPProcessor extends AudioWorkletProcessor {
     this.hopCounter = 0;
     this.hopSize = Math.min(this.hopSize, this.windowSize);
     this.dsp = new Dsp(this.windowSize, sampleRate, this.hopSize, this.rmsHistoryLen);
-    this.dsp.set_smoothing_tau(this.smoothingTauSecs);
-    this.dsp.set_db_floor(this.dbFloor);
-    this.dsp.set_tea_tau_secs(this.teaTauSecs);
-    const payload: ConfiguredOutbound = {
-      type: "configured",
-      waveformLen: this.windowSize,
-      spectrumLen: this.windowSize / 2,
-      bufferAcfLen: this.windowSize / 2,
-      rmsLen: this.rmsHistoryLen,
-      onsetLen: this.rmsHistoryLen,
-      onsetAcfLen: this.rmsHistoryLen / 2,
-      teaLen: this.rmsHistoryLen / 2,
-      candidatesLen: 30, // = 3 * MAX_PEAKS
-      beatGridLen: 3, // = BEAT_GRID_LEN in crates/dsp/src/lib.rs ([period, phase, score])
-      beatPulsesLen: 4, // = BEAT_PULSES_LEN in crates/dsp/src/lib.rs (saw values for cycles 1, 4, 8, 16)
-      beatStateLen: 4, // = BEAT_STATE_LEN in crates/dsp/src/lib.rs ([bpm, bpm_conf, beats_per_measure, measure_conf])
-    };
-    this.lastConfigured = payload;
-    this.port.postMessage(payload);
+    this.dsp.set_param("smoothingTauSecs", this.smoothingTauSecs);
+    this.dsp.set_param("teaTauSecs", this.teaTauSecs);
+    this.dsp.set_param("dbFloor", this.dbFloor);
+    // Cache the buffer name list. Names are static across reconfigurations,
+    // so this could fire only at boot, but rebuilding it on each configure
+    // is cheap and removes the "did names change?" question.
+    this.bufferNames = Array.from(this.dsp.buffer_names());
   }
 
   process(inputs: Float32Array[][]): boolean {
@@ -142,58 +105,14 @@ class DSPProcessor extends AudioWorkletProcessor {
     this.hopCounter += len;
     while (this.hopCounter >= this.hopSize) {
       this.dsp.process(this.window);
-      const wf = new Float32Array(this.dsp.waveform());
-      const sp = new Float32Array(this.dsp.spectrum());
-      const rms = new Float32Array(this.dsp.rms_history());
-      const ba = new Float32Array(this.dsp.buffer_acf());
-      const onset = new Float32Array(this.dsp.onset_history());
-      const onsetAcf = new Float32Array(this.dsp.onset_acf());
-      const onsetAcfEnh = new Float32Array(this.dsp.onset_acf_enhanced());
-      const tea = new Float32Array(this.dsp.tea());
-      const candidates = new Float32Array(this.dsp.candidates());
-      const beatGrid = new Float32Array(this.dsp.beat_grid());
-      const beatPulses = new Float32Array(this.dsp.beat_pulses());
-      const beatState = new Float32Array(this.dsp.beat_state());
-      const rmsLow = new Float32Array(this.dsp.low_rms_history());
-      const rmsMid = new Float32Array(this.dsp.mid_rms_history());
-      const rmsHigh = new Float32Array(this.dsp.high_rms_history());
-      this.port.postMessage(
-        {
-          type: "features",
-          waveform: wf,
-          spectrum: sp,
-          rms,
-          bufferAcf: ba,
-          onset,
-          onsetAcf,
-          onsetAcfEnhanced: onsetAcfEnh,
-          tea,
-          candidates,
-          beatGrid,
-          beatPulses,
-          beatState,
-          rmsLow,
-          rmsMid,
-          rmsHigh,
-        },
-        [
-          wf.buffer,
-          sp.buffer,
-          rms.buffer,
-          ba.buffer,
-          onset.buffer,
-          onsetAcf.buffer,
-          onsetAcfEnh.buffer,
-          tea.buffer,
-          candidates.buffer,
-          beatGrid.buffer,
-          beatPulses.buffer,
-          beatState.buffer,
-          rmsLow.buffer,
-          rmsMid.buffer,
-          rmsHigh.buffer,
-        ],
-      );
+      const buffers: Record<string, Float32Array> = {};
+      const transferList: ArrayBuffer[] = [];
+      for (const name of this.bufferNames) {
+        const data = this.dsp.get_buffer(name);
+        buffers[name] = data;
+        transferList.push(data.buffer as ArrayBuffer);
+      }
+      this.port.postMessage({ type: "features", buffers }, transferList);
       this.hopCounter -= this.hopSize;
     }
 
