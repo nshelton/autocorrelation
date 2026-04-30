@@ -8,6 +8,8 @@ mod spectrum;
 mod acf;
 mod beat;
 
+use crate::buffers::Buffers;
+
 /// Spectrum smoothing time constant in seconds. Chosen to preserve the
 /// legacy alpha ≈ 0.2 behavior at sr=48000, hop=1024:
 ///   alpha = 1 - exp(-dt/tau), dt = 1024/48000 = 21.33 ms
@@ -53,11 +55,10 @@ const TEA_TAU_DEFAULT_SECS: f32 = 4.0;
 
 #[wasm_bindgen]
 pub struct Dsp {
-    waveform: Vec<f32>,
+    buffers: Buffers,
     fft: Arc<dyn RealToComplex<f32>>,
     fft_buffer: Vec<f32>,
     freq_buffer: Vec<Complex<f32>>,
-    spectrum: Vec<f32>,
     hann: Vec<f32>,
     /// Magnitude scale factor that converts raw FFT bin magnitude to
     /// amplitude-equivalent units (so a unit-amplitude sine peaks at ~1.0).
@@ -65,13 +66,10 @@ pub struct Dsp {
     /// and sum(hann) ≈ N/2 corrects for window attenuation.
     mag_scale: f32,
     db_floor: f32,
-    rms_history: Vec<f32>,
-    onset_history: Vec<f32>,
     /// Previous frame's per-bin magnitudes, in the same units as the spectrum
     /// loop's `mag` (i.e. already scaled by `mag_scale`). Length = spectrum.len().
     /// Used to compute spectral-flux OSS as Σ max(0, |X[k]| - prev_mag[k]).
     prev_mag: Vec<f32>,
-    buffer_acf: Vec<f32>,
     /// Per-process-call EMA coefficient for the spectrum. Computed from
     /// `SMOOTHING_TAU_SECS` and the wall-clock dt between hops
     /// (`hop_size / sample_rate`), so changing `hop_size` does NOT change
@@ -90,29 +88,15 @@ pub struct Dsp {
     /// units. Equals 2 / (N · Σ hann²). The 2 accounts for the one-sided real
     /// spectrum; Σ hann² is the window's energy correction.
     parseval_band_scale: f32,
-    low_rms_history: Vec<f32>,
-    mid_rms_history: Vec<f32>,
-    high_rms_history: Vec<f32>,
-    /// Public per-frame `[period, phase, score]` from the P&T pipeline.
-    beat_grid: Vec<f32>,
-    /// Public `[bpm, score, NaN, NaN]` view of the current frame's estimate.
-    beat_state: Vec<f32>,
     /// Continuously-incrementing fractional beat counter. The integer part
     /// counts beats since startup; the fractional part is "how far into the
     /// current beat we are" (0 = on beat, →1 just before next). Wraps mod 16
     /// (= LCM of BEAT_PULSE_CYCLES) to bound f32 precision over long runs.
     beat_position: f32,
-    /// 4 saw values in [0, 1], one per `BEAT_PULSE_CYCLES` entry. 1.0 at the
-    /// start of each m-cycle, decaying linearly to 0 just before the next.
-    /// NaN-padded if no period fit. Output buffer reused across calls.
-    beat_pulses: Vec<f32>,
     gen_acf_fft_forward: Arc<dyn RealToComplex<f32>>,
     gen_acf_fft_inverse: Arc<dyn ComplexToReal<f32>>,
     gen_acf_time_buf: Vec<f32>,
     gen_acf_freq_buf: Vec<Complex<f32>>,
-    onset_acf: Vec<f32>,
-    onset_acf_enhanced: Vec<f32>,
-    candidates: Vec<f32>,            // stride 3: [lag_frac, mag, sharpness]
     cand_scratch: Vec<(usize, f32)>, // preallocated scratch for picker
     tau_min: usize,
     tau_max: usize,
@@ -132,11 +116,6 @@ pub struct Dsp {
     phase_inst: f32,
     /// Per-frame combined score of the winner. 0 when no candidate wins.
     score_inst: f32,
-    /// Tempo Estimate Accumulator (TEA, Percival & Tzanetakis §II-C). Length =
-    /// onset_acf_len. Each frame, `period_inst` casts a Gaussian-shaped vote at
-    /// its lag index; the EMA decays all bins toward 0. The argmax (with
-    /// parabolic sub-bin refine) gives `tau_smoothed`, the stable period output.
-    tea: Vec<f32>,
     /// EMA coefficient for the TEA decay/update. Derived from `TEA_TAU_DEFAULT_SECS`
     /// at construction; tunable via `set_tea_tau_secs`.
     tea_alpha: f32,
@@ -160,7 +139,6 @@ impl Dsp {
         let fft = planner.plan_fft_forward(window_size);
         let freq_buffer = fft.make_output_vec();
         let spectrum_len = freq_buffer.len() - 1; // drop DC
-        let spectrum = vec![0.0; spectrum_len];
         let hann: Vec<f32> = (0..window_size)
             .map(|i| {
                 0.5 - 0.5
@@ -185,37 +163,24 @@ impl Dsp {
         let tau_max_unbounded = ((60.0 / BEAT_TRACKER_MIN_BPM) / dt).ceil() as usize;
         let tau_max = tau_max_unbounded.min(onset_acf_len.saturating_sub(2));
         Dsp {
-            waveform: vec![0.0; window_size],
+            buffers: Buffers::new(window_size, rms_history_len),
             fft,
             fft_buffer: vec![0.0; window_size],
             freq_buffer,
-            spectrum,
             hann,
             mag_scale,
             db_floor: -100.0,
-            rms_history: vec![0.0; rms_history_len],
-            onset_history: vec![0.0; rms_history_len],
             prev_mag: vec![0.0; spectrum_len],
-            buffer_acf: vec![0.0; window_size / 2],
             smoothing_alpha,
             dt,
             low_band_bin_end,
             mid_band_bin_end,
             parseval_band_scale,
-            low_rms_history: vec![0.0; rms_history_len],
-            mid_rms_history: vec![0.0; rms_history_len],
-            high_rms_history: vec![0.0; rms_history_len],
-            beat_grid: vec![f32::NAN; BEAT_GRID_LEN],
-            beat_state: vec![f32::NAN; BEAT_STATE_LEN],
             beat_position: 0.0,
-            beat_pulses: vec![f32::NAN; BEAT_PULSES_LEN],
             gen_acf_fft_forward,
             gen_acf_fft_inverse,
             gen_acf_time_buf,
             gen_acf_freq_buf,
-            onset_acf: vec![0.0; rms_history_len / 2],
-            onset_acf_enhanced: vec![0.0; rms_history_len / 2],
-            candidates: vec![f32::NAN; 3 * MAX_PEAKS],
             cand_scratch: Vec::with_capacity(onset_acf_len / 2 + 1),
             tau_min,
             tau_max,
@@ -226,7 +191,6 @@ impl Dsp {
             period_inst: f32::NAN,
             phase_inst: f32::NAN,
             score_inst: 0.0,
-            tea: vec![0.0; rms_history_len / 2],
             tea_alpha,
             tau_smoothed: f32::NAN,
             phase_smoothed: f32::NAN,
@@ -255,17 +219,14 @@ impl Dsp {
     }
 
     pub fn process(&mut self, input: &[f32]) {
-        let n = input.len().min(self.waveform.len());
-        self.waveform[..n].copy_from_slice(&input[..n]);
+        let n = input.len().min(self.buffers.waveform.len());
+        self.buffers.waveform[..n].copy_from_slice(&input[..n]);
 
         // RMS over the input window
         let mean_sq: f32 = input.iter().take(n).map(|&x| x * x).sum::<f32>() / n.max(1) as f32;
         let rms = mean_sq.sqrt();
 
-        // Shift left and append newest at the end (oldest at index 0)
-        self.rms_history.copy_within(1.., 0);
-        let last = self.rms_history.len() - 1;
-        self.rms_history[last] = rms;
+        push_history(&mut self.buffers.rms, rms);
 
         // Apply Hann window
         for i in 0..n {
@@ -288,7 +249,7 @@ impl Dsp {
         // where RMS-diff is not — a snare hit dumps energy into mid/high bins
         // that weren't there last frame even when total RMS barely moves.
         let mut flux = 0.0f32;
-        for (out_i, bin) in self.freq_buffer[1..=self.spectrum.len()].iter().enumerate() {
+        for (out_i, bin) in self.freq_buffer[1..=self.buffers.spectrum.len()].iter().enumerate() {
             let mag = (bin.re * bin.re + bin.im * bin.im).sqrt() * self.mag_scale;
             flux += (mag - self.prev_mag[out_i]).max(0.0);
             self.prev_mag[out_i] = mag;
@@ -300,13 +261,11 @@ impl Dsp {
             };
             let clipped = db.clamp(self.db_floor, 0.0);
             let normalized = (clipped - self.db_floor) / (-self.db_floor); // [0, 1]
-            self.spectrum[out_i] = self.smoothing_alpha * normalized
-                + (1.0 - self.smoothing_alpha) * self.spectrum[out_i];
+            self.buffers.spectrum[out_i] = self.smoothing_alpha * normalized
+                + (1.0 - self.smoothing_alpha) * self.buffers.spectrum[out_i];
         }
 
-        self.onset_history.copy_within(1.., 0);
-        let last = self.onset_history.len() - 1;
-        self.onset_history[last] = flux;
+        push_history(&mut self.buffers.onset, flux);
 
         // --- Per-band RMS via Parseval-correct FFT-bin energy summation. ---
         // band_rms = sqrt(parseval_band_scale · Σ|X[k]|² over band).
@@ -332,101 +291,48 @@ impl Dsp {
         let mid_rms = (mid_e * self.parseval_band_scale).sqrt();
         let high_rms = (high_e * self.parseval_band_scale).sqrt();
 
-        // Shift each band history left, append newest at the end (oldest at index 0).
-        // Same pattern as the existing time-domain rms_history.
-        for h in [
-            (&mut self.low_rms_history, low_rms),
-            (&mut self.mid_rms_history, mid_rms),
-            (&mut self.high_rms_history, high_rms),
-        ] {
-            let (history, value) = h;
-            history.copy_within(1.., 0);
-            let last = history.len() - 1;
-            history[last] = value;
-        }
+        push_history(&mut self.buffers.rmsLow, low_rms);
+        push_history(&mut self.buffers.rmsMid, mid_rms);
+        push_history(&mut self.buffers.rmsHigh, high_rms);
 
         crate::acf::compute_gen_acf(
-            &self.onset_history,
-            &mut self.onset_acf,
+            &self.buffers.onset,
+            &mut self.buffers.onsetAcf,
             &self.gen_acf_fft_forward,
             &self.gen_acf_fft_inverse,
             &mut self.gen_acf_time_buf,
             &mut self.gen_acf_freq_buf,
         );
-        crate::acf::compute_harmonic_enhanced(&self.onset_acf, &mut self.onset_acf_enhanced);
+        crate::acf::compute_harmonic_enhanced(&self.buffers.onsetAcf, &mut self.buffers.onsetAcfEnhanced);
         self.pick_candidates();
         self.score_candidates();
         self.update_tea();
         self.write_beat_outputs();
         self.update_beat_pulses_v2();
 
-        crate::acf::autocorrelate(&self.waveform, &mut self.buffer_acf);
+        crate::acf::autocorrelate(&self.buffers.waveform, &mut self.buffers.bufferAcf);
     }
 
-    pub fn waveform(&self) -> Vec<f32> {
-        self.waveform.clone()
-    }
-
-    pub fn spectrum(&self) -> Vec<f32> {
-        self.spectrum.clone()
-    }
-
-    pub fn buffer_acf(&self) -> Vec<f32> {
-        self.buffer_acf.clone()
-    }
-
-    pub fn rms_history(&self) -> Vec<f32> {
-        self.rms_history.clone()
-    }
-
-    pub fn onset_history(&self) -> Vec<f32> {
-        self.onset_history.clone()
-    }
-
-    pub fn onset_acf(&self) -> Vec<f32> {
-        self.onset_acf.clone()
-    }
-
-    pub fn onset_acf_enhanced(&self) -> Vec<f32> {
-        self.onset_acf_enhanced.clone()
-    }
-
-    pub fn candidates(&self) -> Vec<f32> {
-        self.candidates.clone()
-    }
-
-    pub fn tea(&self) -> Vec<f32> {
-        self.tea.clone()
-    }
-
-    pub fn low_rms_history(&self) -> Vec<f32> {
-        self.low_rms_history.clone()
-    }
-
-    pub fn mid_rms_history(&self) -> Vec<f32> {
-        self.mid_rms_history.clone()
-    }
-
-    pub fn high_rms_history(&self) -> Vec<f32> {
-        self.high_rms_history.clone()
-    }
-
-    pub fn beat_grid(&self) -> Vec<f32> {
-        self.beat_grid.clone()
-    }
-
-    pub fn beat_pulses(&self) -> Vec<f32> {
-        self.beat_pulses.clone()
-    }
-
-    pub fn beat_state(&self) -> Vec<f32> {
-        self.beat_state.clone()
-    }
+    pub fn waveform(&self) -> Vec<f32> { self.buffers.waveform.clone() }
+    pub fn spectrum(&self) -> Vec<f32> { self.buffers.spectrum.clone() }
+    pub fn buffer_acf(&self) -> Vec<f32> { self.buffers.bufferAcf.clone() }
+    pub fn rms_history(&self) -> Vec<f32> { self.buffers.rms.clone() }
+    pub fn onset_history(&self) -> Vec<f32> { self.buffers.onset.clone() }
+    pub fn onset_acf(&self) -> Vec<f32> { self.buffers.onsetAcf.clone() }
+    pub fn onset_acf_enhanced(&self) -> Vec<f32> { self.buffers.onsetAcfEnhanced.clone() }
+    pub fn candidates(&self) -> Vec<f32> { self.buffers.candidates.clone() }
+    pub fn tea(&self) -> Vec<f32> { self.buffers.tea.clone() }
+    pub fn low_rms_history(&self) -> Vec<f32> { self.buffers.rmsLow.clone() }
+    pub fn mid_rms_history(&self) -> Vec<f32> { self.buffers.rmsMid.clone() }
+    pub fn high_rms_history(&self) -> Vec<f32> { self.buffers.rmsHigh.clone() }
+    pub fn beat_grid(&self) -> Vec<f32> { self.buffers.beatGrid.clone() }
+    pub fn beat_pulses(&self) -> Vec<f32> { self.buffers.beatPulses.clone() }
+    pub fn beat_state(&self) -> Vec<f32> { self.buffers.beatState.clone() }
 }
 
 impl Dsp {
     fn pick_candidates(&mut self) {
-        for slot in self.candidates.iter_mut() {
+        for slot in self.buffers.candidates.iter_mut() {
             *slot = f32::NAN;
         }
         if self.tau_max < self.tau_min + 1 {
@@ -435,10 +341,10 @@ impl Dsp {
 
         // 1. scan strict local maxima in [tau_min, tau_max]
         self.cand_scratch.clear();
-        let upper = self.tau_max.min(self.onset_acf_enhanced.len() - 1);
+        let upper = self.tau_max.min(self.buffers.onsetAcfEnhanced.len() - 1);
         for k in self.tau_min..upper {
-            let y = self.onset_acf_enhanced[k];
-            if y > 0.0 && y > self.onset_acf_enhanced[k - 1] && y > self.onset_acf_enhanced[k + 1] {
+            let y = self.buffers.onsetAcfEnhanced[k];
+            if y > 0.0 && y > self.buffers.onsetAcfEnhanced[k - 1] && y > self.buffers.onsetAcfEnhanced[k + 1] {
                 self.cand_scratch.push((k, y));
             }
         }
@@ -466,9 +372,9 @@ impl Dsp {
         // 4. parabolic sub-bin refinement → write [lag_frac, mag, sharpness]
         for i in 0..count {
             let k = accepted[i] as usize;
-            let y0 = self.onset_acf_enhanced[k - 1];
-            let y1 = self.onset_acf_enhanced[k];
-            let y2 = self.onset_acf_enhanced[k + 1];
+            let y0 = self.buffers.onsetAcfEnhanced[k - 1];
+            let y1 = self.buffers.onsetAcfEnhanced[k];
+            let y2 = self.buffers.onsetAcfEnhanced[k + 1];
             let denom = y0 - 2.0 * y1 + y2;
             let (lag_frac, mag) = if denom.abs() < 1e-12 {
                 (k as f32, y1)
@@ -476,9 +382,9 @@ impl Dsp {
                 let delta = (0.5 * (y0 - y2) / denom).clamp(-0.5, 0.5);
                 (k as f32 + delta, y1 - 0.25 * (y0 - y2) * delta)
             };
-            self.candidates[3 * i] = lag_frac;
-            self.candidates[3 * i + 1] = mag;
-            self.candidates[3 * i + 2] = -denom; // sharpness — large for narrow peaks
+            self.buffers.candidates[3 * i] = lag_frac;
+            self.buffers.candidates[3 * i + 1] = mag;
+            self.buffers.candidates[3 * i + 2] = -denom; // sharpness — large for narrow peaks
         }
     }
 
@@ -490,11 +396,11 @@ impl Dsp {
     fn score_candidates(&mut self) {
         let mut count = 0usize;
         for i in 0..MAX_PEAKS {
-            let lag = self.candidates[3 * i];
+            let lag = self.buffers.candidates[3 * i];
             if lag.is_nan() {
                 break;
             }
-            let (phi, x, sum, sum_sq, n_phi) = crate::beat::score_phase_for_tau(&self.onset_history, lag);
+            let (phi, x, sum, sum_sq, n_phi) = crate::beat::score_phase_for_tau(&self.buffers.onset, lag);
             let n = n_phi as f32;
             let mean = if n > 0.0 { sum / n } else { 0.0 };
             let var = if n > 0.0 {
@@ -540,7 +446,7 @@ impl Dsp {
             self.phase_inst = f32::NAN;
             self.score_inst = 0.0;
         } else {
-            self.period_inst = self.candidates[3 * best_i];
+            self.period_inst = self.buffers.candidates[3 * best_i];
             self.phase_inst = self.pulse_phi[best_i];
             self.score_inst = best_score;
         }
@@ -557,23 +463,23 @@ impl Dsp {
         let alpha = self.tea_alpha;
         if self.score_inst > 0.0 && self.period_inst.is_finite() {
             let inv_2sig2 = 1.0 / (2.0 * TEA_GAUSSIAN_SIGMA * TEA_GAUSSIAN_SIGMA);
-            for tau in 0..self.tea.len() {
+            for tau in 0..self.buffers.tea.len() {
                 let delta = tau as f32 - self.period_inst;
                 let g = (-delta * delta * inv_2sig2).exp();
-                self.tea[tau] = (1.0 - alpha) * self.tea[tau] + alpha * g;
+                self.buffers.tea[tau] = (1.0 - alpha) * self.buffers.tea[tau] + alpha * g;
             }
         } else {
-            for v in self.tea.iter_mut() {
+            for v in self.buffers.tea.iter_mut() {
                 *v *= 1.0 - alpha;
             }
         }
 
-        let upper = self.tau_max.min(self.tea.len() - 1);
+        let upper = self.tau_max.min(self.buffers.tea.len() - 1);
         let mut best_i = self.tau_min;
         let mut best_v = -1.0f32;
         for i in self.tau_min..=upper {
-            if self.tea[i] > best_v {
-                best_v = self.tea[i];
+            if self.buffers.tea[i] > best_v {
+                best_v = self.buffers.tea[i];
                 best_i = i;
             }
         }
@@ -584,9 +490,9 @@ impl Dsp {
         }
         let mut tau = best_i as f32;
         if best_i > self.tau_min && best_i < upper {
-            let y0 = self.tea[best_i - 1];
-            let y1 = self.tea[best_i];
-            let y2 = self.tea[best_i + 1];
+            let y0 = self.buffers.tea[best_i - 1];
+            let y1 = self.buffers.tea[best_i];
+            let y2 = self.buffers.tea[best_i + 1];
             let denom = y0 - 2.0 * y1 + y2;
             if denom.abs() > 1e-12 {
                 let delta = (0.5 * (y0 - y2) / denom).clamp(-0.5, 0.5);
@@ -594,7 +500,7 @@ impl Dsp {
             }
         }
         self.tau_smoothed = tau;
-        let (phi, _, _, _, _) = crate::beat::score_phase_for_tau(&self.onset_history, tau);
+        let (phi, _, _, _, _) = crate::beat::score_phase_for_tau(&self.buffers.onset, tau);
         self.phase_smoothed = phi as f32;
     }
 
@@ -603,25 +509,25 @@ impl Dsp {
         let phi = self.phase_smoothed;
         let s = self.score_inst;
         if p.is_nan() || s <= 0.0 {
-            self.beat_grid[0] = f32::NAN;
-            self.beat_grid[1] = f32::NAN;
-            self.beat_grid[2] = 0.0;
-            self.beat_state[0] = f32::NAN;
-            self.beat_state[1] = 0.0;
-            self.beat_state[2] = f32::NAN;
-            self.beat_state[3] = f32::NAN;
+            self.buffers.beatGrid[0] = f32::NAN;
+            self.buffers.beatGrid[1] = f32::NAN;
+            self.buffers.beatGrid[2] = 0.0;
+            self.buffers.beatState[0] = f32::NAN;
+            self.buffers.beatState[1] = 0.0;
+            self.buffers.beatState[2] = f32::NAN;
+            self.buffers.beatState[3] = f32::NAN;
         } else {
-            self.beat_grid[0] = p;
-            self.beat_grid[1] = phi;
-            self.beat_grid[2] = s;
-            self.beat_state[0] = if p > 0.0 {
+            self.buffers.beatGrid[0] = p;
+            self.buffers.beatGrid[1] = phi;
+            self.buffers.beatGrid[2] = s;
+            self.buffers.beatState[0] = if p > 0.0 {
                 60.0 / (p * self.dt)
             } else {
                 f32::NAN
             };
-            self.beat_state[1] = s;
-            self.beat_state[2] = f32::NAN; // beats_per_measure deferred
-            self.beat_state[3] = f32::NAN; // measure_conf deferred
+            self.buffers.beatState[1] = s;
+            self.buffers.beatState[2] = f32::NAN; // beats_per_measure deferred
+            self.buffers.beatState[3] = f32::NAN; // measure_conf deferred
         }
     }
 
@@ -632,7 +538,7 @@ impl Dsp {
         let phase = self.phase_smoothed;
         let score = self.score_inst;
         if period.is_nan() || period <= 0.0 || score <= 0.0 || phase.is_nan() {
-            for slot in self.beat_pulses.iter_mut() {
+            for slot in self.buffers.beatPulses.iter_mut() {
                 *slot = f32::NAN;
             }
             return;
@@ -647,7 +553,7 @@ impl Dsp {
         self.beat_position = bp.rem_euclid(16.0);
         for (i, &m) in BEAT_PULSE_CYCLES.iter().enumerate() {
             let frac = (self.beat_position / m).fract();
-            self.beat_pulses[i] = 1.0 - frac;
+            self.buffers.beatPulses[i] = 1.0 - frac;
         }
     }
 }
@@ -666,14 +572,14 @@ fn push_history(buf: &mut [f32], value: f32) {
 #[cfg(test)]
 impl Dsp {
     pub fn onset_acf_enhanced_len(&self) -> usize {
-        self.onset_acf_enhanced.len()
+        self.buffers.onsetAcfEnhanced.len()
     }
 
     pub fn test_set_onset_acf_enhanced(&mut self, src: &[f32]) {
-        let n = self.onset_acf_enhanced.len().min(src.len());
-        self.onset_acf_enhanced[..n].copy_from_slice(&src[..n]);
-        if n < self.onset_acf_enhanced.len() {
-            for v in &mut self.onset_acf_enhanced[n..] {
+        let n = self.buffers.onsetAcfEnhanced.len().min(src.len());
+        self.buffers.onsetAcfEnhanced[..n].copy_from_slice(&src[..n]);
+        if n < self.buffers.onsetAcfEnhanced.len() {
+            for v in &mut self.buffers.onsetAcfEnhanced[n..] {
                 *v = 0.0;
             }
         }
@@ -684,14 +590,14 @@ impl Dsp {
     }
 
     pub fn onset_history_len(&self) -> usize {
-        self.onset_history.len()
+        self.buffers.onset.len()
     }
 
     pub fn test_set_onset_history(&mut self, src: &[f32]) {
-        let n = self.onset_history.len().min(src.len());
-        self.onset_history[..n].copy_from_slice(&src[..n]);
-        if n < self.onset_history.len() {
-            for v in &mut self.onset_history[n..] {
+        let n = self.buffers.onset.len().min(src.len());
+        self.buffers.onset[..n].copy_from_slice(&src[..n]);
+        if n < self.buffers.onset.len() {
+            for v in &mut self.buffers.onset[n..] {
                 *v = 0.0;
             }
         }
@@ -700,14 +606,14 @@ impl Dsp {
     pub fn test_run_pick_and_score(&mut self) {
         // Recompute enhanced ACF from current onset_history, then pick & score.
         crate::acf::compute_gen_acf(
-            &self.onset_history,
-            &mut self.onset_acf,
+            &self.buffers.onset,
+            &mut self.buffers.onsetAcf,
             &self.gen_acf_fft_forward,
             &self.gen_acf_fft_inverse,
             &mut self.gen_acf_time_buf,
             &mut self.gen_acf_freq_buf,
         );
-        crate::acf::compute_harmonic_enhanced(&self.onset_acf, &mut self.onset_acf_enhanced);
+        crate::acf::compute_harmonic_enhanced(&self.buffers.onsetAcf, &mut self.buffers.onsetAcfEnhanced);
         self.pick_candidates();
         self.score_candidates();
     }
@@ -717,7 +623,7 @@ impl Dsp {
     }
 
     pub fn tea_len(&self) -> usize {
-        self.tea.len()
+        self.buffers.tea.len()
     }
     pub fn tea_alpha(&self) -> f32 {
         self.tea_alpha
@@ -726,10 +632,10 @@ impl Dsp {
         self.tau_smoothed
     }
     pub fn test_set_tea(&mut self, src: &[f32]) {
-        let n = self.tea.len().min(src.len());
-        self.tea[..n].copy_from_slice(&src[..n]);
-        if n < self.tea.len() {
-            for v in &mut self.tea[n..] {
+        let n = self.buffers.tea.len().min(src.len());
+        self.buffers.tea[..n].copy_from_slice(&src[..n]);
+        if n < self.buffers.tea.len() {
+            for v in &mut self.buffers.tea[n..] {
                 *v = 0.0;
             }
         }
