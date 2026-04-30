@@ -72,8 +72,6 @@ pub struct Dsp {
     onset_history: Vec<f32>,
     prev_rms: f32,
     buffer_acf: Vec<f32>,
-    rms_acf: Vec<f32>,
-    rms_detrended: Vec<f32>,
     /// Per-process-call EMA coefficient for the spectrum. Computed from
     /// `SMOOTHING_TAU_SECS` and the wall-clock dt between hops
     /// (`hop_size / sample_rate`), so changing `hop_size` does NOT change
@@ -95,13 +93,6 @@ pub struct Dsp {
     low_rms_history:  Vec<f32>,
     mid_rms_history:  Vec<f32>,
     high_rms_history: Vec<f32>,
-    /// Scratch: low_rms_history with its mean subtracted, used as input to
-    /// `autocorrelate`. Without detrending, the average band level creates a
-    /// DC bias that drowns out tempo peaks (same rationale as `rms_detrended`
-    /// for the full-band ACF).
-    low_rms_detrended: Vec<f32>,
-    /// Detrended autocorrelation of `low_rms_history`. Length = rms_history_len / 2.
-    low_rms_acf: Vec<f32>,
     /// Public per-frame `[period, phase, score]` from the P&T pipeline.
     beat_grid: Vec<f32>,
     /// Public `[bpm, score, NaN, NaN]` view of the current frame's estimate.
@@ -199,8 +190,6 @@ impl Dsp {
             onset_history: vec![0.0; rms_history_len],
             prev_rms: 0.0,
             buffer_acf: vec![0.0; window_size / 2],
-            rms_acf: vec![0.0; rms_history_len / 2],
-            rms_detrended: vec![0.0; rms_history_len],
             smoothing_alpha,
             dt,
             low_band_bin_end,
@@ -209,8 +198,6 @@ impl Dsp {
             low_rms_history:  vec![0.0; rms_history_len],
             mid_rms_history:  vec![0.0; rms_history_len],
             high_rms_history: vec![0.0; rms_history_len],
-            low_rms_detrended: vec![0.0; rms_history_len],
-            low_rms_acf:       vec![0.0; rms_history_len / 2],
             beat_grid: vec![f32::NAN; BEAT_GRID_LEN],
             beat_state: vec![f32::NAN; BEAT_STATE_LEN],
             beat_position: 0.0,
@@ -349,28 +336,6 @@ impl Dsp {
             history[last] = value;
         }
 
-        // RMS-envelope ACFs: detrend (subtract mean) then autocorrelate.
-        // Computed here, after the FFT and band-RMS updates, so all ACF
-        // computations sit together. Full-band ACF moved here from its
-        // old pre-FFT location; behavior is unchanged.
-        // Mean computed in f64 to avoid summation roundoff: a constant
-        // f32 input of length 512 summed in f32 can drift by ~4e-7,
-        // leaving the detrended buffer with uniform tiny non-zero values
-        // that autocorrelate() then normalizes to ~1.0 instead of 0.
-        let full_mean = (self.rms_history.iter().map(|&x| x as f64).sum::<f64>()
-            / self.rms_history.len() as f64) as f32;
-        for (dst, src) in self.rms_detrended.iter_mut().zip(self.rms_history.iter()) {
-            *dst = src - full_mean;
-        }
-        autocorrelate(&self.rms_detrended, &mut self.rms_acf);
-
-        let low_mean = (self.low_rms_history.iter().map(|&x| x as f64).sum::<f64>()
-            / self.low_rms_history.len() as f64) as f32;
-        for (dst, src) in self.low_rms_detrended.iter_mut().zip(self.low_rms_history.iter()) {
-            *dst = src - low_mean;
-        }
-        autocorrelate(&self.low_rms_detrended, &mut self.low_rms_acf);
-
         // Magnitude → dB → normalized [0, 1] → smoothed
         // Skip bin 0 (DC); use bins 1..=spectrum.len()
         for (out_i, bin) in self.freq_buffer[1..=self.spectrum.len()].iter().enumerate() {
@@ -397,14 +362,6 @@ impl Dsp {
 
     pub fn buffer_acf(&self) -> Vec<f32> {
         self.buffer_acf.clone()
-    }
-
-    pub fn rms_acf(&self) -> Vec<f32> {
-        self.rms_acf.clone()
-    }
-
-    pub fn low_rms_acf(&self) -> Vec<f32> {
-        self.low_rms_acf.clone()
     }
 
     pub fn rms_history(&self) -> Vec<f32> {
@@ -1019,37 +976,11 @@ mod tests {
     }
 
     #[test]
-    fn rms_acf_has_correct_length() {
-        let dsp = Dsp::new(2048, 48000.0, 1024, 512);
-        assert_eq!(dsp.rms_acf().len(), 256);
-    }
-
-    #[test]
     fn acf_of_silence_is_zero() {
         let mut dsp = Dsp::new(2048, 48000.0, 1024, 512);
         dsp.process(&vec![0.0_f32; 2048]);
         for &v in dsp.buffer_acf().iter() {
             assert_eq!(v, 0.0);
-        }
-        for &v in dsp.rms_acf().iter() {
-            assert_eq!(v, 0.0);
-        }
-    }
-
-    #[test]
-    fn rms_acf_constant_input_is_zero() {
-        // Fill rms_history with a constant rms value, then verify the
-        // detrended (mean-subtracted) ACF is zero everywhere.
-        let mut dsp = Dsp::new(8, 48000.0, 4, 512);
-        let constant = vec![0.5_f32; 8];
-        // RMS of [0.5; 8] is 0.5; need >= 512 calls to fully fill.
-        for _ in 0..512 {
-            dsp.process(&constant);
-        }
-        let acf = dsp.rms_acf();
-        assert_eq!(acf.len(), 256);
-        for &v in &acf {
-            assert!(v.abs() < 1e-5, "expected near-zero ACF for constant rms, got {}", v);
         }
     }
 
@@ -1204,13 +1135,6 @@ mod tests {
     }
 
     #[test]
-    fn rms_acf_length_tracks_history_length() {
-        assert_eq!(Dsp::new(2048, 48000.0, 1024, 1024).rms_acf().len(), 512);
-        assert_eq!(Dsp::new(2048, 48000.0, 1024, 256).rms_acf().len(), 128);
-        assert_eq!(Dsp::new(2048, 48000.0, 1024, 512).rms_acf().len(), 256);
-    }
-
-    #[test]
     fn pure_low_band_sine_lands_in_low() {
         // Bin-aligned: 4 × (48000/2048) = 93.75 Hz, in the low band (bins 1..=6).
         // Hann main lobe is 4 bins wide; bin 4 ± 2 = bins 2..6, all in low.
@@ -1319,36 +1243,6 @@ mod tests {
         let n = h.len();
         assert_eq!(h[n - 1], 0.0, "newest should be silent");
         assert!(h[n - 2] > 0.5, "second-newest should be the loud sine, got {}", h[n - 2]);
-    }
-
-    #[test]
-    fn low_rms_acf_has_correct_length() {
-        let dsp = Dsp::new(2048, 48000.0, 1024, 512);
-        assert_eq!(dsp.low_rms_acf().len(), 256);
-    }
-
-    #[test]
-    fn low_rms_acf_constant_input_is_zero() {
-        // Fill low_rms_history with a constant non-zero band-RMS by feeding the
-        // same loud bin-aligned low-frequency sine repeatedly. Detrended ACF on
-        // a constant should be zero everywhere.
-        let mut dsp = Dsp::new(2048, 48000.0, 1024, 512);
-        let sr = 48000.0_f32;
-        let signal: Vec<f32> = (0..2048)
-            .map(|i| (2.0 * std::f32::consts::PI * 93.75 * (i as f32 / sr)).sin())
-            .collect();
-        // 512 calls fully fills the band history with a constant value.
-        for _ in 0..512 {
-            dsp.process(&signal);
-        }
-        let acf = dsp.low_rms_acf();
-        for &v in &acf {
-            assert!(
-                v.abs() < 1e-4,
-                "expected near-zero detrended ACF for constant input, got {}",
-                v
-            );
-        }
     }
 
     #[test]
