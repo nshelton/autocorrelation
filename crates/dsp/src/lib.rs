@@ -11,17 +11,6 @@ mod beat;
 use crate::buffers::Buffers;
 use crate::spectrum::SpectrumState;
 
-/// Spectrum smoothing time constant in seconds. Chosen to preserve the
-/// legacy alpha ≈ 0.2 behavior at sr=48000, hop=1024:
-///   alpha = 1 - exp(-dt/tau), dt = 1024/48000 = 21.33 ms
-///   0.2 ≈ 1 - exp(-21.33ms / 95.6ms)
-const SMOOTHING_TAU_SECS: f32 = 0.0956;
-/// Crossover from low band to mid band, in Hz. Drum-friendly default:
-/// fits the kick fundamental (typically 50–90 Hz) cleanly inside "low"
-/// without bleeding much into snare body.
-const LOW_BAND_HZ_MAX: f32 = 150.0;
-/// Crossover from mid band to high band, in Hz.
-const MID_BAND_HZ_MAX: f32 = 1500.0;
 /// Maximum number of tempo peaks tracked per hop. Drives the fixed length
 /// of `candidates` (= 3 * MAX_PEAKS — interleaved [lag, mag, sharpness]
 /// triples).
@@ -713,7 +702,8 @@ mod tests {
         // sr=48000, hop=1024 → dt = 21.33 ms
         let mut dsp = Dsp::new(2048, 48000.0, 1024, 512);
 
-        // tau = SMOOTHING_TAU_SECS (0.0956 s) → alpha ≈ 1 - exp(-21.33/95.6) ≈ 0.20
+        // tau = 0.0956 s (the SMOOTHING_TAU_SECS_DEFAULT in spectrum.rs)
+        //   → alpha ≈ 1 - exp(-21.33/95.6) ≈ 0.20
         dsp.set_smoothing_tau(0.0956);
         // Drive a steady sine and verify the spectrum stabilizes (i.e. EMA is sane).
         let signal: Vec<f32> = (0..2048)
