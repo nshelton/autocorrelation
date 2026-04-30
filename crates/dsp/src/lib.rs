@@ -14,65 +14,24 @@ const SMOOTHING_TAU_SECS: f32 = 0.0956;
 const LOW_BAND_HZ_MAX: f32 = 150.0;
 /// Crossover from mid band to high band, in Hz.
 const MID_BAND_HZ_MAX: f32 = 1500.0;
-/// Default time constant for the rms_acf decaying accumulator (seconds).
-/// 4 s gives stable peaks for steady tempo while still tracking gradual
-/// tempo changes within ~10–15 seconds.
-const ACCUM_TAU_DEFAULT_SECS: f32 = 4.0;
-/// Minimum lag (in hops) considered for peak picking. Below this, peaks
-/// imply BPM > ~280 (at hop=1024, sr=48000) which isn't a tempo we care
-/// about, and the very-low-lag region of the ACF is dominated by the
-/// shape of the autocorrelation envelope rather than tempo structure.
-const MIN_PEAK_LAG: usize = 10;
 /// Maximum number of tempo peaks tracked per hop. Drives the fixed length
-/// of `acf_peaks` (= 3 * MAX_PEAKS — interleaved [lag, mag, sharpness]
+/// of `candidates` (= 3 * MAX_PEAKS — interleaved [lag, mag, sharpness]
 /// triples).
 const MAX_PEAKS: usize = 10;
 /// Minimum integer-lag distance between accepted peaks, in hops. Without
 /// this, the wide lobes of true tempo peaks return multiple "peaks" all
 /// clustered around a single underlying peak.
 const MIN_PEAK_SPACING: usize = 3;
-/// Plausible-tempo bounds for the `BeatTracker`. Candidate periods T̂ = lag/k
-/// are accepted only when they fall in [period_min, period_max] (derived from
-/// these BPM bounds + dt). Without this, sub-period peaks (hi-hats, 16th-note
-/// patterns) used to pull the tracker into reporting tempos 2-4× too fast —
-/// the user constraint "pick a beat harmonic between 80–190 BPM" becomes the
-/// hard filter that keeps observations in the perceptually-sensible range.
+/// Plausible-tempo bounds for candidate acceptance. Candidate periods
+/// `lag/k` are accepted only when they fall in [period_min, period_max]
+/// (derived from these BPM bounds + dt).
 const BEAT_TRACKER_MIN_BPM: f32 = 40.0;
 const BEAT_TRACKER_MAX_BPM: f32 = 220.0;
-/// Initial BPM the `BeatTracker` holds before any audio has been processed.
-/// 120 is right in the middle of plausible music tempos (60–180), so any
-/// genre converges within a similar number of frames.
-const BEAT_TRACKER_INITIAL_BPM: f32 = 120.0;
-/// Initial measure count (beats per bar) — 4/4 covers most popular music;
-/// changes only via the hysteresis path on strong evidence.
-const BEAT_TRACKER_INITIAL_BEATS_PER_MEASURE: u32 = 4;
-/// Gaussian tolerance σ (in lag units) for peak-vs-target alignment in the
-/// tracker. Wider than the peak-picker's 1.0 because we're matching peaks
-/// against a smoothed candidate period, not against ACF noise.
-const BEAT_TRACKER_SIGMA_LAG: f32 = 1.5;
-/// Max EMA rate per frame for the BPM update — `α(c) = α_max · confidence`.
-/// 0.1 means the tracker can fully shift over ~10 fully-confident frames
-/// (~0.2 s at default sr/hop) — fast enough to follow real tempo drift,
-/// slow enough to ignore single-frame outliers.
-const BEAT_TRACKER_ALPHA_MAX: f32 = 0.1;
-/// EMA factor for confidence smoothing — `conf = (1-x)·conf + x·new`.
-const BEAT_TRACKER_CONF_SMOOTHING: f32 = 0.1;
-/// Margin a candidate `m` must beat the current `beats_per_measure`'s score
-/// by before we switch (hysteresis). 1.3 = 30 % stronger; lower = jittery,
-/// higher = sticky.
-const BEAT_TRACKER_MEASURE_SWITCH_MARGIN: f32 = 1.3;
-/// Discrete `beats_per_measure` candidates considered each frame — 2/4 time,
-/// 3/4 (waltz), 4/4, 6/8 (compound), 8 (long bar / 4-measure phrase).
-const BEAT_TRACKER_MEASURE_CANDIDATES: [u32; 5] = [2, 3, 4, 6, 8];
 /// Length of the public `beat_state` output: [bpm, bpm_conf, beats_per_measure, measure_conf].
 const BEAT_STATE_LEN: usize = 4;
 /// Length of the `beat_grid` output buffer: [period, phase, score]. Keep in
 /// sync with `BeatGridRenderer` / `BeatGridScrollingRenderer` consumers.
 const BEAT_GRID_LEN: usize = 3;
-/// Step for the phase sweep over `rms_history`, in hops. 0.5 hop ≈ 10 ms at
-/// default sr/hop — fine enough that visible beat lines won't visibly snap to
-/// a coarse grid frame-to-frame.
-const BEAT_PHASE_STEP_HOPS: f32 = 0.5;
 /// Cycle multipliers for `beat_pulses`. The detected period is multiplied by
 /// each entry to get an "m-cycle period"; the corresponding pulse output is
 /// a downward saw with that period (1.0 at cycle start, →0 just before next).
@@ -95,162 +54,6 @@ const TEA_GAUSSIAN_SIGMA: f32 = 5.0;
 /// for steady tempos while still tracking gradual drift within ~10–15 s.
 const TEA_TAU_DEFAULT_SECS: f32 = 4.0;
 
-/// State estimator for tempo and meter. Consumes the picked `acf_peaks` (with
-/// magnitude and sharpness) each frame and updates four state values:
-///
-///   - `bpm_period` — smoothed beat period in lag units. Updated as a
-///     confidence-gated EMA; high-confidence frames pull it strongly toward
-///     the observation, low-confidence frames barely move it.
-///   - `beats_per_measure` — discrete; switches only when a different
-///     candidate `m ∈ {2, 3, 4, 6, 8}` scores ≥ 1.3× the current one (so the
-///     measure interpretation is sticky and doesn't jitter every frame).
-///   - `bpm_confidence` and `measure_confidence` — smoothed 0..1 quality
-///     signals consumers can use to fade visualizations or gate downstream
-///     decisions.
-///
-/// Initial state: 120 BPM, 4/4 — the tracker holds these defaults until the
-/// observations have enough support to budge them.
-struct BeatTracker {
-    bpm_period: f32,
-    bpm_confidence: f32,
-    beats_per_measure: u32,
-    measure_confidence: f32,
-    period_min: f32,
-    period_max: f32,
-    /// Seconds per lag = hop_size / sample_rate. Used by the public `bpm()`
-    /// view to convert lags → BPM.
-    dt_secs: f32,
-}
-
-impl BeatTracker {
-    /// Build a tracker with `period_min` / `period_max` derived from the
-    /// `BEAT_TRACKER_MIN_BPM` / `BEAT_TRACKER_MAX_BPM` bounds. The initial
-    /// period (120 BPM) is guaranteed to fall in this range.
-    fn new(dt_secs: f32) -> Self {
-        // BPM is inversely proportional to period — fastest tempo = shortest
-        // period, slowest tempo = longest period.
-        let period_min = (60.0 / BEAT_TRACKER_MAX_BPM) / dt_secs;
-        let period_max = (60.0 / BEAT_TRACKER_MIN_BPM) / dt_secs;
-        let initial_period = (60.0 / BEAT_TRACKER_INITIAL_BPM) / dt_secs;
-        Self {
-            bpm_period: initial_period.clamp(period_min, period_max),
-            bpm_confidence: 0.0,
-            beats_per_measure: BEAT_TRACKER_INITIAL_BEATS_PER_MEASURE,
-            measure_confidence: 0.0,
-            period_min,
-            period_max,
-            dt_secs,
-        }
-    }
-
-    fn bpm(&self) -> f32 {
-        if self.bpm_period > 0.0 {
-            60.0 / (self.bpm_period * self.dt_secs)
-        } else {
-            f32::NAN
-        }
-    }
-
-    /// Observe one frame of `[lag, mag, sharpness]` peaks (length = 3 *
-    /// MAX_PEAKS, NaN-padded) and update state.
-    fn observe(&mut self, acf_peaks: &[f32]) {
-        let inv_two_sigma_sq = 1.0 / (2.0 * BEAT_TRACKER_SIGMA_LAG * BEAT_TRACKER_SIGMA_LAG);
-        let n_peaks = acf_peaks.len() / 3;
-
-        // ── BPM update ────────────────────────────────────────────────────
-        // For each peak (lᵢ, mᵢ), find the integer kᵢ that minimizes
-        // |lᵢ/k − bpm_period|; the candidate T̂ᵢ = lᵢ/kᵢ is "if my current
-        // tempo is right, this peak is the kᵢ-th beat". Magnitude- and
-        // alignment-weighted average gives the observation; off-grid peaks
-        // contribute negligibly via the Gaussian alignment.
-        let mut weight_sum = 0.0f32;
-        let mut weighted_t_sum = 0.0f32;
-        let mut total_mag = 0.0f32;
-
-        for i in 0..n_peaks {
-            let lag = acf_peaks[3 * i];
-            let mag = acf_peaks[3 * i + 1];
-            if lag.is_nan() || mag <= 0.0 {
-                continue;
-            }
-            total_mag += mag;
-            // k near current period; clamp to ≥ 1 so we never divide by 0.
-            let k = (lag / self.bpm_period).round().max(1.0);
-            let candidate_t = lag / k;
-            if candidate_t < self.period_min || candidate_t > self.period_max {
-                continue;
-            }
-            let delta = candidate_t - self.bpm_period;
-            let alignment = (-delta * delta * inv_two_sigma_sq).exp();
-            let weight = mag * alignment;
-            weight_sum += weight;
-            weighted_t_sum += weight * candidate_t;
-        }
-
-        if weight_sum > 0.0 && total_mag > 0.0 {
-            let observation = weighted_t_sum / weight_sum;
-            let new_conf = (weight_sum / total_mag).clamp(0.0, 1.0);
-            let alpha = BEAT_TRACKER_ALPHA_MAX * new_conf;
-            self.bpm_period = ((1.0 - alpha) * self.bpm_period + alpha * observation)
-                .clamp(self.period_min, self.period_max);
-            self.bpm_confidence = (1.0 - BEAT_TRACKER_CONF_SMOOTHING) * self.bpm_confidence
-                + BEAT_TRACKER_CONF_SMOOTHING * new_conf;
-        } else {
-            // No support this frame — decay confidence gently.
-            self.bpm_confidence *= 1.0 - BEAT_TRACKER_CONF_SMOOTHING;
-        }
-
-        // ── Measure update ────────────────────────────────────────────────
-        // For each candidate m, find the highest-scoring peak near m·period.
-        // Score = mag · sharpness · gaussian_alignment — the sharpness factor
-        // is what makes "pointy" peaks (real downbeats) win over broad
-        // lobes that happen to sit near m·period by accident.
-        let mut best_m = self.beats_per_measure;
-        let mut best_m_score = 0.0f32;
-        let mut current_m_score = 0.0f32;
-
-        for &m in &BEAT_TRACKER_MEASURE_CANDIDATES {
-            let target = m as f32 * self.bpm_period;
-            let mut best_peak_score = 0.0f32;
-            for i in 0..n_peaks {
-                let lag = acf_peaks[3 * i];
-                let mag = acf_peaks[3 * i + 1];
-                let sharp = acf_peaks[3 * i + 2];
-                if lag.is_nan() || mag <= 0.0 {
-                    continue;
-                }
-                let delta = lag - target;
-                let alignment = (-delta * delta * inv_two_sigma_sq).exp();
-                let score = mag * sharp.max(0.0) * alignment;
-                if score > best_peak_score {
-                    best_peak_score = score;
-                }
-            }
-            if m == self.beats_per_measure {
-                current_m_score = best_peak_score;
-            }
-            if best_peak_score > best_m_score {
-                best_m_score = best_peak_score;
-                best_m = m;
-            }
-        }
-
-        // Hysteresis: switch only if the new winner clearly beats current.
-        if best_m != self.beats_per_measure
-            && best_m_score > current_m_score * BEAT_TRACKER_MEASURE_SWITCH_MARGIN
-        {
-            self.beats_per_measure = best_m;
-        }
-
-        // Smooth measure confidence using best score normalized by current
-        // BPM confidence (otherwise a strong-mag peak with no real tempo
-        // structure could read as high measure confidence).
-        let new_measure_conf = best_m_score.min(1.0) * self.bpm_confidence;
-        self.measure_confidence = (1.0 - BEAT_TRACKER_CONF_SMOOTHING) * self.measure_confidence
-            + BEAT_TRACKER_CONF_SMOOTHING * new_measure_conf;
-    }
-}
-
 #[wasm_bindgen]
 pub struct Dsp {
     waveform: Vec<f32>,
@@ -270,27 +73,6 @@ pub struct Dsp {
     prev_rms: f32,
     buffer_acf: Vec<f32>,
     rms_acf: Vec<f32>,
-    /// Decaying EMA accumulator over `rms_acf`. Same length. Used as the
-    /// signal for tempo peak picking — the EMA suppresses per-frame noise
-    /// in the instantaneous ACF so true tempo peaks build up.
-    rms_acf_accum: Vec<f32>,
-    /// Per-process EMA coefficient for `rms_acf_accum`. Computed from
-    /// `accum_tau_secs` and the same `dt` used for `smoothing_alpha`:
-    /// `alpha = 1 - exp(-dt / tau)`. Tunable via `set_accum_tau_secs`.
-    accum_alpha: f32,
-    /// Detected tempo peaks in `rms_acf_accum`, as interleaved
-    /// [lag_frac, mag, sharpness] triples. Length = 3 * MAX_PEAKS. Unused
-    /// slots filled with `f32::NAN` so the renderer can detect "no peak"
-    /// with a single `isNaN` check (0.0 would collide with a valid lag).
-    /// Sharpness = `-(y0 - 2y1 + y2)` from the parabolic interp — large
-    /// for narrow real beats, small for broad smeared lobes; consumed by
-    /// `BeatTracker`'s measure detector to favor pointy peaks at `m·T`.
-    acf_peaks: Vec<f32>,
-    /// Preallocated scratch for peak-candidate collection. Capacity is
-    /// reserved at construction (`rms_acf_len / 2` — worst case every other
-    /// lag is a local max). Cleared (not freed) each `process()` call so
-    /// peak picking is allocation-free.
-    peak_candidates: Vec<(usize, f32)>,
     rms_detrended: Vec<f32>,
     /// Per-process-call EMA coefficient for the spectrum. Computed from
     /// `SMOOTHING_TAU_SECS` and the wall-clock dt between hops
@@ -320,18 +102,9 @@ pub struct Dsp {
     low_rms_detrended: Vec<f32>,
     /// Detrended autocorrelation of `low_rms_history`. Length = rms_history_len / 2.
     low_rms_acf: Vec<f32>,
-    /// Public per-frame `[period, phase, confidence]` view of the tracker
-    /// state. Period and phase are in lag units; confidence is bpm_confidence.
-    /// Reused buffer — `update_beat_state` rewrites in place each
-    /// `process()` call.
+    /// Public per-frame `[period, phase, score]` from the P&T pipeline.
     beat_grid: Vec<f32>,
-    /// Tempo / meter state estimator. Consumes `acf_peaks` each frame and
-    /// holds smoothed (bpm_period, beats_per_measure) plus their confidences.
-    /// Initialized at 120 BPM, 4/4.
-    beat_tracker: BeatTracker,
-    /// Public `[bpm, bpm_conf, beats_per_measure_as_f32, measure_conf]` view
-    /// of the tracker state — mirrored from `beat_tracker` each frame so
-    /// consumers can read it as an ordinary feature buffer.
+    /// Public `[bpm, score, NaN, NaN]` view of the current frame's estimate.
     beat_state: Vec<f32>,
     /// Continuously-incrementing fractional beat counter. The integer part
     /// counts beats since startup; the fractional part is "how far into the
@@ -403,7 +176,6 @@ impl Dsp {
         let mid_band_bin_end = bin_for_hz(MID_BAND_HZ_MAX, sample_rate, window_size);
         let hann_energy: f32 = hann.iter().map(|h| h * h).sum();
         let parseval_band_scale = 2.0 / (window_size as f32 * hann_energy);
-        let accum_alpha = 1.0 - (-dt / ACCUM_TAU_DEFAULT_SECS).exp();
         let tea_alpha = 1.0 - (-dt / TEA_TAU_DEFAULT_SECS).exp();
         let gen_acf_n = rms_history_len;
         let gen_acf_fft_forward = planner.plan_fft_forward(2 * gen_acf_n);
@@ -428,10 +200,6 @@ impl Dsp {
             prev_rms: 0.0,
             buffer_acf: vec![0.0; window_size / 2],
             rms_acf: vec![0.0; rms_history_len / 2],
-            rms_acf_accum: vec![0.0; rms_history_len / 2],
-            accum_alpha,
-            acf_peaks: vec![f32::NAN; 3 * MAX_PEAKS],
-            peak_candidates: Vec::with_capacity((rms_history_len / 2) / 2 + 1),
             rms_detrended: vec![0.0; rms_history_len],
             smoothing_alpha,
             dt,
@@ -444,10 +212,6 @@ impl Dsp {
             low_rms_detrended: vec![0.0; rms_history_len],
             low_rms_acf:       vec![0.0; rms_history_len / 2],
             beat_grid: vec![f32::NAN; BEAT_GRID_LEN],
-            // Tracker derives its period bounds from BEAT_TRACKER_MIN/MAX_BPM
-            // — the rms_history-derived bounds were a stale concern from the
-            // old harmonic-sum sweep era.
-            beat_tracker: BeatTracker::new(dt),
             beat_state: vec![f32::NAN; BEAT_STATE_LEN],
             beat_position: 0.0,
             beat_pulses: vec![f32::NAN; BEAT_PULSES_LEN],
@@ -483,15 +247,6 @@ impl Dsp {
     pub fn set_smoothing_tau(&mut self, tau_secs: f32) {
         let tau = tau_secs.clamp(0.001, 10.0);
         self.smoothing_alpha = 1.0 - (-self.dt / tau).exp();
-    }
-
-    /// Set the time constant (seconds) for the rms_acf decaying accumulator.
-    /// `accum_alpha` is recomputed as `1 - exp(-dt / tau)`. Smaller tau →
-    /// faster response, less stable peaks. Clamped to [0.05, 60.0] to avoid
-    /// divide-by-zero and runaway settling.
-    pub fn set_accum_tau_secs(&mut self, tau_secs: f32) {
-        let tau = tau_secs.clamp(0.05, 60.0);
-        self.accum_alpha = 1.0 - (-self.dt / tau).exp();
     }
 
     /// EMA time constant for the TEA. `alpha = 1 - exp(-dt / tau)`. Smaller
@@ -609,15 +364,6 @@ impl Dsp {
         }
         autocorrelate(&self.rms_detrended, &mut self.rms_acf);
 
-        // EMA-decayed accumulator over the instantaneous full-band ACF.
-        // Builds up steady tempo peaks across many hops; suppresses
-        // per-frame noise. Same alpha pattern as `smoothing_alpha`.
-        for i in 0..self.rms_acf_accum.len() {
-            self.rms_acf_accum[i] = self.accum_alpha * self.rms_acf[i]
-                + (1.0 - self.accum_alpha) * self.rms_acf_accum[i];
-        }
-        self.pick_acf_peaks();
-
         let low_mean = (self.low_rms_history.iter().map(|&x| x as f64).sum::<f64>()
             / self.low_rms_history.len() as f64) as f32;
         for (dst, src) in self.low_rms_detrended.iter_mut().zip(self.low_rms_history.iter()) {
@@ -655,10 +401,6 @@ impl Dsp {
 
     pub fn rms_acf(&self) -> Vec<f32> {
         self.rms_acf.clone()
-    }
-
-    pub fn rms_acf_accum(&self) -> Vec<f32> {
-        self.rms_acf_accum.clone()
     }
 
     pub fn low_rms_acf(&self) -> Vec<f32> {
@@ -701,10 +443,6 @@ impl Dsp {
         self.high_rms_history.clone()
     }
 
-    pub fn acf_peaks(&self) -> Vec<f32> {
-        self.acf_peaks.clone()
-    }
-
     pub fn beat_grid(&self) -> Vec<f32> {
         self.beat_grid.clone()
     }
@@ -717,205 +455,6 @@ impl Dsp {
         self.beat_state.clone()
     }
 
-    /// Advance `beat_position` and project saw waves into `beat_pulses`.
-    /// For each cycle multiplier m ∈ BEAT_PULSE_CYCLES,
-    ///   saw_m = 1 − frac(beat_position / m)
-    /// — 1.0 at the start of each m-cycle, →0 just before the next.
-    ///
-    /// Two modes:
-    ///   - **Phase-locked** (phase is real): set `beat_position`'s fractional
-    ///     part to `phase/period` so the cycle-m pulses anchor to actual beat
-    ///     boundaries. The integer part advances by 1 each time the phase
-    ///     wraps backward (caught via the 0.5-threshold check).
-    ///   - **Free-running** (phase is NaN — silence or unconfident phase
-    ///     fit): just advance by 1/period each frame. The saws keep moving at
-    ///     the tracker's rate; alignment is whatever it happened to be when
-    ///     phase last had a value.
-    ///
-    /// Wraps mod 16 (= LCM of BEAT_PULSE_CYCLES) so f32 precision stays
-    /// healthy over long sessions.
-    fn update_beat_pulses(&mut self) {
-        let period = self.beat_grid[0];
-        let phase = self.beat_grid[1];
-        if period.is_nan() || period <= 0.0 {
-            for slot in self.beat_pulses.iter_mut() {
-                *slot = f32::NAN;
-            }
-            return;
-        }
-
-        let new_bp = if phase.is_nan() {
-            // Free-run.
-            self.beat_position + 1.0 / period
-        } else {
-            // Phase-lock: align fractional part to phase/period.
-            let phase_frac = (phase / period).clamp(0.0, 0.999_999);
-            let prev_bp = self.beat_position;
-            let mut candidate = prev_bp.floor() + phase_frac;
-            // Phase wrapped backward across a beat boundary — bump the
-            // integer part to keep `beat_position` monotonic.
-            if candidate < prev_bp - 0.5 {
-                candidate += 1.0;
-            }
-            candidate
-        };
-        self.beat_position = new_bp.rem_euclid(16.0);
-
-        for (i, &m) in BEAT_PULSE_CYCLES.iter().enumerate() {
-            let frac = (self.beat_position / m).fract();
-            self.beat_pulses[i] = 1.0 - frac;
-        }
-    }
-
-    /// Update the `BeatTracker` from this frame's `acf_peaks`, then mirror
-    /// its smoothed state into the public `beat_grid` and `beat_state`
-    /// buffers. Replaces the old per-frame harmonic-sum fit — peak picking
-    /// already extracts the strongest features of the ACF, so re-summing the
-    /// raw signal is redundant; the tracker integrates these observations
-    /// over time with confidence-gated EMA + measure hysteresis.
-    fn update_beat_state(&mut self) {
-        self.beat_tracker.observe(&self.acf_peaks);
-
-        let period = self.beat_tracker.bpm_period;
-        let phase = self.fit_beat_phase(period);
-
-        self.beat_grid[0] = period;
-        self.beat_grid[1] = phase;
-        self.beat_grid[2] = self.beat_tracker.bpm_confidence;
-
-        self.beat_state[0] = self.beat_tracker.bpm();
-        self.beat_state[1] = self.beat_tracker.bpm_confidence;
-        self.beat_state[2] = self.beat_tracker.beats_per_measure as f32;
-        self.beat_state[3] = self.beat_tracker.measure_confidence;
-    }
-
-    /// Find the phase φ ∈ [0, period) that maximizes the comb-filter response
-    /// of `rms_history` against a pulse train at `period`:
-    ///   score(φ) = Σ_k rms_history[(n - 1) - round(φ + k·period)]   (k ≥ 0, while in range)
-    /// φ is "how many hops ago the most-recent beat fell" — small φ means a
-    /// beat just happened. Returned in hop units, sub-bin via the
-    /// `BEAT_PHASE_STEP_HOPS` sweep grain.
-    ///
-    /// Allocation-free; bounded inner loop (rms_history.len() / period ≤ ~50
-    /// at default settings). No detrending: rms is already non-negative, so
-    /// summing it directly is equivalent to a peak-aligned correlation.
-    fn fit_beat_phase(&self, period: f32) -> f32 {
-        let n = self.rms_history.len();
-        if period < 1.0 || (period as usize) >= n {
-            return f32::NAN;
-        }
-
-        let n_phases = (period / BEAT_PHASE_STEP_HOPS).ceil() as usize;
-        let last_idx = (n - 1) as i32;
-
-        let mut best_phi = 0.0f32;
-        let mut best_score = -1.0f32;
-
-        for j in 0..n_phases {
-            let phi = j as f32 * BEAT_PHASE_STEP_HOPS;
-            let mut score = 0.0f32;
-            let mut k = 0usize;
-            loop {
-                let pos = phi + k as f32 * period;
-                let idx_signed = last_idx - pos.round() as i32;
-                if idx_signed < 0 {
-                    break;
-                }
-                score += self.rms_history[idx_signed as usize];
-                k += 1;
-            }
-            if score > best_score {
-                best_score = score;
-                best_phi = phi;
-            }
-        }
-        // Silent rms_history → all candidate scores are 0 and no improvement
-        // ever beats the initial best_score = -1.0... wait, score=0 > -1.0 on
-        // first iter, so best_score becomes 0 and best_phi stays at 0. We
-        // return NaN in that case so consumers (beat_pulses, scrolling grid)
-        // don't lock onto a bogus phase=0 alignment during silence.
-        if best_score <= 0.0 {
-            return f32::NAN;
-        }
-        best_phi
-    }
-
-    /// Pick top-`MAX_PEAKS` tempo peaks in `rms_acf_accum` and write them
-    /// into `acf_peaks` as interleaved `[lag_frac, mag]` pairs (NaN-padded).
-    ///
-    /// Algorithm:
-    ///   1. Scan lags `MIN_PEAK_LAG..len-1` for positive local maxima.
-    ///   2. Sort candidates by integer-lag magnitude, descending.
-    ///   3. Greedy-select with `MIN_PEAK_SPACING` integer-lag separation.
-    ///   4. Parabolic sub-bin interpolation on each accepted peak.
-    ///
-    /// Allocation-free: uses the preallocated `peak_candidates` scratch
-    /// (cleared, not freed) and a stack-bounded accepted set.
-    fn pick_acf_peaks(&mut self) {
-        // Reset output to all-NaN sentinels.
-        for slot in self.acf_peaks.iter_mut() {
-            *slot = f32::NAN;
-        }
-
-        let n = self.rms_acf_accum.len();
-        if n < MIN_PEAK_LAG + 2 {
-            return;
-        }
-
-        // 1. Scan candidates.
-        self.peak_candidates.clear();
-        for k in MIN_PEAK_LAG..(n - 1) {
-            let y1 = self.rms_acf_accum[k];
-            if y1 > 0.0 && y1 > self.rms_acf_accum[k - 1] && y1 > self.rms_acf_accum[k + 1] {
-                self.peak_candidates.push((k, y1));
-            }
-        }
-
-        // 2. Sort by magnitude descending.
-        self.peak_candidates
-            .sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-        // 3. Greedy select with min-spacing.
-        let mut accepted: [u32; MAX_PEAKS] = [0; MAX_PEAKS];
-        let mut accepted_count: usize = 0;
-        for &(k, _mag) in self.peak_candidates.iter() {
-            if accepted_count == MAX_PEAKS {
-                break;
-            }
-            let mut too_close = false;
-            for i in 0..accepted_count {
-                let dist = (k as i32 - accepted[i] as i32).unsigned_abs() as usize;
-                if dist < MIN_PEAK_SPACING {
-                    too_close = true;
-                    break;
-                }
-            }
-            if !too_close {
-                accepted[accepted_count] = k as u32;
-                accepted_count += 1;
-            }
-        }
-
-        // 4. Sub-bin parabolic refinement, write output.
-        for i in 0..accepted_count {
-            let k = accepted[i] as usize;
-            let y0 = self.rms_acf_accum[k - 1];
-            let y1 = self.rms_acf_accum[k];
-            let y2 = self.rms_acf_accum[k + 1];
-            let denom = y0 - 2.0 * y1 + y2;
-            let (lag_frac, mag) = if denom.abs() < 1e-12 {
-                (k as f32, y1)
-            } else {
-                let delta = (0.5 * (y0 - y2) / denom).clamp(-0.5, 0.5);
-                (k as f32 + delta, y1 - 0.25 * (y0 - y2) * delta)
-            };
-            // Sharpness = -denom: at a real maximum y1 > y0,y2 ⇒ denom < 0,
-            // so -denom > 0. Larger = narrower peak = more confident "real beat".
-            self.acf_peaks[3 * i] = lag_frac;
-            self.acf_peaks[3 * i + 1] = mag;
-            self.acf_peaks[3 * i + 2] = -denom;
-        }
-    }
 }
 
 impl Dsp {
@@ -1274,47 +813,6 @@ fn bin_for_hz(hz: f32, sample_rate: f32, n: usize) -> usize {
 
 #[cfg(test)]
 impl Dsp {
-    pub fn test_set_rms_acf_accum(&mut self, src: &[f32]) {
-        let n = src.len().min(self.rms_acf_accum.len());
-        self.rms_acf_accum[..n].copy_from_slice(&src[..n]);
-        for v in self.rms_acf_accum.iter_mut().skip(n) {
-            *v = 0.0;
-        }
-    }
-
-    pub fn test_run_peak_picking(&mut self) {
-        self.pick_acf_peaks();
-    }
-
-    pub fn test_run_update_beat_state(&mut self) {
-        self.update_beat_state();
-    }
-
-    /// Direct access to the tracker for unit tests — bypasses `process()`.
-    pub fn test_observe_tracker(&mut self) {
-        self.beat_tracker.observe(&self.acf_peaks);
-    }
-
-    pub fn test_tracker_bpm_period(&self) -> f32 {
-        self.beat_tracker.bpm_period
-    }
-
-    pub fn test_tracker_beats_per_measure(&self) -> u32 {
-        self.beat_tracker.beats_per_measure
-    }
-
-    pub fn test_set_acf_peak(&mut self, slot: usize, lag: f32, mag: f32, sharpness: f32) {
-        self.acf_peaks[3 * slot] = lag;
-        self.acf_peaks[3 * slot + 1] = mag;
-        self.acf_peaks[3 * slot + 2] = sharpness;
-    }
-
-    pub fn test_clear_acf_peaks(&mut self) {
-        for v in self.acf_peaks.iter_mut() {
-            *v = f32::NAN;
-        }
-    }
-
     pub fn onset_acf_enhanced_len(&self) -> usize {
         self.onset_acf_enhanced.len()
     }
@@ -1851,377 +1349,6 @@ mod tests {
                 v
             );
         }
-    }
-
-    #[test]
-    fn accum_alpha_matches_formula() {
-        // alpha = 1 - exp(-dt / tau) at default tau (4.0 s), dt = 1024/48000
-        let dsp = Dsp::new(2048, 48000.0, 1024, 512);
-        let dt = 1024.0_f32 / 48000.0;
-        let expected = 1.0 - (-dt / ACCUM_TAU_DEFAULT_SECS).exp();
-        assert!(
-            (dsp.accum_alpha - expected).abs() < 1e-6,
-            "got {}, expected {}",
-            dsp.accum_alpha,
-            expected
-        );
-    }
-
-    #[test]
-    fn set_accum_tau_secs_clamps_and_recomputes() {
-        let mut dsp = Dsp::new(2048, 48000.0, 1024, 512);
-        let before = dsp.accum_alpha;
-        dsp.set_accum_tau_secs(20.0);
-        assert!(dsp.accum_alpha < before, "longer tau should yield smaller alpha");
-
-        // Below clamp: 0.001 should clamp up to 0.05.
-        dsp.set_accum_tau_secs(0.001);
-        let dt = 1024.0_f32 / 48000.0;
-        let expected = 1.0 - (-dt / 0.05).exp();
-        assert!((dsp.accum_alpha - expected).abs() < 1e-6, "lower clamp not applied");
-
-        // Above clamp: 1000.0 should clamp down to 60.0.
-        dsp.set_accum_tau_secs(1000.0);
-        let expected = 1.0 - (-dt / 60.0).exp();
-        assert!((dsp.accum_alpha - expected).abs() < 1e-6, "upper clamp not applied");
-    }
-
-    #[test]
-    fn rms_acf_accum_silent_input_is_zero() {
-        let mut dsp = Dsp::new(2048, 48000.0, 1024, 512);
-        let silent = vec![0.0_f32; 2048];
-        for _ in 0..200 {
-            dsp.process(&silent);
-        }
-        let accum = dsp.rms_acf_accum();
-        assert_eq!(accum.len(), 256);
-        for &v in &accum {
-            assert_eq!(v, 0.0, "silent → accumulator must stay zero, got {}", v);
-        }
-    }
-
-    #[test]
-    fn acf_peaks_silent_input_all_nan() {
-        let mut dsp = Dsp::new(2048, 48000.0, 1024, 512);
-        let silent = vec![0.0_f32; 2048];
-        for _ in 0..50 {
-            dsp.process(&silent);
-        }
-        let peaks = dsp.acf_peaks();
-        assert_eq!(peaks.len(), 3 * MAX_PEAKS);
-        for (i, &v) in peaks.iter().enumerate() {
-            assert!(v.is_nan(), "slot {} should be NaN, got {}", i, v);
-        }
-    }
-
-    #[test]
-    fn acf_peaks_min_lag_enforced() {
-        let mut dsp = Dsp::new(2048, 48000.0, 1024, 512);
-        // Synthetic accumulator: a single isolated peak at lag 5 (below MIN_PEAK_LAG=10).
-        let mut accum = vec![0.0_f32; 256];
-        accum[5] = 0.9;
-        dsp.test_set_rms_acf_accum(&accum);
-        dsp.test_run_peak_picking();
-        let peaks = dsp.acf_peaks();
-        // No peak should be picked; all slots NaN.
-        for &v in &peaks {
-            assert!(v.is_nan(), "expected no peak below MIN_PEAK_LAG, got {}", v);
-        }
-    }
-
-    #[test]
-    fn acf_peaks_finds_isolated_peak_with_subbin_offset() {
-        let mut dsp = Dsp::new(2048, 48000.0, 1024, 512);
-        // Asymmetric triangular peak at integer lag 50:
-        //   y0 = accum[49] = 0.6, y1 = accum[50] = 1.0, y2 = accum[51] = 0.8
-        // Parabolic interp: δ = 0.5*(y0-y2)/(y0 - 2*y1 + y2) = 0.5*(-0.2)/(-0.6) ≈ 0.1667
-        let mut accum = vec![0.0_f32; 256];
-        accum[49] = 0.6;
-        accum[50] = 1.0;
-        accum[51] = 0.8;
-        dsp.test_set_rms_acf_accum(&accum);
-        dsp.test_run_peak_picking();
-        let peaks = dsp.acf_peaks();
-        let lag0 = peaks[0];
-        assert!(!lag0.is_nan(), "expected a peak in slot 0");
-        assert!(
-            (lag0 - 50.1667).abs() < 0.01,
-            "expected sub-bin lag ≈ 50.1667, got {}",
-            lag0
-        );
-        // Slots 1..MAX_PEAKS must be NaN.
-        for i in 1..MAX_PEAKS {
-            assert!(peaks[3 * i].is_nan(), "slot {} lag should be NaN", i);
-            assert!(peaks[3 * i + 1].is_nan(), "slot {} mag should be NaN", i);
-        }
-    }
-
-    #[test]
-    fn acf_peaks_min_spacing_filters_nearby() {
-        let mut dsp = Dsp::new(2048, 48000.0, 1024, 512);
-        // Two equal-magnitude lobes at lags 50 and 52 (spacing = 2 < MIN_PEAK_SPACING=3).
-        // Both are local maxima individually because lag 51 sits between them with
-        // a slightly lower value.
-        let mut accum = vec![0.0_f32; 256];
-        accum[49] = 0.8;
-        accum[50] = 1.0;
-        accum[51] = 0.85;
-        accum[52] = 1.0;
-        accum[53] = 0.8;
-        dsp.test_set_rms_acf_accum(&accum);
-        dsp.test_run_peak_picking();
-        let peaks = dsp.acf_peaks();
-        // Exactly one of the two lobes should be picked. Its integer lag rounds
-        // to either 50 or 52.
-        let mut accepted = 0;
-        for i in 0..MAX_PEAKS {
-            if !peaks[3 * i].is_nan() {
-                accepted += 1;
-            }
-        }
-        assert_eq!(accepted, 1, "min-spacing should leave only one peak");
-    }
-
-    #[test]
-    fn acf_peaks_top_n_selection_in_descending_magnitude() {
-        let mut dsp = Dsp::new(2048, 48000.0, 1024, 512);
-        // 15 isolated peaks (well-spaced) with strictly decreasing magnitudes.
-        // Spacing = 8 to satisfy MIN_PEAK_SPACING; first peak at lag 16 to clear
-        // MIN_PEAK_LAG. Only the top 10 should be picked, in magnitude order.
-        let mut accum = vec![0.0_f32; 256];
-        for i in 0..15 {
-            let lag = 16 + 8 * i;
-            let mag = 1.0 - 0.05 * i as f32;
-            accum[lag - 1] = mag * 0.5;
-            accum[lag] = mag;
-            accum[lag + 1] = mag * 0.5;
-        }
-        dsp.test_set_rms_acf_accum(&accum);
-        dsp.test_run_peak_picking();
-        let peaks = dsp.acf_peaks();
-        // First 10 slots are real peaks, in descending magnitude order.
-        let mut last_mag = f32::INFINITY;
-        for i in 0..MAX_PEAKS {
-            let lag = peaks[3 * i];
-            let mag = peaks[3 * i + 1];
-            assert!(!lag.is_nan(), "slot {}: expected real peak", i);
-            assert!(mag <= last_mag + 1e-5, "slot {}: mag {} > prev {}", i, mag, last_mag);
-            last_mag = mag;
-        }
-    }
-
-    #[test]
-    fn acf_peaks_negative_correlations_skipped() {
-        let mut dsp = Dsp::new(2048, 48000.0, 1024, 512);
-        // Negative-magnitude local maximum: accum[50] = -0.1, surrounded by -0.5 / -0.5.
-        // Even though -0.1 > -0.5, anti-correlations aren't beats and must be skipped.
-        let mut accum = vec![0.0_f32; 256];
-        accum[49] = -0.5;
-        accum[50] = -0.1;
-        accum[51] = -0.5;
-        dsp.test_set_rms_acf_accum(&accum);
-        dsp.test_run_peak_picking();
-        let peaks = dsp.acf_peaks();
-        for &v in &peaks {
-            assert!(v.is_nan(), "negative peak must be skipped, got {}", v);
-        }
-    }
-
-    #[test]
-    fn rms_acf_accum_converges_to_instantaneous_for_steady_periodic() {
-        // Each hop receives a 2048-sample sine whose amplitude depends on the
-        // hop index — this produces a non-constant `rms_history` with real
-        // temporal structure (a slow envelope), so the detrended ACF has
-        // non-trivial values. Without this, every hop has the same RMS, the
-        // detrended history is all zeros, and the convergence assertion holds
-        // trivially because both sides are zero.
-        let mut dsp = Dsp::new(2048, 48000.0, 1024, 512);
-        let sr = 48000.0_f32;
-        // Convergence rule of thumb: ~5τ at default 4 s tau, dt ≈ 21.33 ms → ~940 hops.
-        // Use 1500 hops for headroom.
-        for k in 0..1500 {
-            // Slow amplitude envelope across hops (~ one cycle per ~63 hops).
-            let amp = 0.5 + 0.3 * (k as f32 * 0.1).sin();
-            let signal: Vec<f32> = (0..2048)
-                .map(|i| {
-                    let t = i as f32 / sr;
-                    amp * (2.0 * std::f32::consts::PI * 1000.0 * t).sin()
-                })
-                .collect();
-            dsp.process(&signal);
-        }
-        let inst = dsp.rms_acf();
-        let accum = dsp.rms_acf_accum();
-        // After convergence, accum tracks inst. Tighter tolerance is fine because
-        // the EMA at 5τ has ~99% reached steady state.
-        for (i, (a, b)) in accum.iter().zip(inst.iter()).enumerate() {
-            assert!(
-                (a - b).abs() < 0.05,
-                "lag {}: accum {} should track inst {}",
-                i, a, b
-            );
-        }
-        // Sanity: at least *some* lag must be non-trivially non-zero — otherwise
-        // the test is vacuous again.
-        let max_abs = inst.iter().map(|v| v.abs()).fold(0.0_f32, f32::max);
-        assert!(max_abs > 0.01, "expected non-trivial ACF; max |inst| = {}", max_abs);
-    }
-
-    #[test]
-    fn process_pipeline_finds_periodic_peak_via_acf_peaks() {
-        // End-to-end integration test: drive process() with a known per-hop
-        // amplitude period, then verify acf_peaks()[0] reports that period as
-        // the dominant tempo lag. Catches integration bugs in process() that
-        // unit-tested individual stages would miss (e.g., pick_acf_peaks
-        // not called, called before EMA update, etc.).
-        let mut dsp = Dsp::new(2048, 48000.0, 1024, 512);
-        let sr = 48000.0_f32;
-        let period_hops = 32usize;
-        // 1500 hops covers both rms_history fill (512) and accumulator
-        // convergence at default tau=4s (~940 hops).
-        for k in 0..1500 {
-            // Sinusoidal envelope across hops with period `period_hops`.
-            // Add a constant offset of 0.6 so amplitude stays positive — RMS is
-            // |signal|-symmetric, so a zero-crossing envelope would create a
-            // doubled-frequency artifact.
-            let amp = 0.6 + 0.3 * (2.0 * std::f32::consts::PI * (k as f32) / (period_hops as f32)).sin();
-            let signal: Vec<f32> = (0..2048)
-                .map(|i| {
-                    let t = i as f32 / sr;
-                    amp * (2.0 * std::f32::consts::PI * 1000.0 * t).sin()
-                })
-                .collect();
-            dsp.process(&signal);
-        }
-        let peaks = dsp.acf_peaks();
-        let lag0 = peaks[0];
-        assert!(!lag0.is_nan(), "expected at least one peak after convergence");
-        assert!(
-            (lag0 - period_hops as f32).abs() < 1.0,
-            "expected peak near lag {}, got {}",
-            period_hops, lag0
-        );
-        // The peak's magnitude (ACF normalized to [0,1] roughly) should be
-        // meaningfully positive, not just barely above zero.
-        let mag0 = peaks[1];
-        assert!(mag0 > 0.1, "expected significant peak magnitude, got {}", mag0);
-    }
-
-    #[test]
-    fn tracker_holds_default_120_bpm_under_silence() {
-        // New pipeline: silence produces score_inst=0, so beat_grid and beat_state
-        // output NaN/0. The BeatTracker still holds its 120 BPM default internally
-        // (tested via test_observe_tracker), but the public outputs reflect "no fit".
-        let mut dsp = Dsp::new(2048, 48000.0, 1024, 512);
-        let silent = vec![0.0_f32; 2048];
-        for _ in 0..50 {
-            dsp.process(&silent);
-        }
-        let grid = dsp.beat_grid();
-        let state = dsp.beat_state();
-        assert_eq!(grid.len(), 3);
-        assert_eq!(state.len(), 4);
-        assert!(grid[0].is_nan(), "period should be NaN under silence (no fit), got {}", grid[0]);
-        assert!(state[0].is_nan(), "BPM should be NaN under silence (no fit), got {}", state[0]);
-        assert_eq!(state[1], 0.0, "score should be 0 under silence, got {}", state[1]);
-        assert!(state[2].is_nan(), "beats_per_measure deferred, got {}", state[2]);
-        assert!(state[3].is_nan(), "measure_conf deferred, got {}", state[3]);
-    }
-
-    #[test]
-    fn tracker_pulls_period_toward_nearby_observation() {
-        // Inject peaks at lags 24 and 48 (period 24 ≈ 117 BPM). Initial
-        // period is 23.44 (120 BPM at default sr/hop), so peak at 24 lies
-        // within the Gaussian tolerance and votes for T=24. Tracker should
-        // pull toward 24 over many frames.
-        // Note: large jumps (e.g. 23 → 32) are intentionally NOT supported
-        // without a wider σ — the tracker assumes tempo drifts smoothly.
-        let mut dsp = Dsp::new(2048, 48000.0, 1024, 512);
-        let initial = dsp.test_tracker_bpm_period();
-        for _ in 0..200 {
-            dsp.test_clear_acf_peaks();
-            dsp.test_set_acf_peak(0, 24.0, 1.0, 0.5);
-            dsp.test_set_acf_peak(1, 48.0, 0.8, 0.4);
-            dsp.test_observe_tracker();
-        }
-        let final_period = dsp.test_tracker_bpm_period();
-        assert!(
-            (final_period - 24.0).abs() < 0.3,
-            "tracker should converge near 24, started at {}, got {}",
-            initial, final_period
-        );
-    }
-
-    #[test]
-    fn tracker_holds_period_against_single_outlier_frame() {
-        // Lock onto period ≈ 24 with sustained input.
-        let mut dsp = Dsp::new(2048, 48000.0, 1024, 512);
-        for _ in 0..200 {
-            dsp.test_clear_acf_peaks();
-            dsp.test_set_acf_peak(0, 24.0, 1.0, 0.5);
-            dsp.test_set_acf_peak(1, 48.0, 0.8, 0.4);
-            dsp.test_observe_tracker();
-        }
-        let locked = dsp.test_tracker_bpm_period();
-        // Single noisy frame with a far-off peak that aligns badly to the
-        // current period — its alignment weight will be near-zero, so it
-        // shouldn't move the tracker.
-        dsp.test_clear_acf_peaks();
-        dsp.test_set_acf_peak(0, 50.0, 1.0, 0.5);
-        dsp.test_observe_tracker();
-        let after = dsp.test_tracker_bpm_period();
-        assert!(
-            (after - locked).abs() < 0.5,
-            "single far-off outlier shouldn't drag period: locked {} → {}",
-            locked, after
-        );
-    }
-
-    #[test]
-    fn tracker_picks_beats_per_measure_from_strongest_m_peak() {
-        // Drive period to ≈ 24, then provide peaks at 24, 48, and 96 with
-        // amplitudes biased toward 96 (the "measure" peak the user described).
-        // beats_per_measure should be 4 because m=4·24=96 has the strongest
-        // peak of any candidate target.
-        let mut dsp = Dsp::new(2048, 48000.0, 1024, 512);
-        for _ in 0..200 {
-            dsp.test_clear_acf_peaks();
-            dsp.test_set_acf_peak(0, 24.0, 0.6, 0.4);
-            dsp.test_set_acf_peak(1, 48.0, 0.7, 0.5);
-            dsp.test_set_acf_peak(2, 96.0, 1.0, 1.0); // strongest + sharpest
-            dsp.test_observe_tracker();
-        }
-        assert_eq!(
-            dsp.test_tracker_beats_per_measure(), 4,
-            "strongest peak at 4·period should yield beats_per_measure=4"
-        );
-    }
-
-    #[test]
-    fn tracker_switches_beats_per_measure_when_strongest_m_peak_changes() {
-        // First lock onto m=4 with a strong peak at 4·24=96.
-        let mut dsp = Dsp::new(2048, 48000.0, 1024, 512);
-        for _ in 0..200 {
-            dsp.test_clear_acf_peaks();
-            dsp.test_set_acf_peak(0, 24.0, 0.6, 0.4);
-            dsp.test_set_acf_peak(1, 48.0, 0.6, 0.4);
-            dsp.test_set_acf_peak(2, 96.0, 1.0, 1.0);
-            dsp.test_observe_tracker();
-        }
-        assert_eq!(dsp.test_tracker_beats_per_measure(), 4);
-        // Now move the strongest peak to 2·24=48 (and remove the 96 peak).
-        // Hysteresis (1.3× margin) requires the new winner to clearly beat
-        // current — sustained strong evidence at 48 should flip to m=2.
-        for _ in 0..200 {
-            dsp.test_clear_acf_peaks();
-            dsp.test_set_acf_peak(0, 24.0, 0.5, 0.3);
-            dsp.test_set_acf_peak(1, 48.0, 1.0, 1.0); // strong + sharp
-            dsp.test_observe_tracker();
-        }
-        assert_eq!(
-            dsp.test_tracker_beats_per_measure(), 2,
-            "sustained strongest peak at 2·period should switch to m=2"
-        );
     }
 
     #[test]
