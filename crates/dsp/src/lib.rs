@@ -538,6 +538,8 @@ impl Dsp {
         self.pick_candidates();
         self.score_candidates();
         self.update_tea();
+        self.write_beat_outputs();
+        self.update_beat_pulses_v2();
 
         autocorrelate(&self.waveform, &mut self.buffer_acf);
 
@@ -615,8 +617,6 @@ impl Dsp {
                 + (1.0 - self.accum_alpha) * self.rms_acf_accum[i];
         }
         self.pick_acf_peaks();
-        self.update_beat_state();
-        self.update_beat_pulses();
 
         let low_mean = (self.low_rms_history.iter().map(|&x| x as f64).sum::<f64>()
             / self.low_rms_history.len() as f64) as f32;
@@ -1069,6 +1069,55 @@ impl Dsp {
         self.tau_smoothed = tau;
         let (phi, _, _, _, _) = score_phase_for_tau(&self.onset_history, tau);
         self.phase_smoothed = phi as f32;
+    }
+
+    fn write_beat_outputs(&mut self) {
+        let p = self.tau_smoothed;
+        let phi = self.phase_smoothed;
+        let s = self.score_inst;
+        if p.is_nan() || s <= 0.0 {
+            self.beat_grid[0] = f32::NAN;
+            self.beat_grid[1] = f32::NAN;
+            self.beat_grid[2] = 0.0;
+            self.beat_state[0] = f32::NAN;
+            self.beat_state[1] = 0.0;
+            self.beat_state[2] = f32::NAN;
+            self.beat_state[3] = f32::NAN;
+        } else {
+            self.beat_grid[0]  = p;
+            self.beat_grid[1]  = phi;
+            self.beat_grid[2]  = s;
+            self.beat_state[0] = if p > 0.0 { 60.0 / (p * self.dt) } else { f32::NAN };
+            self.beat_state[1] = s;
+            self.beat_state[2] = f32::NAN; // beats_per_measure deferred
+            self.beat_state[3] = f32::NAN; // measure_conf deferred
+        }
+    }
+
+    // Simplified saw-wave generator. Phase is always real when there's a fit;
+    // NaN-out under silence/no-fit so the renderer holds last value.
+    fn update_beat_pulses_v2(&mut self) {
+        let period = self.tau_smoothed;
+        let phase = self.phase_smoothed;
+        let score = self.score_inst;
+        if period.is_nan() || period <= 0.0 || score <= 0.0 || phase.is_nan() {
+            for slot in self.beat_pulses.iter_mut() {
+                *slot = f32::NAN;
+            }
+            return;
+        }
+        // Anchor fractional part to phase/period so cycle-1 starts at phase=0.
+        let phase_frac = (phase / period).clamp(0.0, 0.999_999);
+        let prev = self.beat_position;
+        let mut bp = prev.floor() + phase_frac;
+        if bp < prev - 0.5 {
+            bp += 1.0;
+        }
+        self.beat_position = bp.rem_euclid(16.0);
+        for (i, &m) in BEAT_PULSE_CYCLES.iter().enumerate() {
+            let frac = (self.beat_position / m).fract();
+            self.beat_pulses[i] = 1.0 - frac;
+        }
     }
 }
 
@@ -2060,9 +2109,9 @@ mod tests {
 
     #[test]
     fn tracker_holds_default_120_bpm_under_silence() {
-        // With no peaks ever picked, tracker holds its initial state. Period
-        // and BPM stay at the 120 BPM defaults; phase is NaN (silent
-        // rms_history can't yield a phase). bpm_confidence stays at 0.
+        // New pipeline: silence produces score_inst=0, so beat_grid and beat_state
+        // output NaN/0. The BeatTracker still holds its 120 BPM default internally
+        // (tested via test_observe_tracker), but the public outputs reflect "no fit".
         let mut dsp = Dsp::new(2048, 48000.0, 1024, 512);
         let silent = vec![0.0_f32; 2048];
         for _ in 0..50 {
@@ -2072,11 +2121,11 @@ mod tests {
         let state = dsp.beat_state();
         assert_eq!(grid.len(), 3);
         assert_eq!(state.len(), 4);
-        assert!(!grid[0].is_nan(), "period should hold at default, not NaN");
-        assert!(grid[1].is_nan(), "phase should be NaN for silence");
-        assert!((state[0] - 120.0).abs() < 1.0, "BPM should hold near 120, got {}", state[0]);
-        assert_eq!(state[2] as u32, 4, "beats_per_measure should hold at 4");
-        assert!(state[1] < 0.05, "bpm_confidence should be ~0 under silence, got {}", state[1]);
+        assert!(grid[0].is_nan(), "period should be NaN under silence (no fit), got {}", grid[0]);
+        assert!(state[0].is_nan(), "BPM should be NaN under silence (no fit), got {}", state[0]);
+        assert_eq!(state[1], 0.0, "score should be 0 under silence, got {}", state[1]);
+        assert!(state[2].is_nan(), "beats_per_measure deferred, got {}", state[2]);
+        assert!(state[3].is_nan(), "measure_conf deferred, got {}", state[3]);
     }
 
     #[test]
@@ -2176,60 +2225,6 @@ mod tests {
     }
 
     #[test]
-    fn beat_grid_finds_phase_aligned_with_rms_peaks() {
-        // End-to-end: drive process() with a periodic envelope. The phase the
-        // worklet reports should be small — i.e., the fit decided there was a
-        // beat near the newest sample of the rms history. The exact phase
-        // depends on the envelope's place in its cycle at the moment we stop
-        // feeding the dsp, so we just verify the phase is sensible (in
-        // [0, period)) and that score is positive.
-        let mut dsp = Dsp::new(2048, 48000.0, 1024, 512);
-        let sr = 48000.0_f32;
-        let period_hops = 32usize;
-        for k in 0..1500 {
-            let amp = 0.6 + 0.3 * (2.0 * std::f32::consts::PI * (k as f32) / (period_hops as f32)).sin();
-            let signal: Vec<f32> = (0..2048)
-                .map(|i| {
-                    let t = i as f32 / sr;
-                    amp * (2.0 * std::f32::consts::PI * 1000.0 * t).sin()
-                })
-                .collect();
-            dsp.process(&signal);
-        }
-        let grid = dsp.beat_grid();
-        let period = grid[0];
-        let phase = grid[1];
-        let score = grid[2];
-        assert!(!period.is_nan(), "expected period fit");
-        assert!(!phase.is_nan(), "expected phase fit");
-        assert!(phase >= 0.0, "phase must be non-negative, got {}", phase);
-        assert!(phase < period, "phase {} must be < period {}", phase, period);
-        assert!(score > 0.0, "expected positive score, got {}", score);
-    }
-
-    #[test]
-    fn beat_pulses_free_run_at_default_rate_under_silence() {
-        // Tracker holds 120 BPM defaults under silence; phase is NaN so the
-        // pulse loop free-runs (advances by 1/period each frame). Pulses are
-        // valid 0..1 floats that change between frames, not NaN. The renderer
-        // can use beat_grid[2] (confidence) to dim/hide if desired.
-        let mut dsp = Dsp::new(2048, 48000.0, 1024, 512);
-        let silent = vec![0.0_f32; 2048];
-        for _ in 0..10 {
-            dsp.process(&silent);
-        }
-        let p_before = dsp.beat_pulses();
-        for &v in p_before.iter() {
-            assert!(!v.is_nan(), "free-run pulse should not be NaN, got {}", v);
-            assert!((0.0..=1.0).contains(&v));
-        }
-        dsp.process(&silent);
-        let p_after = dsp.beat_pulses();
-        // Cycle 1 should advance noticeably between frames at default ~23.4 lag period.
-        assert!((p_after[0] - p_before[0]).abs() > 1e-3, "cycle-1 should advance under free-run");
-    }
-
-    #[test]
     fn beat_pulses_advance_with_period_and_wrap() {
         // Drive a periodic envelope so beat fitting finds a stable period,
         // then verify all 4 pulse outputs are in [0, 1] and that the cycle-1
@@ -2276,10 +2271,10 @@ mod tests {
     #[test]
     fn beat_grid_end_to_end_via_process() {
         // End-to-end: drive process() with a periodic envelope and verify the
-        // beat grid lands on the period that pick_acf_peaks reports.
+        // beat grid lands on the correct period via the new P&T pipeline.
         let mut dsp = Dsp::new(2048, 48000.0, 1024, 512);
         let sr = 48000.0_f32;
-        let period_hops = 32usize;
+        let period_hops = 36usize;
         for k in 0..1500 {
             let amp = 0.6 + 0.3 * (2.0 * std::f32::consts::PI * (k as f32) / (period_hops as f32)).sin();
             let signal: Vec<f32> = (0..2048)
@@ -2539,5 +2534,46 @@ mod tests {
         assert!(alpha_low > alpha_default, "smaller tau ⇒ larger alpha");
         assert!(alpha_high < alpha_default, "larger tau ⇒ smaller alpha");
         assert!(!alpha_low.is_nan() && !alpha_high.is_nan());
+    }
+
+    #[test]
+    fn beat_grid_from_new_pipeline_locks_to_periodic_input() {
+        // End-to-end: periodic envelope at 36 hops should populate beat_grid[0]
+        // (period) ≈ 36, beat_state[0] (BPM) ≈ 78, and slots [2]/[3] of beat_state
+        // are NaN (measure detection deferred).
+        let mut dsp = Dsp::new(2048, 48000.0, 1024, 512);
+        let sr = 48000.0_f32;
+        let period_hops = 36usize;
+        for k in 0..1500 {
+            let amp = 0.6 + 0.3 * (2.0 * std::f32::consts::PI * (k as f32) / (period_hops as f32)).sin();
+            let signal: Vec<f32> = (0..2048)
+                .map(|i| amp * (2.0 * std::f32::consts::PI * 1000.0 * (i as f32 / sr)).sin())
+                .collect();
+            dsp.process(&signal);
+        }
+        let grid = dsp.beat_grid();
+        let state = dsp.beat_state();
+        assert!(!grid[0].is_nan(), "expected period fit");
+        assert!((grid[0] - period_hops as f32).abs() < 1.5,
+            "period: expected ~{}, got {}", period_hops, grid[0]);
+        let bpm_expected = 60.0 / (period_hops as f32 * (1024.0 / 48000.0));
+        assert!((state[0] - bpm_expected).abs() < 4.0,
+            "bpm: expected ~{:.1}, got {:.1}", bpm_expected, state[0]);
+        assert!(state[2].is_nan(), "beats_per_measure should be NaN, got {}", state[2]);
+        assert!(state[3].is_nan(), "measure_conf should be NaN, got {}", state[3]);
+    }
+
+    #[test]
+    fn beat_pulses_silent_input_all_nan() {
+        // New behavior under silence: score_inst=0 → all-NaN beat_pulses.
+        // (Replaces the old "free-run" behavior tested by the now-removed
+        // `beat_pulses_free_run_at_default_rate_under_silence`.)
+        let mut dsp = Dsp::new(2048, 48000.0, 1024, 512);
+        let silent = vec![0.0f32; 2048];
+        for _ in 0..50 { dsp.process(&silent); }
+        let pulses = dsp.beat_pulses();
+        for (i, &v) in pulses.iter().enumerate() {
+            assert!(v.is_nan(), "pulse[{}] expected NaN under silence, got {}", i, v);
+        }
     }
 }
