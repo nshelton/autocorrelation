@@ -18,16 +18,17 @@ export interface DebugFeatures {
   spectrum?: Float32Array;
   rms?: Float32Array;
   bufferAcf?: Float32Array;
-  rmsAcf?: Float32Array;
-  rmsAcfAccum?: Float32Array;
-  acfPeaks?: Float32Array;
+  onset?: Float32Array;
+  onsetAcf?: Float32Array;
+  onsetAcfEnhanced?: Float32Array;
+  tea?: Float32Array;
+  candidates?: Float32Array;
   beatGrid?: Float32Array;
   beatPulses?: Float32Array;
   beatState?: Float32Array;
   rmsLow?: Float32Array;
   rmsMid?: Float32Array;
   rmsHigh?: Float32Array;
-  rmsAcfLow?: Float32Array;
 }
 
 export interface DebugSizes {
@@ -35,8 +36,10 @@ export interface DebugSizes {
   spectrumLen: number;
   bufferAcfLen: number;
   rmsLen: number;
-  rmsAcfLen: number;
-  acfPeaksLen: number;
+  onsetLen: number;
+  onsetAcfLen: number;
+  teaLen: number;
+  candidatesLen: number;
   beatGridLen: number;
   beatPulsesLen: number;
   beatStateLen: number;
@@ -68,13 +71,14 @@ export class DebugView {
   private spectrumLine?: LineRenderer;
   private rmsLine?: LineRenderer;
   private bufferAcfLine?: LineRenderer;
-  private rmsAcfLine?: LineRenderer;
-  private rmsAcfAccumLine?: LineRenderer;
+  private onsetLine?: LineRenderer;
+  private onsetAcfLine?: LineRenderer;
+  private onsetAcfEnhancedLine?: LineRenderer;
+  private teaLine?: LineRenderer;
   private peakMarkers?: PeakMarkers;
   private lowRmsLine?: LineRenderer;
   private midRmsLine?: LineRenderer;
   private highRmsLine?: LineRenderer;
-  private lowRmsAcfLine?: LineRenderer;
   private beatDebug: BeatDebugView;
 
   // Per-channel running peak for the autogained RMS-history lines. See
@@ -97,10 +101,11 @@ export class DebugView {
     if (msg.waveform) store.set("waveform", msg.waveform);
     if (msg.spectrum) store.set("spectrum", msg.spectrum);
     if (msg.bufferAcf) store.set("bufferAcf", msg.bufferAcf);
-    if (msg.rmsAcf) store.set("rmsAcf", msg.rmsAcf);
-    if (msg.rmsAcfAccum) store.set("rmsAcfAccum", msg.rmsAcfAccum);
-    if (msg.acfPeaks) store.set("acfPeaks", msg.acfPeaks);
-    if (msg.rmsAcfLow) store.set("rmsAcfLow", msg.rmsAcfLow);
+    if (msg.onset) store.set("onset", msg.onset);
+    if (msg.onsetAcf) store.set("onsetAcf", msg.onsetAcf);
+    if (msg.onsetAcfEnhanced) store.set("onsetAcfEnhanced", msg.onsetAcfEnhanced);
+    if (msg.tea) store.set("tea", msg.tea);
+    if (msg.candidates) store.set("candidates", msg.candidates);
     if (msg.rms) {
       store.set("rms", msg.rms);
       this.applyAutoGain("rms", msg.rms);
@@ -129,9 +134,10 @@ export class DebugView {
       this.midRmsLine,
       this.highRmsLine,
       this.rmsLine,
-      this.lowRmsAcfLine,
-      this.rmsAcfLine,
-      this.rmsAcfAccumLine,
+      this.onsetLine,
+      this.onsetAcfLine,
+      this.onsetAcfEnhancedLine,
+      this.teaLine,
     ]) {
       line?.dispose();
     }
@@ -143,15 +149,16 @@ export class DebugView {
     store.set("spectrum", new Float32Array(sizes.spectrumLen));
     store.set("rms", new Float32Array(sizes.rmsLen));
     store.set("bufferAcf", new Float32Array(sizes.bufferAcfLen));
-    store.set("rmsAcf", new Float32Array(sizes.rmsAcfLen));
-    store.set("rmsAcfAccum", new Float32Array(sizes.rmsAcfLen));
-    const peaksInit = new Float32Array(sizes.acfPeaksLen);
-    peaksInit.fill(NaN);
-    store.set("acfPeaks", peaksInit);
+    store.set("onset", new Float32Array(sizes.onsetLen));
+    store.set("onsetAcf", new Float32Array(sizes.onsetAcfLen));
+    store.set("onsetAcfEnhanced", new Float32Array(sizes.onsetAcfLen));
+    store.set("tea", new Float32Array(sizes.teaLen));
+    const candidatesInit = new Float32Array(sizes.candidatesLen);
+    candidatesInit.fill(NaN);
+    store.set("candidates", candidatesInit);
     store.set("rmsLow", new Float32Array(sizes.rmsLen));
     store.set("rmsMid", new Float32Array(sizes.rmsLen));
     store.set("rmsHigh", new Float32Array(sizes.rmsLen));
-    store.set("rmsAcfLow", new Float32Array(sizes.rmsAcfLen));
     // Parallel autogained buffers — `applyAutoGain` writes here on each
     // features message, line renderers read from here. Reset runningMax so
     // the next features message seeds from its full incoming buffer (no slow
@@ -211,31 +218,38 @@ export class DebugView {
     });
     scene.add(this.rmsLine.object3d);
 
-    this.lowRmsAcfLine = new LineRenderer({
-      source: () => store.get("rmsAcfLow"),
-      layout: linearLayout(-1.0, 0.4),
-      color: 0xbb8888,
+    this.onsetLine = new LineRenderer({
+      source: () => store.get("onset"),
+      layout: linearLayout(0.0, 0.4),
+      color: 0xff9966,
     });
-    scene.add(this.lowRmsAcfLine.object3d);
+    scene.add(this.onsetLine.object3d);
 
-    this.rmsAcfLine = new LineRenderer({
-      source: () => store.get("rmsAcf"),
-      layout: linearLayout(-1.0, 0.4),
-      color: 0x666666,
-    });
-    scene.add(this.rmsAcfLine.object3d);
-
-    this.rmsAcfAccumLine = new LineRenderer({
-      source: () => store.get("rmsAcfAccum"),
+    this.onsetAcfLine = new LineRenderer({
+      source: () => store.get("onsetAcf"),
       layout: linearLayout(-1.0, 0.4),
       color: 0x66ffff,
     });
-    scene.add(this.rmsAcfAccumLine.object3d);
+    scene.add(this.onsetAcfLine.object3d);
+
+    this.onsetAcfEnhancedLine = new LineRenderer({
+      source: () => store.get("onsetAcfEnhanced"),
+      layout: linearLayout(-1.0, 0.4),
+      color: 0xff99cc,
+    });
+    scene.add(this.onsetAcfEnhancedLine.object3d);
+
+    this.teaLine = new LineRenderer({
+      source: () => store.get("tea"),
+      layout: linearLayout(-1.0, 0.4),
+      color: 0xffff66,
+    });
+    scene.add(this.teaLine.object3d);
 
     this.peakMarkers = new PeakMarkers({
-      source: () => store.get("acfPeaks"),
+      source: () => store.get("candidates"),
       maxPeaks: 10,
-      lagDomain: sizes.rmsAcfLen,
+      lagDomain: sizes.onsetAcfLen,
       yCenter: -1.0,
       ySpan: 0.4,
       // Mirrors linearLayout's x-formula. If you change one, change the other —
@@ -246,7 +260,13 @@ export class DebugView {
     });
     scene.add(this.peakMarkers.object3d);
 
-    this.beatDebug.applyConfigured(sizes);
+    this.beatDebug.applyConfigured({
+      rmsLen: sizes.rmsLen,
+      rmsAcfLen: sizes.onsetAcfLen,
+      beatGridLen: sizes.beatGridLen,
+      beatPulsesLen: sizes.beatPulsesLen,
+      beatStateLen: sizes.beatStateLen,
+    });
   }
 
   update(): void {
@@ -257,9 +277,10 @@ export class DebugView {
     this.midRmsLine?.update();
     this.highRmsLine?.update();
     this.rmsLine?.update();
-    this.lowRmsAcfLine?.update();
-    this.rmsAcfLine?.update();
-    this.rmsAcfAccumLine?.update();
+    this.onsetLine?.update();
+    this.onsetAcfLine?.update();
+    this.onsetAcfEnhancedLine?.update();
+    this.teaLine?.update();
     this.peakMarkers?.update();
     this.beatDebug.update();
   }
@@ -273,9 +294,10 @@ export class DebugView {
       this.midRmsLine,
       this.highRmsLine,
       this.rmsLine,
-      this.lowRmsAcfLine,
-      this.rmsAcfLine,
-      this.rmsAcfAccumLine,
+      this.onsetLine,
+      this.onsetAcfLine,
+      this.onsetAcfEnhancedLine,
+      this.teaLine,
     ]) {
       line?.dispose();
     }
