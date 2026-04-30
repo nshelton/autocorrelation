@@ -13,8 +13,10 @@ Tracks features that are agreed-on but deferred. Each entry is a candidate for a
 2. preset controller, each module with its parameter set can have a bank of presets
 
 ## Beatdetector improvements
-3. generate a sawtooth wave -assume 4 beats ? assume we got the measure ? 
-4. onset detection for down beat - this is hard
+1. Spectral flux OSS (replace the half-wave-rectified RMS-diff proxy with the paper's per-bin log-magnitude flux)
+2. Octave decider (paper §II-C step 4) — heuristic or simple ML to multiply/halve the reported tempo
+3. `beats_per_measure` detection (deferred from rewrite)
+4. Onset / downbeat detection (which `k·τ` of the beat grid is the bar boundary)
 
 ## modules
 1. camera
@@ -43,7 +45,6 @@ then add little cubes for highs
 - Trace the "Multiple instances of Three.js" warning that still appears in dev despite `resolve.dedupe`
 
 ### Performance
-- Migrate autocorrelation to FFT-based (Wiener–Khinchin: ACF = IFFT(|FFT(x)|²)) once the v3 direct implementation has proven the visualization is correct. O(N log N) vs O(N²); reuses the existing realfft planner. Folds the RMS-ACF onto the same code path.
 
 ### Visual
 - Particle system + post-processing (driven by spectrum / RMS / autocorrelation features)
@@ -55,6 +56,7 @@ then add little cubes for highs
 
 ## Shipped
 
+- **v3.3** (tag pending): beat tracker rewrite to streaming Percival & Tzanetakis 2014 — half-wave-rectified RMS as OSS, generalized FFT ACF (`|X|^0.5`), harmonic enhancement, top-10 peak picking, pulse-train scoring, Gaussian-smeared TEA. Fixes the octave-ambiguity bug in the old `lag/k` tracker. New `dsp.teaTauSecs` param replaces `dsp.accumTauSecs`. New visualization channels: `onset`, `onsetAcf`, `onsetAcfEnhanced`, `tea`. Old `rms_acf` / `rms_acf_accum` / `low_rms_acf` removed.
 - **v3.2** (tag pending): rms_acf decaying EMA accumulator + top-10 sub-bin tempo peak picking with PeakMarkers visualization; new `dsp.accumTauSecs` analysis param
 - **v3.1** (tag `v3.1.0`): runtime-tunable analysis parameters via ParamStore + tweakpane (window size, RMS history length, hop size, smoothing τ, dB floor); persisted to localStorage; live worklet reconfiguration with dispose+rebuild of LineRenderers; FPS overlay moved to top-left
 - **v3** (tag `v3.0.0`): buffer autocorrelation + RMS-envelope autocorrelation (with mean-subtracted detrending) as two new line strips; two new camera presets (keys 5 and 6); five-line vertical layout
