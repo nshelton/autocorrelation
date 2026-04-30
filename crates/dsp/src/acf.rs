@@ -92,3 +92,44 @@ pub fn bin_for_hz(hz: f32, sample_rate: f32, n: usize) -> usize {
     let bin = (hz * n as f32 / sample_rate).round() as usize;
     bin.clamp(1, n / 2 - 1)
 }
+
+pub struct AcfState {
+    fft_forward: Arc<dyn RealToComplex<f32>>,
+    fft_inverse: Arc<dyn ComplexToReal<f32>>,
+    time_buf: Vec<f32>,
+    freq_buf: Vec<Complex<f32>>,
+}
+
+impl AcfState {
+    pub fn new(rms_history_len: usize) -> Self {
+        let n = rms_history_len;
+        let mut planner = realfft::RealFftPlanner::<f32>::new();
+        let fft_forward = planner.plan_fft_forward(2 * n);
+        let fft_inverse = planner.plan_fft_inverse(2 * n);
+        Self {
+            fft_forward,
+            fft_inverse,
+            time_buf: vec![0.0; 2 * n],
+            freq_buf: vec![Complex::new(0.0, 0.0); n + 1],
+        }
+    }
+
+    /// Run gen-ACF on `onset` → write `onset_acf`, then harmonic-enhance →
+    /// write `onset_acf_enhanced`.
+    pub fn process(
+        &mut self,
+        onset: &[f32],
+        onset_acf: &mut [f32],
+        onset_acf_enhanced: &mut [f32],
+    ) {
+        compute_gen_acf(
+            onset,
+            onset_acf,
+            &self.fft_forward,
+            &self.fft_inverse,
+            &mut self.time_buf,
+            &mut self.freq_buf,
+        );
+        compute_harmonic_enhanced(onset_acf, onset_acf_enhanced);
+    }
+}

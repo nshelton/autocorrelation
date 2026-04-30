@@ -1,6 +1,3 @@
-use realfft::num_complex::Complex;
-use realfft::{ComplexToReal, RealFftPlanner, RealToComplex};
-use std::sync::Arc;
 use wasm_bindgen::prelude::*;
 
 mod buffers;
@@ -8,6 +5,7 @@ mod spectrum;
 mod acf;
 mod beat;
 
+use crate::acf::AcfState;
 use crate::buffers::Buffers;
 use crate::spectrum::SpectrumState;
 
@@ -56,10 +54,7 @@ pub struct Dsp {
     /// current beat we are" (0 = on beat, →1 just before next). Wraps mod 16
     /// (= LCM of BEAT_PULSE_CYCLES) to bound f32 precision over long runs.
     beat_position: f32,
-    gen_acf_fft_forward: Arc<dyn RealToComplex<f32>>,
-    gen_acf_fft_inverse: Arc<dyn ComplexToReal<f32>>,
-    gen_acf_time_buf: Vec<f32>,
-    gen_acf_freq_buf: Vec<Complex<f32>>,
+    acf: AcfState,
     cand_scratch: Vec<(usize, f32)>, // preallocated scratch for picker
     tau_min: usize,
     tau_max: usize,
@@ -98,14 +93,8 @@ impl Dsp {
         hop_size: usize,
         rms_history_len: usize,
     ) -> Dsp {
-        let mut planner = RealFftPlanner::<f32>::new();
         let dt = hop_size as f32 / sample_rate;
         let tea_alpha = 1.0 - (-dt / TEA_TAU_DEFAULT_SECS).exp();
-        let gen_acf_n = rms_history_len;
-        let gen_acf_fft_forward = planner.plan_fft_forward(2 * gen_acf_n);
-        let gen_acf_fft_inverse = planner.plan_fft_inverse(2 * gen_acf_n);
-        let gen_acf_time_buf = vec![0.0; 2 * gen_acf_n];
-        let gen_acf_freq_buf = vec![Complex::new(0.0, 0.0); gen_acf_n + 1];
         let onset_acf_len = rms_history_len / 2;
         let tau_min = ((60.0 / BEAT_TRACKER_MAX_BPM) / dt).floor().max(1.0) as usize;
         let tau_max_unbounded = ((60.0 / BEAT_TRACKER_MIN_BPM) / dt).ceil() as usize;
@@ -116,10 +105,7 @@ impl Dsp {
             db_floor: -100.0,
             dt,
             beat_position: 0.0,
-            gen_acf_fft_forward,
-            gen_acf_fft_inverse,
-            gen_acf_time_buf,
-            gen_acf_freq_buf,
+            acf: AcfState::new(rms_history_len),
             cand_scratch: Vec::with_capacity(onset_acf_len / 2 + 1),
             tau_min,
             tau_max,
@@ -176,15 +162,11 @@ impl Dsp {
         push_history(&mut self.buffers.rmsHigh, high_rms);
         push_history(&mut self.buffers.onset, flux);
 
-        crate::acf::compute_gen_acf(
+        self.acf.process(
             &self.buffers.onset,
             &mut self.buffers.onsetAcf,
-            &self.gen_acf_fft_forward,
-            &self.gen_acf_fft_inverse,
-            &mut self.gen_acf_time_buf,
-            &mut self.gen_acf_freq_buf,
+            &mut self.buffers.onsetAcfEnhanced,
         );
-        crate::acf::compute_harmonic_enhanced(&self.buffers.onsetAcf, &mut self.buffers.onsetAcfEnhanced);
         self.pick_candidates();
         self.score_candidates();
         self.update_tea();
@@ -485,16 +467,11 @@ impl Dsp {
     }
 
     pub fn test_run_pick_and_score(&mut self) {
-        // Recompute enhanced ACF from current onset_history, then pick & score.
-        crate::acf::compute_gen_acf(
+        self.acf.process(
             &self.buffers.onset,
             &mut self.buffers.onsetAcf,
-            &self.gen_acf_fft_forward,
-            &self.gen_acf_fft_inverse,
-            &mut self.gen_acf_time_buf,
-            &mut self.gen_acf_freq_buf,
+            &mut self.buffers.onsetAcfEnhanced,
         );
-        crate::acf::compute_harmonic_enhanced(&self.buffers.onsetAcf, &mut self.buffers.onsetAcfEnhanced);
         self.pick_candidates();
         self.score_candidates();
     }
