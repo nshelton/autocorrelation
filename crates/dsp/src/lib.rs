@@ -83,6 +83,10 @@ const BEAT_PULSES_LEN: usize = 4;
 /// Tzanetakis 2014 §II-B.3: [2, 4] are the two factors that reliably reinforce
 /// the fundamental without introducing sub-octave artifacts.
 const HARMONIC_MULTIPLES: [usize; 2] = [2, 4];
+/// Number of pulses per train in `score_phase_for_tau`. The paper recommends
+/// enough pulses to span the onset_history window; 4 covers ~4 beats at the
+/// slowest tracked tempo (40 BPM) without wasting work at fast tempos.
+const PULSE_N: usize = 4;
 
 /// State estimator for tempo and meter. Consumes the picked `acf_peaks` (with
 /// magnitude and sharpness) each frame and updates four state values:
@@ -341,6 +345,22 @@ pub struct Dsp {
     cand_scratch: Vec<(usize, f32)>,        // preallocated scratch for picker
     tau_min: usize,
     tau_max: usize,
+    /// Per-candidate max-φ correlation from `score_phase_for_tau` (X in the paper).
+    pulse_x: [f32; MAX_PEAKS],
+    /// Per-candidate variance-of-φ correlation — high variance means the pulse
+    /// train picks out clear beats; low variance means all phases score equally
+    /// (no tempo structure at this lag).
+    pulse_v: [f32; MAX_PEAKS],
+    /// Best (integer) phase offset for each candidate, in hop units.
+    pulse_phi: [f32; MAX_PEAKS],
+    /// Combined normalized score (`X_norm + V_norm`) for each candidate.
+    pulse_score: [f32; MAX_PEAKS],
+    /// Per-frame winning period (in lag units). NaN until `score_candidates` finds a winner.
+    period_inst: f32,
+    /// Per-frame winning phase offset (integer hops). NaN until `score_candidates` finds a winner.
+    phase_inst: f32,
+    /// Per-frame combined score of the winner. 0 when no candidate wins.
+    score_inst: f32,
 }
 
 #[wasm_bindgen]
@@ -420,6 +440,13 @@ impl Dsp {
             cand_scratch: Vec::with_capacity(onset_acf_len / 2 + 1),
             tau_min,
             tau_max,
+            pulse_x:     [0.0; MAX_PEAKS],
+            pulse_v:     [0.0; MAX_PEAKS],
+            pulse_phi:   [0.0; MAX_PEAKS],
+            pulse_score: [0.0; MAX_PEAKS],
+            period_inst: f32::NAN,
+            phase_inst:  f32::NAN,
+            score_inst:  0.0,
         }
     }
 
@@ -911,6 +938,53 @@ impl Dsp {
             self.candidates[3 * i + 2] = -denom;  // sharpness — large for narrow peaks
         }
     }
+
+    /// Score every candidate's pulse train, normalize X (max-φ corr) and V
+    /// (var-φ corr) so each sums to 1 across candidates, pick winner with
+    /// `score = X_norm + V_norm`. Writes per-frame outputs into
+    /// `period_inst`, `phase_inst`, `score_inst`. Silent / no-candidate
+    /// frames yield `(NaN, NaN, 0.0)`.
+    fn score_candidates(&mut self) {
+        let mut count = 0usize;
+        for i in 0..MAX_PEAKS {
+            let lag = self.candidates[3 * i];
+            if lag.is_nan() { break; }
+            let (phi, x, sum, sum_sq, n_phi) = score_phase_for_tau(&self.onset_history, lag);
+            let n = n_phi as f32;
+            let mean = if n > 0.0 { sum / n } else { 0.0 };
+            let var = if n > 0.0 { (sum_sq / n - mean * mean).max(0.0) } else { 0.0 };
+            self.pulse_x[i]   = x;
+            self.pulse_v[i]   = var;
+            self.pulse_phi[i] = phi as f32;
+            count += 1;
+        }
+        if count == 0 {
+            self.period_inst = f32::NAN;
+            self.phase_inst  = f32::NAN;
+            self.score_inst  = 0.0;
+            return;
+        }
+        let sum_x: f32 = self.pulse_x[..count].iter().sum();
+        let sum_v: f32 = self.pulse_v[..count].iter().sum();
+        let mut best_i = 0usize;
+        let mut best_score = -1.0f32;
+        for i in 0..count {
+            let xn = if sum_x > 0.0 { self.pulse_x[i] / sum_x } else { 0.0 };
+            let vn = if sum_v > 0.0 { self.pulse_v[i] / sum_v } else { 0.0 };
+            let s = xn + vn;
+            self.pulse_score[i] = s;
+            if s > best_score { best_score = s; best_i = i; }
+        }
+        if best_score <= 0.0 {
+            self.period_inst = f32::NAN;
+            self.phase_inst  = f32::NAN;
+            self.score_inst  = 0.0;
+        } else {
+            self.period_inst = self.candidates[3 * best_i];
+            self.phase_inst  = self.pulse_phi[best_i];
+            self.score_inst  = best_score;
+        }
+    }
 }
 
 /// Generalized autocorrelation per Percival & Tzanetakis 2014 §II-B.2:
@@ -953,6 +1027,64 @@ fn compute_gen_acf(
     for i in 0..output.len() {
         output[i] = time_buf[i] / zero;
     }
+}
+
+/// Score one tempo lag `tau` against the OSS by sweeping integer phases
+/// `phi ∈ [0, ceil(tau))`. Returns `(best_phi, best_corr, sum_corr,
+/// sum_corr_sq, n_phases)`. Pulse-train is the paper's combined
+/// `Φ₁ (w=1.0) + Φ₂ (w=0.5) + Φ₁.₅ (w=0.5)` with N=4 pulses each. Pulses
+/// are placed *backward* from the most-recent onset sample so `phi = 0`
+/// means "a beat just landed". Out-of-frame pulses are omitted, per the
+/// paper's "if an index falls outside the OSS frame, that pulse is omitted".
+fn score_phase_for_tau(onset: &[f32], tau: f32) -> (usize, f32, f32, f32, usize) {
+    let n = onset.len();
+    if n == 0 || tau < 1.0 {
+        return (0, 0.0, 0.0, 0.0, 0);
+    }
+    let last = (n - 1) as i32;
+    let phi_max = (tau.ceil() as usize).max(1);
+
+    let mut best_phi = 0usize;
+    let mut best_corr = -1.0f32;
+    let mut sum = 0.0f32;
+    let mut sum_sq = 0.0f32;
+
+    for phi in 0..phi_max {
+        let mut corr = 0.0f32;
+        // Φ₁ at k·τ, weight 1.0
+        for k in 0..PULSE_N {
+            let off = (k as f32 * tau).round() as i32;
+            let pos = last - phi as i32 - off;
+            if pos >= 0 && (pos as usize) < n {
+                corr += onset[pos as usize];
+            }
+        }
+        // Φ₂ at k·2τ, weight 0.5
+        for k in 0..PULSE_N {
+            let off = (k as f32 * 2.0 * tau).round() as i32;
+            let pos = last - phi as i32 - off;
+            if pos >= 0 && (pos as usize) < n {
+                corr += 0.5 * onset[pos as usize];
+            }
+        }
+        // Φ₁.₅ at (k+0.5)·τ, weight 0.5
+        for k in 0..PULSE_N {
+            let off = ((k as f32 + 0.5) * tau).round() as i32;
+            let pos = last - phi as i32 - off;
+            if pos >= 0 && (pos as usize) < n {
+                corr += 0.5 * onset[pos as usize];
+            }
+        }
+
+        sum += corr;
+        sum_sq += corr * corr;
+        if corr > best_corr {
+            best_corr = corr;
+            best_phi = phi;
+        }
+    }
+
+    (best_phi, best_corr.max(0.0), sum, sum_sq, phi_max)
 }
 
 /// Per Percival & Tzanetakis 2014 §II-B.3: boost peaks corresponding to
@@ -1063,6 +1195,37 @@ impl Dsp {
 
     pub fn test_run_pick_candidates(&mut self) {
         self.pick_candidates();
+    }
+
+    pub fn onset_history_len(&self) -> usize {
+        self.onset_history.len()
+    }
+
+    pub fn test_set_onset_history(&mut self, src: &[f32]) {
+        let n = self.onset_history.len().min(src.len());
+        self.onset_history[..n].copy_from_slice(&src[..n]);
+        if n < self.onset_history.len() {
+            for v in &mut self.onset_history[n..] { *v = 0.0; }
+        }
+    }
+
+    pub fn test_run_pick_and_score(&mut self) {
+        // Recompute enhanced ACF from current onset_history, then pick & score.
+        compute_gen_acf(
+            &self.onset_history,
+            &mut self.onset_acf,
+            &self.gen_acf_fft_forward,
+            &self.gen_acf_fft_inverse,
+            &mut self.gen_acf_time_buf,
+            &mut self.gen_acf_freq_buf,
+        );
+        compute_harmonic_enhanced(&self.onset_acf, &mut self.onset_acf_enhanced);
+        self.pick_candidates();
+        self.score_candidates();
+    }
+
+    pub fn test_per_frame_estimate(&self) -> (f32, f32, f32) {
+        (self.period_inst, self.phase_inst, self.score_inst)
     }
 
 }
@@ -2178,5 +2341,53 @@ mod tests {
                     "picked lag {} outside [12, 70]", lag);
             }
         }
+    }
+
+    #[test]
+    fn pulse_score_finds_period_in_synthetic_oss() {
+        // Synthetic onset_history: pulses at every 36 samples (lag 36 ≈ 78 BPM
+        // at default sr/hop, well inside [40, 220]). Period 36 is chosen so
+        // 2×36=72 > tau_max≈70, meaning the double-period candidate never
+        // enters the running and the scorer must pick the true period directly.
+        let mut dsp = Dsp::new(2048, 48000.0, 1024, 512);
+        let n = dsp.onset_history_len();
+        let mut onset = vec![0.0f32; n];
+        let period = 36usize;
+        let mut idx = period;
+        while idx < n {
+            onset[idx] = 1.0;
+            idx += period;
+        }
+        dsp.test_set_onset_history(&onset);
+        dsp.test_run_pick_and_score();
+        let (period_inst, phase_inst, score_inst) = dsp.test_per_frame_estimate();
+        assert!(score_inst > 0.0, "expected nonzero score, got {}", score_inst);
+        assert!((period_inst - period as f32).abs() < 1.5,
+            "expected period ≈ {}, got {}", period, period_inst);
+        assert!(phase_inst >= 0.0 && phase_inst < period_inst,
+            "phase {} should be in [0, period={})", phase_inst, period_inst);
+    }
+
+    #[test]
+    fn pulse_score_disambiguates_octave() {
+        // Regression test for sub-period rejection. Onsets only at multiples of
+        // P=36. Pulse-train at τ=36 lands all 4 Φ₁ pulses on real onsets;
+        // pulse-train at τ=12 (P/3) lands only every 3rd pulse on a real onset
+        // (the Φ₁ positions at k·12 hit real onsets only when k≡0 mod 3).
+        // Score must prefer 36 over any sub-period candidate.
+        // Period 36 chosen so 2×36=72 > tau_max≈70, keeping the double-period
+        // candidate out of range and making this a clean sub-period test.
+        let mut dsp = Dsp::new(2048, 48000.0, 1024, 512);
+        let n = dsp.onset_history_len();
+        let mut onset = vec![0.0f32; n];
+        for k in 1..(n / 36 + 1) {
+            let i = k * 36;
+            if i < n { onset[i] = 1.0; }
+        }
+        dsp.test_set_onset_history(&onset);
+        dsp.test_run_pick_and_score();
+        let (period_inst, _, _) = dsp.test_per_frame_estimate();
+        assert!((period_inst - 36.0).abs() < 1.5,
+            "sub-period disambiguation failed: expected 36, got {}", period_inst);
     }
 }
