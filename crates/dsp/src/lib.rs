@@ -9,6 +9,7 @@ mod acf;
 mod beat;
 
 use crate::buffers::Buffers;
+use crate::spectrum::SpectrumState;
 
 /// Spectrum smoothing time constant in seconds. Chosen to preserve the
 /// legacy alpha ≈ 0.2 behavior at sr=48000, hop=1024:
@@ -56,38 +57,11 @@ const TEA_TAU_DEFAULT_SECS: f32 = 4.0;
 #[wasm_bindgen]
 pub struct Dsp {
     buffers: Buffers,
-    fft: Arc<dyn RealToComplex<f32>>,
-    fft_buffer: Vec<f32>,
-    freq_buffer: Vec<Complex<f32>>,
-    hann: Vec<f32>,
-    /// Magnitude scale factor that converts raw FFT bin magnitude to
-    /// amplitude-equivalent units (so a unit-amplitude sine peaks at ~1.0).
-    /// Equals 2/sum(hann) — the 2 accounts for the one-sided real spectrum,
-    /// and sum(hann) ≈ N/2 corrects for window attenuation.
-    mag_scale: f32,
+    spectrum: SpectrumState,
     db_floor: f32,
-    /// Previous frame's per-bin magnitudes, in the same units as the spectrum
-    /// loop's `mag` (i.e. already scaled by `mag_scale`). Length = spectrum.len().
-    /// Used to compute spectral-flux OSS as Σ max(0, |X[k]| - prev_mag[k]).
-    prev_mag: Vec<f32>,
-    /// Per-process-call EMA coefficient for the spectrum. Computed from
-    /// `SMOOTHING_TAU_SECS` and the wall-clock dt between hops
-    /// (`hop_size / sample_rate`), so changing `hop_size` does NOT change
-    /// perceived smoothing dynamics.
-    smoothing_alpha: f32,
     /// dt = hop_size / sample_rate, captured at construction. Used by
     /// `set_smoothing_tau` to recompute `smoothing_alpha`.
     dt: f32,
-    /// Inclusive last bin index of the low band. Low band = bins 1..=low_band_bin_end.
-    /// Bin 0 (DC) is always skipped.
-    low_band_bin_end: usize,
-    /// Inclusive last bin index of the mid band. Mid = (low_end+1)..=mid_band_bin_end.
-    /// High = (mid_end+1)..=N/2-1 (Nyquist excluded).
-    mid_band_bin_end: usize,
-    /// Parseval scale: converts Σ|X[k]|² over a band → band RMS² in time-domain
-    /// units. Equals 2 / (N · Σ hann²). The 2 accounts for the one-sided real
-    /// spectrum; Σ hann² is the window's energy correction.
-    parseval_band_scale: f32,
     /// Continuously-incrementing fractional beat counter. The integer part
     /// counts beats since startup; the fractional part is "how far into the
     /// current beat we are" (0 = on beat, →1 just before next). Wraps mod 16
@@ -136,22 +110,7 @@ impl Dsp {
         rms_history_len: usize,
     ) -> Dsp {
         let mut planner = RealFftPlanner::<f32>::new();
-        let fft = planner.plan_fft_forward(window_size);
-        let freq_buffer = fft.make_output_vec();
-        let spectrum_len = freq_buffer.len() - 1; // drop DC
-        let hann: Vec<f32> = (0..window_size)
-            .map(|i| {
-                0.5 - 0.5
-                    * (2.0 * std::f32::consts::PI * i as f32 / (window_size as f32 - 1.0)).cos()
-            })
-            .collect();
-        let mag_scale = 2.0 / hann.iter().sum::<f32>();
         let dt = hop_size as f32 / sample_rate;
-        let smoothing_alpha = 1.0 - (-dt / SMOOTHING_TAU_SECS).exp();
-        let low_band_bin_end = crate::acf::bin_for_hz(LOW_BAND_HZ_MAX, sample_rate, window_size);
-        let mid_band_bin_end = crate::acf::bin_for_hz(MID_BAND_HZ_MAX, sample_rate, window_size);
-        let hann_energy: f32 = hann.iter().map(|h| h * h).sum();
-        let parseval_band_scale = 2.0 / (window_size as f32 * hann_energy);
         let tea_alpha = 1.0 - (-dt / TEA_TAU_DEFAULT_SECS).exp();
         let gen_acf_n = rms_history_len;
         let gen_acf_fft_forward = planner.plan_fft_forward(2 * gen_acf_n);
@@ -164,18 +123,9 @@ impl Dsp {
         let tau_max = tau_max_unbounded.min(onset_acf_len.saturating_sub(2));
         Dsp {
             buffers: Buffers::new(window_size, rms_history_len),
-            fft,
-            fft_buffer: vec![0.0; window_size],
-            freq_buffer,
-            hann,
-            mag_scale,
+            spectrum: SpectrumState::new(window_size, sample_rate, dt),
             db_floor: -100.0,
-            prev_mag: vec![0.0; spectrum_len],
-            smoothing_alpha,
             dt,
-            low_band_bin_end,
-            mid_band_bin_end,
-            parseval_band_scale,
             beat_position: 0.0,
             gen_acf_fft_forward,
             gen_acf_fft_inverse,
@@ -203,8 +153,7 @@ impl Dsp {
     /// response. Clamped to [0.001, 10.0] to avoid divide-by-zero and
     /// nonsensical multi-second settling times.
     pub fn set_smoothing_tau(&mut self, tau_secs: f32) {
-        let tau = tau_secs.clamp(0.001, 10.0);
-        self.smoothing_alpha = 1.0 - (-self.dt / tau).exp();
+        self.spectrum.set_smoothing_tau(tau_secs, self.dt);
     }
 
     /// EMA time constant for the TEA. `alpha = 1 - exp(-dt / tau)`. Smaller
@@ -228,72 +177,15 @@ impl Dsp {
 
         push_history(&mut self.buffers.rms, rms);
 
-        // Apply Hann window
-        for i in 0..n {
-            self.fft_buffer[i] = input[i] * self.hann[i];
-        }
-        // Zero-pad if input shorter than window
-        for i in n..self.fft_buffer.len() {
-            self.fft_buffer[i] = 0.0;
-        }
-
-        // Forward real FFT
-        let _ = self
-            .fft
-            .process(&mut self.fft_buffer, &mut self.freq_buffer);
-
-        // Spectral-flux onset signal + spectrum smoothing in one pass over
-        // bins 1..=N/2 (DC excluded, Nyquist included). SF = Σ max(0, |X[k]| - prev_mag[k]):
-        // half-wave-rectified per-bin magnitude rise. Standard OSS for beat
-        // tracking (Ellis 2007, Percival & Tzanetakis 2014). Frequency-aware
-        // where RMS-diff is not — a snare hit dumps energy into mid/high bins
-        // that weren't there last frame even when total RMS barely moves.
-        let mut flux = 0.0f32;
-        for (out_i, bin) in self.freq_buffer[1..=self.buffers.spectrum.len()].iter().enumerate() {
-            let mag = (bin.re * bin.re + bin.im * bin.im).sqrt() * self.mag_scale;
-            flux += (mag - self.prev_mag[out_i]).max(0.0);
-            self.prev_mag[out_i] = mag;
-
-            let db = if mag > 0.0 {
-                20.0 * mag.log10()
-            } else {
-                self.db_floor
-            };
-            let clipped = db.clamp(self.db_floor, 0.0);
-            let normalized = (clipped - self.db_floor) / (-self.db_floor); // [0, 1]
-            self.buffers.spectrum[out_i] = self.smoothing_alpha * normalized
-                + (1.0 - self.smoothing_alpha) * self.buffers.spectrum[out_i];
-        }
-
-        push_history(&mut self.buffers.onset, flux);
-
-        // --- Per-band RMS via Parseval-correct FFT-bin energy summation. ---
-        // band_rms = sqrt(parseval_band_scale · Σ|X[k]|² over band).
-        // Bands cover bins 1..=low_end, low_end+1..=mid_end, mid_end+1..=N/2-1.
-        // (DC at bin 0 and Nyquist at bin N/2 are excluded by design.)
-        let nyquist_bin = self.freq_buffer.len() - 1; // N/2
-        let mut low_e = 0.0f32;
-        for k in 1..=self.low_band_bin_end {
-            let c = self.freq_buffer[k];
-            low_e += c.re * c.re + c.im * c.im;
-        }
-        let mut mid_e = 0.0f32;
-        for k in (self.low_band_bin_end + 1)..=self.mid_band_bin_end {
-            let c = self.freq_buffer[k];
-            mid_e += c.re * c.re + c.im * c.im;
-        }
-        let mut high_e = 0.0f32;
-        for k in (self.mid_band_bin_end + 1)..nyquist_bin {
-            let c = self.freq_buffer[k];
-            high_e += c.re * c.re + c.im * c.im;
-        }
-        let low_rms = (low_e * self.parseval_band_scale).sqrt();
-        let mid_rms = (mid_e * self.parseval_band_scale).sqrt();
-        let high_rms = (high_e * self.parseval_band_scale).sqrt();
-
+        let (low_rms, mid_rms, high_rms, flux) = self.spectrum.process(
+            input,
+            &mut self.buffers.spectrum,
+            self.db_floor,
+        );
         push_history(&mut self.buffers.rmsLow, low_rms);
         push_history(&mut self.buffers.rmsMid, mid_rms);
         push_history(&mut self.buffers.rmsHigh, high_rms);
+        push_history(&mut self.buffers.onset, flux);
 
         crate::acf::compute_gen_acf(
             &self.buffers.onset,
@@ -815,9 +707,9 @@ mod tests {
         let dt = 1024.0_f32 / 48000.0;
         let expected = 1.0 - (-dt / SMOOTHING_TAU_SECS).exp();
         assert!(
-            (dsp.smoothing_alpha - expected).abs() < 1e-6,
+            (dsp.spectrum.smoothing_alpha - expected).abs() < 1e-6,
             "alpha {} != expected {}",
-            dsp.smoothing_alpha,
+            dsp.spectrum.smoothing_alpha,
             expected
         );
     }
@@ -828,9 +720,9 @@ mod tests {
         // alpha ≈ 0.2 — i.e., the legacy hard-coded value is preserved.
         let dsp = Dsp::new(2048, 48000.0, 1024, 512);
         assert!(
-            (dsp.smoothing_alpha - 0.2).abs() < 0.005,
+            (dsp.spectrum.smoothing_alpha - 0.2).abs() < 0.005,
             "expected alpha ≈ 0.2 at legacy settings, got {}",
-            dsp.smoothing_alpha
+            dsp.spectrum.smoothing_alpha
         );
     }
 
@@ -841,12 +733,12 @@ mod tests {
         let large = Dsp::new(2048, 48000.0, 1024, 512);
         let small = Dsp::new(2048, 48000.0, 512, 512);
         assert!(
-            small.smoothing_alpha < large.smoothing_alpha,
+            small.spectrum.smoothing_alpha < large.spectrum.smoothing_alpha,
             "small {} should be < large {}",
-            small.smoothing_alpha,
-            large.smoothing_alpha
+            small.spectrum.smoothing_alpha,
+            large.spectrum.smoothing_alpha
         );
-        let ratio = small.smoothing_alpha / large.smoothing_alpha;
+        let ratio = small.spectrum.smoothing_alpha / large.spectrum.smoothing_alpha;
         assert!(
             (0.45..=0.55).contains(&ratio),
             "expected ratio ≈ 0.5, got {}",
@@ -865,8 +757,8 @@ mod tests {
     #[test]
     fn band_bin_ends_at_default_settings() {
         let dsp = Dsp::new(2048, 48000.0, 1024, 512);
-        assert_eq!(dsp.low_band_bin_end, 6);
-        assert_eq!(dsp.mid_band_bin_end, 64);
+        assert_eq!(dsp.spectrum.low_band_bin_end, 6);
+        assert_eq!(dsp.spectrum.mid_band_bin_end, 64);
     }
 
     #[test]
@@ -883,9 +775,9 @@ mod tests {
             .sum();
         let expected = 2.0 / (n as f32 * hann_energy);
         assert!(
-            (dsp.parseval_band_scale - expected).abs() < 1e-10,
+            (dsp.spectrum.parseval_band_scale - expected).abs() < 1e-10,
             "got {}, expected {}",
-            dsp.parseval_band_scale,
+            dsp.spectrum.parseval_band_scale,
             expected
         );
     }
