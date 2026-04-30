@@ -37,8 +37,8 @@ const MIN_PEAK_SPACING: usize = 3;
 /// patterns) used to pull the tracker into reporting tempos 2-4× too fast —
 /// the user constraint "pick a beat harmonic between 80–190 BPM" becomes the
 /// hard filter that keeps observations in the perceptually-sensible range.
-const BEAT_TRACKER_MIN_BPM: f32 = 80.0;
-const BEAT_TRACKER_MAX_BPM: f32 = 190.0;
+const BEAT_TRACKER_MIN_BPM: f32 = 40.0;
+const BEAT_TRACKER_MAX_BPM: f32 = 220.0;
 /// Initial BPM the `BeatTracker` holds before any audio has been processed.
 /// 120 is right in the middle of plausible music tempos (60–180), so any
 /// genre converges within a similar number of frames.
@@ -337,6 +337,10 @@ pub struct Dsp {
     gen_acf_freq_buf: Vec<Complex<f32>>,
     onset_acf: Vec<f32>,
     onset_acf_enhanced: Vec<f32>,
+    candidates: Vec<f32>,                   // stride 3: [lag_frac, mag, sharpness]
+    cand_scratch: Vec<(usize, f32)>,        // preallocated scratch for picker
+    tau_min: usize,
+    tau_max: usize,
 }
 
 #[wasm_bindgen]
@@ -365,6 +369,10 @@ impl Dsp {
         let gen_acf_fft_inverse = planner.plan_fft_inverse(2 * gen_acf_n);
         let gen_acf_time_buf = vec![0.0; 2 * gen_acf_n];
         let gen_acf_freq_buf = vec![Complex::new(0.0, 0.0); gen_acf_n + 1];
+        let onset_acf_len = rms_history_len / 2;
+        let tau_min = ((60.0 / BEAT_TRACKER_MAX_BPM) / dt).floor().max(1.0) as usize;
+        let tau_max_unbounded = ((60.0 / BEAT_TRACKER_MIN_BPM) / dt).ceil() as usize;
+        let tau_max = tau_max_unbounded.min(onset_acf_len.saturating_sub(2));
         Dsp {
             waveform: vec![0.0; window_size],
             fft,
@@ -408,6 +416,10 @@ impl Dsp {
             gen_acf_freq_buf,
             onset_acf: vec![0.0; rms_history_len / 2],
             onset_acf_enhanced: vec![0.0; rms_history_len / 2],
+            candidates: vec![f32::NAN; 3 * MAX_PEAKS],
+            cand_scratch: Vec::with_capacity(onset_acf_len / 2 + 1),
+            tau_min,
+            tau_max,
         }
     }
 
@@ -464,6 +476,7 @@ impl Dsp {
             &mut self.gen_acf_freq_buf,
         );
         compute_harmonic_enhanced(&self.onset_acf, &mut self.onset_acf_enhanced);
+        self.pick_candidates();
 
         autocorrelate(&self.waveform, &mut self.buffer_acf);
 
@@ -605,6 +618,10 @@ impl Dsp {
 
     pub fn onset_acf_enhanced(&self) -> Vec<f32> {
         self.onset_acf_enhanced.clone()
+    }
+
+    pub fn candidates(&self) -> Vec<f32> {
+        self.candidates.clone()
     }
 
     pub fn low_rms_history(&self) -> Vec<f32> {
@@ -836,6 +853,66 @@ impl Dsp {
     }
 }
 
+impl Dsp {
+    fn pick_candidates(&mut self) {
+        for slot in self.candidates.iter_mut() {
+            *slot = f32::NAN;
+        }
+        if self.tau_max < self.tau_min + 1 {
+            return;
+        }
+
+        // 1. scan strict local maxima in [tau_min, tau_max]
+        self.cand_scratch.clear();
+        let upper = self.tau_max.min(self.onset_acf_enhanced.len() - 1);
+        for k in self.tau_min..upper {
+            let y = self.onset_acf_enhanced[k];
+            if y > 0.0
+                && y > self.onset_acf_enhanced[k - 1]
+                && y > self.onset_acf_enhanced[k + 1]
+            {
+                self.cand_scratch.push((k, y));
+            }
+        }
+
+        // 2. sort descending by magnitude
+        self.cand_scratch.sort_unstable_by(|a, b|
+            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        // 3. greedy select top-N with min-spacing
+        let mut accepted: [u32; MAX_PEAKS] = [0; MAX_PEAKS];
+        let mut count: usize = 0;
+        for &(k, _) in &self.cand_scratch {
+            if count == MAX_PEAKS { break; }
+            let too_close = accepted[..count].iter().any(|&j| {
+                ((k as i32 - j as i32).unsigned_abs() as usize) < MIN_PEAK_SPACING
+            });
+            if !too_close {
+                accepted[count] = k as u32;
+                count += 1;
+            }
+        }
+
+        // 4. parabolic sub-bin refinement → write [lag_frac, mag, sharpness]
+        for i in 0..count {
+            let k = accepted[i] as usize;
+            let y0 = self.onset_acf_enhanced[k - 1];
+            let y1 = self.onset_acf_enhanced[k];
+            let y2 = self.onset_acf_enhanced[k + 1];
+            let denom = y0 - 2.0 * y1 + y2;
+            let (lag_frac, mag) = if denom.abs() < 1e-12 {
+                (k as f32, y1)
+            } else {
+                let delta = (0.5 * (y0 - y2) / denom).clamp(-0.5, 0.5);
+                (k as f32 + delta, y1 - 0.25 * (y0 - y2) * delta)
+            };
+            self.candidates[3 * i]     = lag_frac;
+            self.candidates[3 * i + 1] = mag;
+            self.candidates[3 * i + 2] = -denom;  // sharpness — large for narrow peaks
+        }
+    }
+}
+
 /// Generalized autocorrelation per Percival & Tzanetakis 2014 §II-B.2:
 /// zero-pad input to 2N, forward FFT, magnitude compression `|X|^0.5`, inverse
 /// FFT, take the first N/2 lags, normalize so output[0] == 1.0. Allocation-
@@ -970,6 +1047,22 @@ impl Dsp {
         for v in self.acf_peaks.iter_mut() {
             *v = f32::NAN;
         }
+    }
+
+    pub fn onset_acf_enhanced_len(&self) -> usize {
+        self.onset_acf_enhanced.len()
+    }
+
+    pub fn test_set_onset_acf_enhanced(&mut self, src: &[f32]) {
+        let n = self.onset_acf_enhanced.len().min(src.len());
+        self.onset_acf_enhanced[..n].copy_from_slice(&src[..n]);
+        if n < self.onset_acf_enhanced.len() {
+            for v in &mut self.onset_acf_enhanced[n..] { *v = 0.0; }
+        }
+    }
+
+    pub fn test_run_pick_candidates(&mut self) {
+        self.pick_candidates();
     }
 
 }
@@ -2028,5 +2121,62 @@ mod tests {
         assert!((enhanced[20] - 0.5).abs() < 1e-6, "enhanced[20] = {}", enhanced[20]);
         // enhanced[40] = acf[40] + acf[80(oob)] + acf[160(oob)] = 0.2
         assert!((enhanced[40] - 0.2).abs() < 1e-6, "enhanced[40] = {}", enhanced[40]);
+    }
+
+    #[test]
+    fn pick_candidates_silent_all_nan() {
+        let mut dsp = Dsp::new(2048, 48000.0, 1024, 512);
+        let silent = vec![0.0f32; 2048];
+        for _ in 0..5 { dsp.process(&silent); }
+        let cands = dsp.candidates();
+        assert_eq!(cands.len(), 30);
+        for &v in cands.iter() {
+            assert!(v.is_nan(), "silent → all candidate slots NaN, got {}", v);
+        }
+    }
+
+    #[test]
+    fn pick_candidates_top_n_within_tau_range() {
+        let mut dsp = Dsp::new(2048, 48000.0, 1024, 512);
+        let n = dsp.onset_acf_enhanced_len();  // = rms_history_len / 2 = 256
+        let mut enhanced = vec![0.0f32; n];
+        let positions = [14usize, 18, 22, 26, 30, 34, 38, 42, 46, 50, 54, 58];
+        for (i, &p) in positions.iter().enumerate() {
+            // Make each a strict local max with descending magnitude
+            let mag = 1.0 - 0.05 * i as f32;
+            enhanced[p - 1] = mag * 0.5;
+            enhanced[p]     = mag;
+            enhanced[p + 1] = mag * 0.5;
+        }
+        dsp.test_set_onset_acf_enhanced(&enhanced);
+        dsp.test_run_pick_candidates();
+        let cands = dsp.candidates();
+        let mut last_mag = f32::INFINITY;
+        for i in 0..10 {
+            let lag = cands[3 * i];
+            let mag = cands[3 * i + 1];
+            assert!(!lag.is_nan(), "slot {} should have a peak, got NaN", i);
+            assert!(mag <= last_mag, "magnitudes should be descending: {} > {}", mag, last_mag);
+            last_mag = mag;
+        }
+    }
+
+    #[test]
+    fn pick_candidates_excludes_out_of_range_lags() {
+        let mut dsp = Dsp::new(2048, 48000.0, 1024, 512);
+        let n = dsp.onset_acf_enhanced_len();
+        let mut enhanced = vec![0.0f32; n];
+        enhanced[5] = 1.0; enhanced[4] = 0.5; enhanced[6] = 0.5;
+        enhanced[100] = 1.0; enhanced[99] = 0.5; enhanced[101] = 0.5;
+        dsp.test_set_onset_acf_enhanced(&enhanced);
+        dsp.test_run_pick_candidates();
+        let cands = dsp.candidates();
+        for i in 0..10 {
+            let lag = cands[3 * i];
+            if !lag.is_nan() {
+                assert!(lag >= 12.0 && lag <= 70.0,
+                    "picked lag {} outside [12, 70]", lag);
+            }
+        }
     }
 }
