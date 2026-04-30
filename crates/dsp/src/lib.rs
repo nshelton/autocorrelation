@@ -79,6 +79,10 @@ const BEAT_PHASE_STEP_HOPS: f32 = 0.5;
 /// LCM of these (= 16) is also the wrap-around modulus for `beat_position`.
 const BEAT_PULSE_CYCLES: [f32; 4] = [1.0, 2.0, 4.0, 8.0];
 const BEAT_PULSES_LEN: usize = 4;
+/// Harmonic stretch factors for `compute_harmonic_enhanced`. Per Percival &
+/// Tzanetakis 2014 §II-B.3: [2, 4] are the two factors that reliably reinforce
+/// the fundamental without introducing sub-octave artifacts.
+const HARMONIC_MULTIPLES: [usize; 2] = [2, 4];
 
 /// State estimator for tempo and meter. Consumes the picked `acf_peaks` (with
 /// magnitude and sharpness) each frame and updates four state values:
@@ -332,6 +336,7 @@ pub struct Dsp {
     gen_acf_time_buf: Vec<f32>,
     gen_acf_freq_buf: Vec<Complex<f32>>,
     onset_acf: Vec<f32>,
+    onset_acf_enhanced: Vec<f32>,
 }
 
 #[wasm_bindgen]
@@ -402,6 +407,7 @@ impl Dsp {
             gen_acf_time_buf,
             gen_acf_freq_buf,
             onset_acf: vec![0.0; rms_history_len / 2],
+            onset_acf_enhanced: vec![0.0; rms_history_len / 2],
         }
     }
 
@@ -457,6 +463,7 @@ impl Dsp {
             &mut self.gen_acf_time_buf,
             &mut self.gen_acf_freq_buf,
         );
+        compute_harmonic_enhanced(&self.onset_acf, &mut self.onset_acf_enhanced);
 
         autocorrelate(&self.waveform, &mut self.buffer_acf);
 
@@ -594,6 +601,10 @@ impl Dsp {
 
     pub fn onset_acf(&self) -> Vec<f32> {
         self.onset_acf.clone()
+    }
+
+    pub fn onset_acf_enhanced(&self) -> Vec<f32> {
+        self.onset_acf_enhanced.clone()
     }
 
     pub fn low_rms_history(&self) -> Vec<f32> {
@@ -864,6 +875,25 @@ fn compute_gen_acf(
     let zero = time_buf[0].max(1e-12);
     for i in 0..output.len() {
         output[i] = time_buf[i] / zero;
+    }
+}
+
+/// Per Percival & Tzanetakis 2014 §II-B.3: boost peaks corresponding to
+/// integer multiples of the underlying tempo by adding time-stretched
+/// versions of the ACF. For each `mult ∈ HARMONIC_MULTIPLES`, `enhanced[τ] +=
+/// acf[mult * τ]` when `mult * τ < acf.len()`. `enhanced` should be the
+/// same length as `acf` (caller's responsibility).
+fn compute_harmonic_enhanced(acf: &[f32], enhanced: &mut [f32]) {
+    let n = acf.len();
+    for tau in 0..n {
+        let mut sum = acf[tau];
+        for &mult in &HARMONIC_MULTIPLES {
+            let idx = tau * mult;
+            if idx < n {
+                sum += acf[idx];
+            }
+        }
+        enhanced[tau] = sum;
     }
 }
 
@@ -1979,5 +2009,24 @@ mod tests {
         assert!(around > far,
             "peak near lag {} ({:.3}) should exceed nearby non-period max ({:.3})",
             p, around, far);
+    }
+
+    #[test]
+    fn harmonic_enhanced_sums_multiples() {
+        // Synthetic ACF: peaks at lags 10, 20, 40 with magnitudes 0.5, 0.3, 0.2;
+        // zeros elsewhere. After enhancement via `HARMONIC_MULTIPLES = [2, 4]`,
+        // enhanced[10] should equal 0.5 + 0.3 + 0.2 = 1.0 (since 10*2=20 and
+        // 10*4=40 hit the other peaks).
+        let mut acf = vec![0.0f32; 64];
+        acf[10] = 0.5;
+        acf[20] = 0.3;
+        acf[40] = 0.2;
+        let mut enhanced = vec![0.0f32; 64];
+        compute_harmonic_enhanced(&acf, &mut enhanced);
+        assert!((enhanced[10] - 1.0).abs() < 1e-6, "enhanced[10] = {}", enhanced[10]);
+        // enhanced[20] = acf[20] + acf[40] + acf[80(oob)] = 0.3 + 0.2 + 0 = 0.5
+        assert!((enhanced[20] - 0.5).abs() < 1e-6, "enhanced[20] = {}", enhanced[20]);
+        // enhanced[40] = acf[40] + acf[80(oob)] + acf[160(oob)] = 0.2
+        assert!((enhanced[40] - 0.2).abs() < 1e-6, "enhanced[40] = {}", enhanced[40]);
     }
 }
