@@ -6,40 +6,9 @@ mod acf;
 mod beat;
 
 use crate::acf::AcfState;
+use crate::beat::BeatState;
 use crate::buffers::Buffers;
 use crate::spectrum::SpectrumState;
-
-/// Maximum number of tempo peaks tracked per hop. Drives the fixed length
-/// of `candidates` (= 3 * MAX_PEAKS — interleaved [lag, mag, sharpness]
-/// triples).
-const MAX_PEAKS: usize = 10;
-/// Minimum integer-lag distance between accepted peaks, in hops. Without
-/// this, the wide lobes of true tempo peaks return multiple "peaks" all
-/// clustered around a single underlying peak.
-const MIN_PEAK_SPACING: usize = 3;
-/// Plausible-tempo bounds for candidate acceptance. Candidate periods
-/// `lag/k` are accepted only when they fall in [period_min, period_max]
-/// (derived from these BPM bounds + dt).
-const BEAT_TRACKER_MIN_BPM: f32 = 40.0;
-const BEAT_TRACKER_MAX_BPM: f32 = 220.0;
-/// Length of the public `beat_state` output: [bpm, bpm_conf, beats_per_measure, measure_conf].
-const BEAT_STATE_LEN: usize = 4;
-/// Length of the `beat_grid` output buffer: [period, phase, score]. Keep in
-/// sync with `BeatGridRenderer` / `BeatGridScrollingRenderer` consumers.
-const BEAT_GRID_LEN: usize = 3;
-/// Cycle multipliers for `beat_pulses`. The detected period is multiplied by
-/// each entry to get an "m-cycle period"; the corresponding pulse output is
-/// a downward saw with that period (1.0 at cycle start, →0 just before next).
-/// LCM of these (= 16) is also the wrap-around modulus for `beat_position`.
-const BEAT_PULSE_CYCLES: [f32; 4] = [1.0, 2.0, 4.0, 8.0];
-const BEAT_PULSES_LEN: usize = 4;
-/// Gaussian kernel width (σ in lag units) for smearing a TEA vote. Wider σ
-/// means the vote from `period_inst` spreads over more lag bins — enough to
-/// bridge sub-bin variation between frames without hiding adjacent peaks.
-const TEA_GAUSSIAN_SIGMA: f32 = 5.0;
-/// Default EMA time constant for the TEA (seconds). 4 s gives stable argmax
-/// for steady tempos while still tracking gradual drift within ~10–15 s.
-const TEA_TAU_DEFAULT_SECS: f32 = 4.0;
 
 #[wasm_bindgen]
 pub struct Dsp {
@@ -49,39 +18,8 @@ pub struct Dsp {
     /// dt = hop_size / sample_rate, captured at construction. Used by
     /// `set_smoothing_tau` to recompute `smoothing_alpha`.
     dt: f32,
-    /// Continuously-incrementing fractional beat counter. The integer part
-    /// counts beats since startup; the fractional part is "how far into the
-    /// current beat we are" (0 = on beat, →1 just before next). Wraps mod 16
-    /// (= LCM of BEAT_PULSE_CYCLES) to bound f32 precision over long runs.
-    beat_position: f32,
     acf: AcfState,
-    cand_scratch: Vec<(usize, f32)>, // preallocated scratch for picker
-    tau_min: usize,
-    tau_max: usize,
-    /// Per-candidate max-φ correlation from `score_phase_for_tau` (X in the paper).
-    pulse_x: [f32; MAX_PEAKS],
-    /// Per-candidate variance-of-φ correlation — high variance means the pulse
-    /// train picks out clear beats; low variance means all phases score equally
-    /// (no tempo structure at this lag).
-    pulse_v: [f32; MAX_PEAKS],
-    /// Best (integer) phase offset for each candidate, in hop units.
-    pulse_phi: [f32; MAX_PEAKS],
-    /// Combined normalized score (`X_norm + V_norm`) for each candidate.
-    pulse_score: [f32; MAX_PEAKS],
-    /// Per-frame winning period (in lag units). NaN until `score_candidates` finds a winner.
-    period_inst: f32,
-    /// Per-frame winning phase offset (integer hops). NaN until `score_candidates` finds a winner.
-    phase_inst: f32,
-    /// Per-frame combined score of the winner. 0 when no candidate wins.
-    score_inst: f32,
-    /// EMA coefficient for the TEA decay/update. Derived from `TEA_TAU_DEFAULT_SECS`
-    /// at construction; tunable via `set_tea_tau_secs`.
-    tea_alpha: f32,
-    /// Smoothed period estimate in lag units — TEA argmax with parabolic
-    /// sub-bin refinement. NaN when TEA has no evidence yet.
-    tau_smoothed: f32,
-    /// Phase offset (in hops) re-scored at `tau_smoothed`. NaN when `tau_smoothed` is NaN.
-    phase_smoothed: f32,
+    beat: BeatState,
 }
 
 #[wasm_bindgen]
@@ -94,31 +32,13 @@ impl Dsp {
         rms_history_len: usize,
     ) -> Dsp {
         let dt = hop_size as f32 / sample_rate;
-        let tea_alpha = 1.0 - (-dt / TEA_TAU_DEFAULT_SECS).exp();
-        let onset_acf_len = rms_history_len / 2;
-        let tau_min = ((60.0 / BEAT_TRACKER_MAX_BPM) / dt).floor().max(1.0) as usize;
-        let tau_max_unbounded = ((60.0 / BEAT_TRACKER_MIN_BPM) / dt).ceil() as usize;
-        let tau_max = tau_max_unbounded.min(onset_acf_len.saturating_sub(2));
         Dsp {
             buffers: Buffers::new(window_size, rms_history_len),
             spectrum: SpectrumState::new(window_size, sample_rate, dt),
             db_floor: -100.0,
             dt,
-            beat_position: 0.0,
             acf: AcfState::new(rms_history_len),
-            cand_scratch: Vec::with_capacity(onset_acf_len / 2 + 1),
-            tau_min,
-            tau_max,
-            pulse_x: [0.0; MAX_PEAKS],
-            pulse_v: [0.0; MAX_PEAKS],
-            pulse_phi: [0.0; MAX_PEAKS],
-            pulse_score: [0.0; MAX_PEAKS],
-            period_inst: f32::NAN,
-            phase_inst: f32::NAN,
-            score_inst: 0.0,
-            tea_alpha,
-            tau_smoothed: f32::NAN,
-            phase_smoothed: f32::NAN,
+            beat: BeatState::new(rms_history_len, dt),
         }
     }
 
@@ -134,8 +54,7 @@ impl Dsp {
     /// EMA time constant for the TEA. `alpha = 1 - exp(-dt / tau)`. Smaller
     /// τ ⇒ faster response, less stable. Clamped to [0.05, 60.0].
     pub fn set_tea_tau_secs(&mut self, tau_secs: f32) {
-        let tau = tau_secs.clamp(0.05, 60.0);
-        self.tea_alpha = 1.0 - (-self.dt / tau).exp();
+        self.beat.set_tea_tau(tau_secs, self.dt);
     }
 
     pub fn set_db_floor(&mut self, floor: f32) {
@@ -167,11 +86,17 @@ impl Dsp {
             &mut self.buffers.onsetAcf,
             &mut self.buffers.onsetAcfEnhanced,
         );
-        self.pick_candidates();
-        self.score_candidates();
-        self.update_tea();
-        self.write_beat_outputs();
-        self.update_beat_pulses_v2();
+
+        self.beat.process(
+            &self.buffers.onset,
+            &self.buffers.onsetAcfEnhanced,
+            &mut self.buffers.candidates,
+            &mut self.buffers.tea,
+            &mut self.buffers.beatGrid,
+            &mut self.buffers.beatState,
+            &mut self.buffers.beatPulses,
+            self.dt,
+        );
 
         crate::acf::autocorrelate(&self.buffers.waveform, &mut self.buffers.bufferAcf);
     }
@@ -191,234 +116,6 @@ impl Dsp {
     pub fn beat_grid(&self) -> Vec<f32> { self.buffers.beatGrid.clone() }
     pub fn beat_pulses(&self) -> Vec<f32> { self.buffers.beatPulses.clone() }
     pub fn beat_state(&self) -> Vec<f32> { self.buffers.beatState.clone() }
-}
-
-impl Dsp {
-    fn pick_candidates(&mut self) {
-        for slot in self.buffers.candidates.iter_mut() {
-            *slot = f32::NAN;
-        }
-        if self.tau_max < self.tau_min + 1 {
-            return;
-        }
-
-        // 1. scan strict local maxima in [tau_min, tau_max]
-        self.cand_scratch.clear();
-        let upper = self.tau_max.min(self.buffers.onsetAcfEnhanced.len() - 1);
-        for k in self.tau_min..upper {
-            let y = self.buffers.onsetAcfEnhanced[k];
-            if y > 0.0 && y > self.buffers.onsetAcfEnhanced[k - 1] && y > self.buffers.onsetAcfEnhanced[k + 1] {
-                self.cand_scratch.push((k, y));
-            }
-        }
-
-        // 2. sort descending by magnitude
-        self.cand_scratch
-            .sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-        // 3. greedy select top-N with min-spacing
-        let mut accepted: [u32; MAX_PEAKS] = [0; MAX_PEAKS];
-        let mut count: usize = 0;
-        for &(k, _) in &self.cand_scratch {
-            if count == MAX_PEAKS {
-                break;
-            }
-            let too_close = accepted[..count]
-                .iter()
-                .any(|&j| ((k as i32 - j as i32).unsigned_abs() as usize) < MIN_PEAK_SPACING);
-            if !too_close {
-                accepted[count] = k as u32;
-                count += 1;
-            }
-        }
-
-        // 4. parabolic sub-bin refinement → write [lag_frac, mag, sharpness]
-        for i in 0..count {
-            let k = accepted[i] as usize;
-            let y0 = self.buffers.onsetAcfEnhanced[k - 1];
-            let y1 = self.buffers.onsetAcfEnhanced[k];
-            let y2 = self.buffers.onsetAcfEnhanced[k + 1];
-            let denom = y0 - 2.0 * y1 + y2;
-            let (lag_frac, mag) = if denom.abs() < 1e-12 {
-                (k as f32, y1)
-            } else {
-                let delta = (0.5 * (y0 - y2) / denom).clamp(-0.5, 0.5);
-                (k as f32 + delta, y1 - 0.25 * (y0 - y2) * delta)
-            };
-            self.buffers.candidates[3 * i] = lag_frac;
-            self.buffers.candidates[3 * i + 1] = mag;
-            self.buffers.candidates[3 * i + 2] = -denom; // sharpness — large for narrow peaks
-        }
-    }
-
-    /// Score every candidate's pulse train, normalize X (max-φ corr) and V
-    /// (var-φ corr) so each sums to 1 across candidates, pick winner with
-    /// `score = X_norm + V_norm`. Writes per-frame outputs into
-    /// `period_inst`, `phase_inst`, `score_inst`. Silent / no-candidate
-    /// frames yield `(NaN, NaN, 0.0)`.
-    fn score_candidates(&mut self) {
-        let mut count = 0usize;
-        for i in 0..MAX_PEAKS {
-            let lag = self.buffers.candidates[3 * i];
-            if lag.is_nan() {
-                break;
-            }
-            let (phi, x, sum, sum_sq, n_phi) = crate::beat::score_phase_for_tau(&self.buffers.onset, lag);
-            let n = n_phi as f32;
-            let mean = if n > 0.0 { sum / n } else { 0.0 };
-            let var = if n > 0.0 {
-                (sum_sq / n - mean * mean).max(0.0)
-            } else {
-                0.0
-            };
-            self.pulse_x[i] = x;
-            self.pulse_v[i] = var;
-            self.pulse_phi[i] = phi as f32;
-            count += 1;
-        }
-        if count == 0 {
-            self.period_inst = f32::NAN;
-            self.phase_inst = f32::NAN;
-            self.score_inst = 0.0;
-            return;
-        }
-        let sum_x: f32 = self.pulse_x[..count].iter().sum();
-        let sum_v: f32 = self.pulse_v[..count].iter().sum();
-        let mut best_i = 0usize;
-        let mut best_score = -1.0f32;
-        for i in 0..count {
-            let xn = if sum_x > 0.0 {
-                self.pulse_x[i] / sum_x
-            } else {
-                0.0
-            };
-            let vn = if sum_v > 0.0 {
-                self.pulse_v[i] / sum_v
-            } else {
-                0.0
-            };
-            let s = xn + vn;
-            self.pulse_score[i] = s;
-            if s > best_score {
-                best_score = s;
-                best_i = i;
-            }
-        }
-        if best_score <= 0.0 {
-            self.period_inst = f32::NAN;
-            self.phase_inst = f32::NAN;
-            self.score_inst = 0.0;
-        } else {
-            self.period_inst = self.buffers.candidates[3 * best_i];
-            self.phase_inst = self.pulse_phi[best_i];
-            self.score_inst = best_score;
-        }
-    }
-
-    /// Advance the TEA by one frame (Percival & Tzanetakis §II-C). When this
-    /// frame produced a fit (`score_inst > 0`), cast a Gaussian vote at
-    /// `period_inst` so the lag bin and its σ-neighbourhood accumulate
-    /// evidence; otherwise decay all bins by `(1 - alpha)` — silence drains
-    /// the accumulator toward 0. Then argmax over `[tau_min, tau_max]` with
-    /// parabolic sub-bin refine → `tau_smoothed`; re-score phase at that lag
-    /// for a coherent `phase_smoothed`.
-    fn update_tea(&mut self) {
-        let alpha = self.tea_alpha;
-        if self.score_inst > 0.0 && self.period_inst.is_finite() {
-            let inv_2sig2 = 1.0 / (2.0 * TEA_GAUSSIAN_SIGMA * TEA_GAUSSIAN_SIGMA);
-            for tau in 0..self.buffers.tea.len() {
-                let delta = tau as f32 - self.period_inst;
-                let g = (-delta * delta * inv_2sig2).exp();
-                self.buffers.tea[tau] = (1.0 - alpha) * self.buffers.tea[tau] + alpha * g;
-            }
-        } else {
-            for v in self.buffers.tea.iter_mut() {
-                *v *= 1.0 - alpha;
-            }
-        }
-
-        let upper = self.tau_max.min(self.buffers.tea.len() - 1);
-        let mut best_i = self.tau_min;
-        let mut best_v = -1.0f32;
-        for i in self.tau_min..=upper {
-            if self.buffers.tea[i] > best_v {
-                best_v = self.buffers.tea[i];
-                best_i = i;
-            }
-        }
-        if best_v <= 0.0 {
-            self.tau_smoothed = f32::NAN;
-            self.phase_smoothed = f32::NAN;
-            return;
-        }
-        let mut tau = best_i as f32;
-        if best_i > self.tau_min && best_i < upper {
-            let y0 = self.buffers.tea[best_i - 1];
-            let y1 = self.buffers.tea[best_i];
-            let y2 = self.buffers.tea[best_i + 1];
-            let denom = y0 - 2.0 * y1 + y2;
-            if denom.abs() > 1e-12 {
-                let delta = (0.5 * (y0 - y2) / denom).clamp(-0.5, 0.5);
-                tau = best_i as f32 + delta;
-            }
-        }
-        self.tau_smoothed = tau;
-        let (phi, _, _, _, _) = crate::beat::score_phase_for_tau(&self.buffers.onset, tau);
-        self.phase_smoothed = phi as f32;
-    }
-
-    fn write_beat_outputs(&mut self) {
-        let p = self.tau_smoothed;
-        let phi = self.phase_smoothed;
-        let s = self.score_inst;
-        if p.is_nan() || s <= 0.0 {
-            self.buffers.beatGrid[0] = f32::NAN;
-            self.buffers.beatGrid[1] = f32::NAN;
-            self.buffers.beatGrid[2] = 0.0;
-            self.buffers.beatState[0] = f32::NAN;
-            self.buffers.beatState[1] = 0.0;
-            self.buffers.beatState[2] = f32::NAN;
-            self.buffers.beatState[3] = f32::NAN;
-        } else {
-            self.buffers.beatGrid[0] = p;
-            self.buffers.beatGrid[1] = phi;
-            self.buffers.beatGrid[2] = s;
-            self.buffers.beatState[0] = if p > 0.0 {
-                60.0 / (p * self.dt)
-            } else {
-                f32::NAN
-            };
-            self.buffers.beatState[1] = s;
-            self.buffers.beatState[2] = f32::NAN; // beats_per_measure deferred
-            self.buffers.beatState[3] = f32::NAN; // measure_conf deferred
-        }
-    }
-
-    // Simplified saw-wave generator. Phase is always real when there's a fit;
-    // NaN-out under silence/no-fit so the renderer holds last value.
-    fn update_beat_pulses_v2(&mut self) {
-        let period = self.tau_smoothed;
-        let phase = self.phase_smoothed;
-        let score = self.score_inst;
-        if period.is_nan() || period <= 0.0 || score <= 0.0 || phase.is_nan() {
-            for slot in self.buffers.beatPulses.iter_mut() {
-                *slot = f32::NAN;
-            }
-            return;
-        }
-        // Anchor fractional part to phase/period so cycle-1 starts at phase=0.
-        let phase_frac = (phase / period).clamp(0.0, 0.999_999);
-        let prev = self.beat_position;
-        let mut bp = prev.floor() + phase_frac;
-        if bp < prev - 0.5 {
-            bp += 1.0;
-        }
-        self.beat_position = bp.rem_euclid(16.0);
-        for (i, &m) in BEAT_PULSE_CYCLES.iter().enumerate() {
-            let frac = (self.beat_position / m).fract();
-            self.buffers.beatPulses[i] = 1.0 - frac;
-        }
-    }
 }
 
 /// Shift a history buffer left by one slot (oldest at index 0 falls off)
@@ -449,7 +146,16 @@ impl Dsp {
     }
 
     pub fn test_run_pick_candidates(&mut self) {
-        self.pick_candidates();
+        self.beat.process(
+            &self.buffers.onset,
+            &self.buffers.onsetAcfEnhanced,
+            &mut self.buffers.candidates,
+            &mut self.buffers.tea,
+            &mut self.buffers.beatGrid,
+            &mut self.buffers.beatState,
+            &mut self.buffers.beatPulses,
+            self.dt,
+        );
     }
 
     pub fn onset_history_len(&self) -> usize {
@@ -472,22 +178,30 @@ impl Dsp {
             &mut self.buffers.onsetAcf,
             &mut self.buffers.onsetAcfEnhanced,
         );
-        self.pick_candidates();
-        self.score_candidates();
+        self.beat.process(
+            &self.buffers.onset,
+            &self.buffers.onsetAcfEnhanced,
+            &mut self.buffers.candidates,
+            &mut self.buffers.tea,
+            &mut self.buffers.beatGrid,
+            &mut self.buffers.beatState,
+            &mut self.buffers.beatPulses,
+            self.dt,
+        );
     }
 
     pub fn test_per_frame_estimate(&self) -> (f32, f32, f32) {
-        (self.period_inst, self.phase_inst, self.score_inst)
+        self.beat.test_per_frame_estimate()
     }
 
     pub fn tea_len(&self) -> usize {
         self.buffers.tea.len()
     }
     pub fn tea_alpha(&self) -> f32 {
-        self.tea_alpha
+        self.beat.tea_alpha()
     }
     pub fn tea_argmax(&self) -> f32 {
-        self.tau_smoothed
+        self.beat.tau_smoothed()
     }
     pub fn test_set_tea(&mut self, src: &[f32]) {
         let n = self.buffers.tea.len().min(src.len());
