@@ -3,6 +3,11 @@ use realfft::{ComplexToReal, RealFftPlanner, RealToComplex};
 use std::sync::Arc;
 use wasm_bindgen::prelude::*;
 
+mod buffers;
+mod spectrum;
+mod acf;
+mod beat;
+
 /// Spectrum smoothing time constant in seconds. Chosen to preserve the
 /// legacy alpha ≈ 0.2 behavior at sr=48000, hop=1024:
 ///   alpha = 1 - exp(-dt/tau), dt = 1024/48000 = 21.33 ms
@@ -804,6 +809,17 @@ fn autocorrelate(input: &[f32], output: &mut [f32]) {
 fn bin_for_hz(hz: f32, sample_rate: f32, n: usize) -> usize {
     let bin = (hz * n as f32 / sample_rate).round() as usize;
     bin.clamp(1, n / 2 - 1)
+}
+
+/// Shift a history buffer left by one slot (oldest at index 0 falls off)
+/// and write `value` at the end. No-op for empty buffers.
+fn push_history(buf: &mut [f32], value: f32) {
+    if buf.is_empty() {
+        return;
+    }
+    buf.copy_within(1.., 0);
+    let last = buf.len() - 1;
+    buf[last] = value;
 }
 
 #[cfg(test)]
