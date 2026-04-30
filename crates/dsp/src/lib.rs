@@ -251,6 +251,8 @@ pub struct Dsp {
     mag_scale: f32,
     db_floor: f32,
     rms_history: Vec<f32>,
+    onset_history: Vec<f32>,
+    prev_rms: f32,
     buffer_acf: Vec<f32>,
     rms_acf: Vec<f32>,
     /// Decaying EMA accumulator over `rms_acf`. Same length. Used as the
@@ -358,6 +360,8 @@ impl Dsp {
             mag_scale,
             db_floor: -100.0,
             rms_history: vec![0.0; rms_history_len],
+            onset_history: vec![0.0; rms_history_len],
+            prev_rms: 0.0,
             buffer_acf: vec![0.0; window_size / 2],
             rms_acf: vec![0.0; rms_history_len / 2],
             rms_acf_accum: vec![0.0; rms_history_len / 2],
@@ -421,6 +425,14 @@ impl Dsp {
         self.rms_history.copy_within(1.., 0);
         let last = self.rms_history.len() - 1;
         self.rms_history[last] = rms;
+
+        // Half-wave-rectified RMS difference — proxy for the paper's spectral
+        // flux OSS. `rms` is the just-computed full-band RMS for this frame.
+        let onset = (rms - self.prev_rms).max(0.0);
+        self.prev_rms = rms;
+        self.onset_history.copy_within(1.., 0);
+        let last = self.onset_history.len() - 1;
+        self.onset_history[last] = onset;
 
         autocorrelate(&self.waveform, &mut self.buffer_acf);
 
@@ -550,6 +562,10 @@ impl Dsp {
 
     pub fn rms_history(&self) -> Vec<f32> {
         self.rms_history.clone()
+    }
+
+    pub fn onset_history(&self) -> Vec<f32> {
+        self.onset_history.clone()
     }
 
     pub fn low_rms_history(&self) -> Vec<f32> {
@@ -1829,5 +1845,31 @@ mod tests {
             "expected period ≈ {}, got {}",
             period_hops, grid[0]
         );
+    }
+
+    #[test]
+    fn onset_history_captures_positive_rms_diff() {
+        // RMS of a constant-amplitude signal A over a frame is A.
+        // Step ladder: silence (RMS 0) → 0.5 → 0.5 → 0.3.
+        // Expected onset values per process call (max(0, rms - prev_rms)):
+        //   process(silent): rms=0, prev=0 → onset=0
+        //   process(half):   rms=0.5, prev=0   → onset=0.5
+        //   process(half):   rms=0.5, prev=0.5 → onset=0
+        //   process(lower):  rms=0.3, prev=0.5 → onset=0  (negative diff clamped)
+        let mut dsp = Dsp::new(2048, 48000.0, 1024, 512);
+        let silent = vec![0.0f32; 2048];
+        let half   = vec![0.5f32; 2048];
+        let lower  = vec![0.3f32; 2048];
+        dsp.process(&silent);
+        dsp.process(&half);
+        dsp.process(&half);
+        dsp.process(&lower);
+        let onset = dsp.onset_history();
+        let n = onset.len();
+        // newest at index n-1, oldest at index 0
+        assert!((onset[n - 1] - 0.0).abs() < 1e-3, "newest = {}", onset[n - 1]);
+        assert!((onset[n - 2] - 0.0).abs() < 1e-3, "newest-1 = {}", onset[n - 2]);
+        assert!((onset[n - 3] - 0.5).abs() < 1e-2, "newest-2 = {}", onset[n - 3]);
+        assert!((onset[n - 4] - 0.0).abs() < 1e-3, "newest-3 = {}", onset[n - 4]);
     }
 }
