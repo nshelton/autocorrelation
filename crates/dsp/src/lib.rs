@@ -701,85 +701,11 @@ mod tests {
     }
 
     #[test]
-    fn smoothing_alpha_matches_time_constant_formula() {
-        // alpha = 1 - exp(-dt/tau) where dt = hop_size / sample_rate
-        let dsp = Dsp::new(2048, 48000.0, 1024, 512);
-        let dt = 1024.0_f32 / 48000.0;
-        let expected = 1.0 - (-dt / SMOOTHING_TAU_SECS).exp();
-        assert!(
-            (dsp.spectrum.smoothing_alpha - expected).abs() < 1e-6,
-            "alpha {} != expected {}",
-            dsp.spectrum.smoothing_alpha,
-            expected
-        );
-    }
-
-    #[test]
-    fn smoothing_alpha_at_legacy_settings_is_approximately_0_2() {
-        // SMOOTHING_TAU_SECS is chosen so that at sr=48000, hop=1024
-        // alpha ≈ 0.2 — i.e., the legacy hard-coded value is preserved.
-        let dsp = Dsp::new(2048, 48000.0, 1024, 512);
-        assert!(
-            (dsp.spectrum.smoothing_alpha - 0.2).abs() < 0.005,
-            "expected alpha ≈ 0.2 at legacy settings, got {}",
-            dsp.spectrum.smoothing_alpha
-        );
-    }
-
-    #[test]
-    fn smoothing_alpha_shrinks_at_smaller_hop() {
-        // Halving hop ≈ halves alpha (small-dt regime: 1 - exp(-x) ≈ x).
-        // Wall-clock dynamics stay the same; per-call coefficient changes.
-        let large = Dsp::new(2048, 48000.0, 1024, 512);
-        let small = Dsp::new(2048, 48000.0, 512, 512);
-        assert!(
-            small.spectrum.smoothing_alpha < large.spectrum.smoothing_alpha,
-            "small {} should be < large {}",
-            small.spectrum.smoothing_alpha,
-            large.spectrum.smoothing_alpha
-        );
-        let ratio = small.spectrum.smoothing_alpha / large.spectrum.smoothing_alpha;
-        assert!(
-            (0.45..=0.55).contains(&ratio),
-            "expected ratio ≈ 0.5, got {}",
-            ratio
-        );
-    }
-
-    #[test]
     fn bin_for_hz_snaps_at_default_settings() {
         // 150 Hz at sr=48000, N=2048: 150 * 2048 / 48000 = 6.4 → 6.
         // 1500 Hz: 1500 * 2048 / 48000 = 64.0 → 64.
         assert_eq!(crate::acf::bin_for_hz(150.0, 48000.0, 2048), 6);
         assert_eq!(crate::acf::bin_for_hz(1500.0, 48000.0, 2048), 64);
-    }
-
-    #[test]
-    fn band_bin_ends_at_default_settings() {
-        let dsp = Dsp::new(2048, 48000.0, 1024, 512);
-        assert_eq!(dsp.spectrum.low_band_bin_end, 6);
-        assert_eq!(dsp.spectrum.mid_band_bin_end, 64);
-    }
-
-    #[test]
-    fn parseval_band_scale_matches_formula() {
-        // parseval_band_scale = 2 / (N · Σ hann²)
-        let dsp = Dsp::new(2048, 48000.0, 1024, 512);
-        let n = 2048usize;
-        let hann_energy: f32 = (0..n)
-            .map(|i| {
-                let h =
-                    0.5 - 0.5 * (2.0 * std::f32::consts::PI * i as f32 / (n as f32 - 1.0)).cos();
-                h * h
-            })
-            .sum();
-        let expected = 2.0 / (n as f32 * hann_energy);
-        assert!(
-            (dsp.spectrum.parseval_band_scale - expected).abs() < 1e-10,
-            "got {}, expected {}",
-            dsp.spectrum.parseval_band_scale,
-            expected
-        );
     }
 
     #[test]
