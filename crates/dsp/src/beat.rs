@@ -55,7 +55,9 @@ pub fn score_phase_for_tau(onset: &[f32], tau: f32) -> (usize, f32, f32, f32, us
     (best_phi, best_corr.max(0.0), sum, sum_sq, phi_max)
 }
 
-const MAX_PEAKS: usize = 10;
+/// Maximum number of tempo candidates tracked per hop. Shared with `Buffers`,
+/// which sizes `candidates` as `3 * MAX_PEAKS` triples (lag, mag, sharpness).
+pub(crate) const MAX_PEAKS: usize = 10;
 const MIN_PEAK_SPACING: usize = 3;
 const BEAT_TRACKER_MIN_BPM: f32 = 40.0;
 const BEAT_TRACKER_MAX_BPM: f32 = 220.0;

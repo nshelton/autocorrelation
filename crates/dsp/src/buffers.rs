@@ -6,7 +6,8 @@
 //! message field, and FeatureStore key. `#[allow(non_snake_case)]` accepts
 //! these names.
 
-const MAX_PEAKS: usize = 10;
+use crate::beat::MAX_PEAKS;
+
 const BEAT_GRID_LEN: usize = 3;
 const BEAT_PULSES_LEN: usize = 4;
 const BEAT_STATE_LEN: usize = 4;
