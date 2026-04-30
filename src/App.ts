@@ -1,7 +1,7 @@
 import { Vector3 } from "three";
 import { createSceneAndCamera } from "./render/Scene";
 import { CameraRig } from "./render/CameraRig";
-import { DebugView, type DebugFeatures, type DebugSizes } from "./render/DebugView";
+import { DebugView } from "./render/DebugView";
 import { FeatureStore } from "./store/FeatureStore";
 import { FpsOverlay } from "./ui/Stats";
 import type { ParamStore } from "./params/ParamStore";
@@ -15,9 +15,10 @@ export interface AppDeps {
   paramStore: ParamStore;
 }
 
-type WorkletMsg =
-  | ({ type: "features" } & DebugFeatures)
-  | ({ type: "configured" } & DebugSizes);
+type WorkletMsg = {
+  type: "features";
+  buffers: Record<string, Float32Array>;
+};
 
 export class App {
   private rig!: CameraRig;
@@ -83,60 +84,11 @@ export class App {
 
     workletNode.port.onmessage = (e) => {
       const msg = e.data as WorkletMsg;
-      if (msg.type === "features") {
-        const s = this.store;
-        if (msg.waveform) s.set("waveform", msg.waveform);
-        if (msg.spectrum) s.set("spectrum", msg.spectrum);
-        if (msg.bufferAcf) s.set("bufferAcf", msg.bufferAcf);
-        if (msg.onset) s.set("onset", msg.onset);
-        if (msg.onsetAcf) s.set("onsetAcf", msg.onsetAcf);
-        if (msg.onsetAcfEnhanced) s.set("onsetAcfEnhanced", msg.onsetAcfEnhanced);
-        if (msg.tea) s.set("tea", msg.tea);
-        if (msg.candidates) s.set("candidates", msg.candidates);
-        if (msg.rms) s.set("rms", msg.rms);
-        if (msg.rmsLow) s.set("rmsLow", msg.rmsLow);
-        if (msg.rmsMid) s.set("rmsMid", msg.rmsMid);
-        if (msg.rmsHigh) s.set("rmsHigh", msg.rmsHigh);
-        return;
-      }
-      if (msg.type === "configured") {
-        const s = this.store;
-        s.set("waveform", new Float32Array(msg.waveformLen));
-        s.set("spectrum", new Float32Array(msg.spectrumLen));
-        s.set("rms", new Float32Array(msg.rmsLen));
-        s.set("bufferAcf", new Float32Array(msg.bufferAcfLen));
-        s.set("onset", new Float32Array(msg.onsetLen));
-        s.set("onsetAcf", new Float32Array(msg.onsetAcfLen));
-        s.set("onsetAcfEnhanced", new Float32Array(msg.onsetAcfLen));
-        s.set("tea", new Float32Array(msg.teaLen));
-        s.set("rmsLow", new Float32Array(msg.rmsLen));
-        s.set("rmsMid", new Float32Array(msg.rmsLen));
-        s.set("rmsHigh", new Float32Array(msg.rmsLen));
-        // NaN-filled: empty-slot sentinel for PeakMarkers and beat overlays.
-        const candidates = new Float32Array(msg.candidatesLen);
-        candidates.fill(NaN);
-        s.set("candidates", candidates);
-        const beatGrid = new Float32Array(msg.beatGridLen);
-        beatGrid.fill(NaN);
-        s.set("beatGrid", beatGrid);
-        const beatPulses = new Float32Array(msg.beatPulsesLen);
-        beatPulses.fill(NaN);
-        s.set("beatPulses", beatPulses);
-        const beatState = new Float32Array(msg.beatStateLen);
-        beatState.fill(NaN);
-        s.set("beatState", beatState);
-        this.view.applyConfigured(msg);
+      if (msg.type !== "features") return;
+      for (const [name, buf] of Object.entries(msg.buffers)) {
+        this.store.set(name, buf);
       }
     };
-
-    // HMR: this App instance has a fresh, empty Scene and no line renderers.
-    // The page-lifetime worklet only auto-emits `configured` on its own boot
-    // (already happened) or on a `configure` request (which would reset DSP
-    // state). `sync` asks it to re-emit the cached `configured` payload so we
-    // can rebuild the line renderers without disturbing the running DSP.
-    // On initial load this is harmlessly redundant — boot's own `configured`
-    // and bridge.bootstrap()'s configure→configured both still arrive.
-    workletNode.port.postMessage({ type: "sync" });
 
     const loop = (now: number) => {
       this.fps.begin();
