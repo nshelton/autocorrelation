@@ -12,18 +12,11 @@ export interface BeatDebugSizes {
   beatStateLen: number;
 }
 
-export interface BeatDebugFeatures {
-  beatGrid?: Float32Array;
-  beatPulses?: Float32Array;
-  beatState?: Float32Array;
-}
-
 /**
  * Composes the three beat-debug renderers (static autocorr grid, scrolling
- * rms-history grid, 2×2 pulse squares) along with their shared buffer
- * allocations and feature ingestion. Owns its own subset of the FeatureStore
- * keys: `beatGrid` and `beatPulses`. App passes through `applyFeatures()`
- * for each "features" message and `applyConfigured()` whenever sizes change.
+ * rms-history grid, 2×2 pulse squares). Reads `beatGrid` / `beatPulses` /
+ * `beatState` from the FeatureStore (App owns those store entries); App
+ * calls {@link applyConfigured} whenever sizes change to rebuild renderers.
  *
  * Layout constants are baked in here — these renderers are only meaningful
  * when overlaid on the rms-history / autocorr-accumulator areas built by
@@ -36,29 +29,13 @@ export class BeatDebugView {
 
   constructor(private scene: Scene, private store: FeatureStore) {}
 
-  applyFeatures(msg: BeatDebugFeatures): void {
-    if (msg.beatGrid) this.store.set("beatGrid", msg.beatGrid);
-    if (msg.beatPulses) this.store.set("beatPulses", msg.beatPulses);
-    if (msg.beatState) this.store.set("beatState", msg.beatState);
-  }
-
   /**
-   * Tear down any existing renderers, allocate fresh NaN-filled buffers in
-   * the store, and rebuild all three renderers at the new sizes. Idempotent
-   * — safe to call multiple times.
+   * Tear down any existing renderers and rebuild them at the new sizes.
+   * App owns store buffers; this only handles renderer (re)construction.
+   * Idempotent — safe to call multiple times.
    */
   applyConfigured(sizes: BeatDebugSizes): void {
     this.dispose();
-
-    const beatGridInit = new Float32Array(sizes.beatGridLen);
-    beatGridInit.fill(NaN);
-    this.store.set("beatGrid", beatGridInit);
-    const beatPulsesInit = new Float32Array(sizes.beatPulsesLen);
-    beatPulsesInit.fill(NaN);
-    this.store.set("beatPulses", beatPulsesInit);
-    const beatStateInit = new Float32Array(sizes.beatStateLen);
-    beatStateInit.fill(NaN);
-    this.store.set("beatState", beatStateInit);
 
     // Linear x-mapping shared by both grid renderers — matches `linearLayout`
     // and `PeakMarkers` so the grid lines pixel-align with the chart lines.

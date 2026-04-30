@@ -112,20 +112,14 @@ const onStart = async (
 ): Promise<void> => {
   if (started) return;
   started = true;
-  startMic.disabled = true;
-  startTab.disabled = true;
-  if (startTest) startTest.disabled = true;
-  buttons.style.opacity = "0.5";
+  buttons.style.display = "none";
   try {
     pageDeps = await buildPageDeps(factory);
     buildAppLayer(pageDeps);
   } catch (err) {
     started = false;
     pageDeps = null;
-    startMic.disabled = false;
-    startTab.disabled = false;
-    if (startTest) startTest.disabled = false;
-    buttons.style.opacity = "1";
+    buttons.style.display = "";
     console.error("[app] start failed:", err);
     alert(err instanceof Error ? err.message : String(err));
   }

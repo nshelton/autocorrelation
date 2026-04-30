@@ -84,10 +84,47 @@ export class App {
     workletNode.port.onmessage = (e) => {
       const msg = e.data as WorkletMsg;
       if (msg.type === "features") {
-        this.view.applyFeatures(msg);
+        const s = this.store;
+        if (msg.waveform) s.set("waveform", msg.waveform);
+        if (msg.spectrum) s.set("spectrum", msg.spectrum);
+        if (msg.bufferAcf) s.set("bufferAcf", msg.bufferAcf);
+        if (msg.onset) s.set("onset", msg.onset);
+        if (msg.onsetAcf) s.set("onsetAcf", msg.onsetAcf);
+        if (msg.onsetAcfEnhanced) s.set("onsetAcfEnhanced", msg.onsetAcfEnhanced);
+        if (msg.tea) s.set("tea", msg.tea);
+        if (msg.candidates) s.set("candidates", msg.candidates);
+        if (msg.rms) s.set("rms", msg.rms);
+        if (msg.rmsLow) s.set("rmsLow", msg.rmsLow);
+        if (msg.rmsMid) s.set("rmsMid", msg.rmsMid);
+        if (msg.rmsHigh) s.set("rmsHigh", msg.rmsHigh);
         return;
       }
       if (msg.type === "configured") {
+        const s = this.store;
+        s.set("waveform", new Float32Array(msg.waveformLen));
+        s.set("spectrum", new Float32Array(msg.spectrumLen));
+        s.set("rms", new Float32Array(msg.rmsLen));
+        s.set("bufferAcf", new Float32Array(msg.bufferAcfLen));
+        s.set("onset", new Float32Array(msg.onsetLen));
+        s.set("onsetAcf", new Float32Array(msg.onsetAcfLen));
+        s.set("onsetAcfEnhanced", new Float32Array(msg.onsetAcfLen));
+        s.set("tea", new Float32Array(msg.teaLen));
+        s.set("rmsLow", new Float32Array(msg.rmsLen));
+        s.set("rmsMid", new Float32Array(msg.rmsLen));
+        s.set("rmsHigh", new Float32Array(msg.rmsLen));
+        // NaN-filled: empty-slot sentinel for PeakMarkers and beat overlays.
+        const candidates = new Float32Array(msg.candidatesLen);
+        candidates.fill(NaN);
+        s.set("candidates", candidates);
+        const beatGrid = new Float32Array(msg.beatGridLen);
+        beatGrid.fill(NaN);
+        s.set("beatGrid", beatGrid);
+        const beatPulses = new Float32Array(msg.beatPulsesLen);
+        beatPulses.fill(NaN);
+        s.set("beatPulses", beatPulses);
+        const beatState = new Float32Array(msg.beatStateLen);
+        beatState.fill(NaN);
+        s.set("beatState", beatState);
         this.view.applyConfigured(msg);
       }
     };
