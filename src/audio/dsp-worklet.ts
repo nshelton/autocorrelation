@@ -83,7 +83,7 @@ class DSPProcessor extends AudioWorkletProcessor {
     // Cache the buffer name list. Names are static across reconfigurations,
     // so this could fire only at boot, but rebuilding it on each configure
     // is cheap and removes the "did names change?" question.
-    this.bufferNames = Array.from(this.dsp.buffer_names());
+    this.bufferNames = this.dsp.buffer_names();
   }
 
   process(inputs: Float32Array[][]): boolean {
