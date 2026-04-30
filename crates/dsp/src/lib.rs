@@ -70,7 +70,10 @@ pub struct Dsp {
     db_floor: f32,
     rms_history: Vec<f32>,
     onset_history: Vec<f32>,
-    prev_rms: f32,
+    /// Previous frame's per-bin magnitudes, in the same units as the spectrum
+    /// loop's `mag` (i.e. already scaled by `mag_scale`). Length = spectrum.len().
+    /// Used to compute spectral-flux OSS as Σ max(0, |X[k]| - prev_mag[k]).
+    prev_mag: Vec<f32>,
     buffer_acf: Vec<f32>,
     /// Per-process-call EMA coefficient for the spectrum. Computed from
     /// `SMOOTHING_TAU_SECS` and the wall-clock dt between hops
@@ -90,8 +93,8 @@ pub struct Dsp {
     /// units. Equals 2 / (N · Σ hann²). The 2 accounts for the one-sided real
     /// spectrum; Σ hann² is the window's energy correction.
     parseval_band_scale: f32,
-    low_rms_history:  Vec<f32>,
-    mid_rms_history:  Vec<f32>,
+    low_rms_history: Vec<f32>,
+    mid_rms_history: Vec<f32>,
     high_rms_history: Vec<f32>,
     /// Public per-frame `[period, phase, score]` from the P&T pipeline.
     beat_grid: Vec<f32>,
@@ -112,8 +115,8 @@ pub struct Dsp {
     gen_acf_freq_buf: Vec<Complex<f32>>,
     onset_acf: Vec<f32>,
     onset_acf_enhanced: Vec<f32>,
-    candidates: Vec<f32>,                   // stride 3: [lag_frac, mag, sharpness]
-    cand_scratch: Vec<(usize, f32)>,        // preallocated scratch for picker
+    candidates: Vec<f32>,            // stride 3: [lag_frac, mag, sharpness]
+    cand_scratch: Vec<(usize, f32)>, // preallocated scratch for picker
     tau_min: usize,
     tau_max: usize,
     /// Per-candidate max-φ correlation from `score_phase_for_tau` (X in the paper).
@@ -150,14 +153,21 @@ pub struct Dsp {
 #[wasm_bindgen]
 impl Dsp {
     #[wasm_bindgen(constructor)]
-    pub fn new(window_size: usize, sample_rate: f32, hop_size: usize, rms_history_len: usize) -> Dsp {
+    pub fn new(
+        window_size: usize,
+        sample_rate: f32,
+        hop_size: usize,
+        rms_history_len: usize,
+    ) -> Dsp {
         let mut planner = RealFftPlanner::<f32>::new();
         let fft = planner.plan_fft_forward(window_size);
         let freq_buffer = fft.make_output_vec();
-        let spectrum = vec![0.0; freq_buffer.len() - 1]; // drop DC
+        let spectrum_len = freq_buffer.len() - 1; // drop DC
+        let spectrum = vec![0.0; spectrum_len];
         let hann: Vec<f32> = (0..window_size)
             .map(|i| {
-                0.5 - 0.5 * (2.0 * std::f32::consts::PI * i as f32 / (window_size as f32 - 1.0)).cos()
+                0.5 - 0.5
+                    * (2.0 * std::f32::consts::PI * i as f32 / (window_size as f32 - 1.0)).cos()
             })
             .collect();
         let mag_scale = 2.0 / hann.iter().sum::<f32>();
@@ -188,15 +198,15 @@ impl Dsp {
             db_floor: -100.0,
             rms_history: vec![0.0; rms_history_len],
             onset_history: vec![0.0; rms_history_len],
-            prev_rms: 0.0,
+            prev_mag: vec![0.0; spectrum_len],
             buffer_acf: vec![0.0; window_size / 2],
             smoothing_alpha,
             dt,
             low_band_bin_end,
             mid_band_bin_end,
             parseval_band_scale,
-            low_rms_history:  vec![0.0; rms_history_len],
-            mid_rms_history:  vec![0.0; rms_history_len],
+            low_rms_history: vec![0.0; rms_history_len],
+            mid_rms_history: vec![0.0; rms_history_len],
             high_rms_history: vec![0.0; rms_history_len],
             beat_grid: vec![f32::NAN; BEAT_GRID_LEN],
             beat_state: vec![f32::NAN; BEAT_STATE_LEN],
@@ -212,16 +222,16 @@ impl Dsp {
             cand_scratch: Vec::with_capacity(onset_acf_len / 2 + 1),
             tau_min,
             tau_max,
-            pulse_x:     [0.0; MAX_PEAKS],
-            pulse_v:     [0.0; MAX_PEAKS],
-            pulse_phi:   [0.0; MAX_PEAKS],
+            pulse_x: [0.0; MAX_PEAKS],
+            pulse_v: [0.0; MAX_PEAKS],
+            pulse_phi: [0.0; MAX_PEAKS],
             pulse_score: [0.0; MAX_PEAKS],
             period_inst: f32::NAN,
-            phase_inst:  f32::NAN,
-            score_inst:  0.0,
+            phase_inst: f32::NAN,
+            score_inst: 0.0,
             tea: vec![0.0; rms_history_len / 2],
             tea_alpha,
-            tau_smoothed:   f32::NAN,
+            tau_smoothed: f32::NAN,
             phase_smoothed: f32::NAN,
         }
     }
@@ -260,31 +270,6 @@ impl Dsp {
         let last = self.rms_history.len() - 1;
         self.rms_history[last] = rms;
 
-        // Half-wave-rectified RMS difference — proxy for the paper's spectral
-        // flux OSS. `rms` is the just-computed full-band RMS for this frame.
-        let onset = (rms - self.prev_rms).max(0.0);
-        self.prev_rms = rms;
-        self.onset_history.copy_within(1.., 0);
-        let last = self.onset_history.len() - 1;
-        self.onset_history[last] = onset;
-
-        compute_gen_acf(
-            &self.onset_history,
-            &mut self.onset_acf,
-            &self.gen_acf_fft_forward,
-            &self.gen_acf_fft_inverse,
-            &mut self.gen_acf_time_buf,
-            &mut self.gen_acf_freq_buf,
-        );
-        compute_harmonic_enhanced(&self.onset_acf, &mut self.onset_acf_enhanced);
-        self.pick_candidates();
-        self.score_candidates();
-        self.update_tea();
-        self.write_beat_outputs();
-        self.update_beat_pulses_v2();
-
-        autocorrelate(&self.waveform, &mut self.buffer_acf);
-
         // Apply Hann window
         for i in 0..n {
             self.fft_buffer[i] = input[i] * self.hann[i];
@@ -298,6 +283,33 @@ impl Dsp {
         let _ = self
             .fft
             .process(&mut self.fft_buffer, &mut self.freq_buffer);
+
+        // Spectral-flux onset signal + spectrum smoothing in one pass over
+        // bins 1..=N/2 (DC excluded, Nyquist included). SF = Σ max(0, |X[k]| - prev_mag[k]):
+        // half-wave-rectified per-bin magnitude rise. Standard OSS for beat
+        // tracking (Ellis 2007, Percival & Tzanetakis 2014). Frequency-aware
+        // where RMS-diff is not — a snare hit dumps energy into mid/high bins
+        // that weren't there last frame even when total RMS barely moves.
+        let mut flux = 0.0f32;
+        for (out_i, bin) in self.freq_buffer[1..=self.spectrum.len()].iter().enumerate() {
+            let mag = (bin.re * bin.re + bin.im * bin.im).sqrt() * self.mag_scale;
+            flux += (mag - self.prev_mag[out_i]).max(0.0);
+            self.prev_mag[out_i] = mag;
+
+            let db = if mag > 0.0 {
+                20.0 * mag.log10()
+            } else {
+                self.db_floor
+            };
+            let clipped = db.clamp(self.db_floor, 0.0);
+            let normalized = (clipped - self.db_floor) / (-self.db_floor); // [0, 1]
+            self.spectrum[out_i] = self.smoothing_alpha * normalized
+                + (1.0 - self.smoothing_alpha) * self.spectrum[out_i];
+        }
+
+        self.onset_history.copy_within(1.., 0);
+        let last = self.onset_history.len() - 1;
+        self.onset_history[last] = flux;
 
         // --- Per-band RMS via Parseval-correct FFT-bin energy summation. ---
         // band_rms = sqrt(parseval_band_scale · Σ|X[k]|² over band).
@@ -319,8 +331,8 @@ impl Dsp {
             let c = self.freq_buffer[k];
             high_e += c.re * c.re + c.im * c.im;
         }
-        let low_rms  = (low_e  * self.parseval_band_scale).sqrt();
-        let mid_rms  = (mid_e  * self.parseval_band_scale).sqrt();
+        let low_rms = (low_e * self.parseval_band_scale).sqrt();
+        let mid_rms = (mid_e * self.parseval_band_scale).sqrt();
         let high_rms = (high_e * self.parseval_band_scale).sqrt();
 
         // Shift each band history left, append newest at the end (oldest at index 0).
@@ -336,20 +348,22 @@ impl Dsp {
             history[last] = value;
         }
 
-        // Magnitude → dB → normalized [0, 1] → smoothed
-        // Skip bin 0 (DC); use bins 1..=spectrum.len()
-        for (out_i, bin) in self.freq_buffer[1..=self.spectrum.len()].iter().enumerate() {
-            let mag = (bin.re * bin.re + bin.im * bin.im).sqrt() * self.mag_scale;
-            let db = if mag > 0.0 {
-                20.0 * mag.log10()
-            } else {
-                self.db_floor
-            };
-            let clipped = db.clamp(self.db_floor, 0.0);
-            let normalized = (clipped - self.db_floor) / (-self.db_floor); // [0, 1]
-            self.spectrum[out_i] = self.smoothing_alpha * normalized
-                + (1.0 - self.smoothing_alpha) * self.spectrum[out_i];
-        }
+        compute_gen_acf(
+            &self.onset_history,
+            &mut self.onset_acf,
+            &self.gen_acf_fft_forward,
+            &self.gen_acf_fft_inverse,
+            &mut self.gen_acf_time_buf,
+            &mut self.gen_acf_freq_buf,
+        );
+        compute_harmonic_enhanced(&self.onset_acf, &mut self.onset_acf_enhanced);
+        self.pick_candidates();
+        self.score_candidates();
+        self.update_tea();
+        self.write_beat_outputs();
+        self.update_beat_pulses_v2();
+
+        autocorrelate(&self.waveform, &mut self.buffer_acf);
     }
 
     pub fn waveform(&self) -> Vec<f32> {
@@ -411,7 +425,6 @@ impl Dsp {
     pub fn beat_state(&self) -> Vec<f32> {
         self.beat_state.clone()
     }
-
 }
 
 impl Dsp {
@@ -428,26 +441,25 @@ impl Dsp {
         let upper = self.tau_max.min(self.onset_acf_enhanced.len() - 1);
         for k in self.tau_min..upper {
             let y = self.onset_acf_enhanced[k];
-            if y > 0.0
-                && y > self.onset_acf_enhanced[k - 1]
-                && y > self.onset_acf_enhanced[k + 1]
-            {
+            if y > 0.0 && y > self.onset_acf_enhanced[k - 1] && y > self.onset_acf_enhanced[k + 1] {
                 self.cand_scratch.push((k, y));
             }
         }
 
         // 2. sort descending by magnitude
-        self.cand_scratch.sort_unstable_by(|a, b|
-            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        self.cand_scratch
+            .sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
         // 3. greedy select top-N with min-spacing
         let mut accepted: [u32; MAX_PEAKS] = [0; MAX_PEAKS];
         let mut count: usize = 0;
         for &(k, _) in &self.cand_scratch {
-            if count == MAX_PEAKS { break; }
-            let too_close = accepted[..count].iter().any(|&j| {
-                ((k as i32 - j as i32).unsigned_abs() as usize) < MIN_PEAK_SPACING
-            });
+            if count == MAX_PEAKS {
+                break;
+            }
+            let too_close = accepted[..count]
+                .iter()
+                .any(|&j| ((k as i32 - j as i32).unsigned_abs() as usize) < MIN_PEAK_SPACING);
             if !too_close {
                 accepted[count] = k as u32;
                 count += 1;
@@ -467,9 +479,9 @@ impl Dsp {
                 let delta = (0.5 * (y0 - y2) / denom).clamp(-0.5, 0.5);
                 (k as f32 + delta, y1 - 0.25 * (y0 - y2) * delta)
             };
-            self.candidates[3 * i]     = lag_frac;
+            self.candidates[3 * i] = lag_frac;
             self.candidates[3 * i + 1] = mag;
-            self.candidates[3 * i + 2] = -denom;  // sharpness — large for narrow peaks
+            self.candidates[3 * i + 2] = -denom; // sharpness — large for narrow peaks
         }
     }
 
@@ -482,20 +494,26 @@ impl Dsp {
         let mut count = 0usize;
         for i in 0..MAX_PEAKS {
             let lag = self.candidates[3 * i];
-            if lag.is_nan() { break; }
+            if lag.is_nan() {
+                break;
+            }
             let (phi, x, sum, sum_sq, n_phi) = score_phase_for_tau(&self.onset_history, lag);
             let n = n_phi as f32;
             let mean = if n > 0.0 { sum / n } else { 0.0 };
-            let var = if n > 0.0 { (sum_sq / n - mean * mean).max(0.0) } else { 0.0 };
-            self.pulse_x[i]   = x;
-            self.pulse_v[i]   = var;
+            let var = if n > 0.0 {
+                (sum_sq / n - mean * mean).max(0.0)
+            } else {
+                0.0
+            };
+            self.pulse_x[i] = x;
+            self.pulse_v[i] = var;
             self.pulse_phi[i] = phi as f32;
             count += 1;
         }
         if count == 0 {
             self.period_inst = f32::NAN;
-            self.phase_inst  = f32::NAN;
-            self.score_inst  = 0.0;
+            self.phase_inst = f32::NAN;
+            self.score_inst = 0.0;
             return;
         }
         let sum_x: f32 = self.pulse_x[..count].iter().sum();
@@ -503,20 +521,31 @@ impl Dsp {
         let mut best_i = 0usize;
         let mut best_score = -1.0f32;
         for i in 0..count {
-            let xn = if sum_x > 0.0 { self.pulse_x[i] / sum_x } else { 0.0 };
-            let vn = if sum_v > 0.0 { self.pulse_v[i] / sum_v } else { 0.0 };
+            let xn = if sum_x > 0.0 {
+                self.pulse_x[i] / sum_x
+            } else {
+                0.0
+            };
+            let vn = if sum_v > 0.0 {
+                self.pulse_v[i] / sum_v
+            } else {
+                0.0
+            };
             let s = xn + vn;
             self.pulse_score[i] = s;
-            if s > best_score { best_score = s; best_i = i; }
+            if s > best_score {
+                best_score = s;
+                best_i = i;
+            }
         }
         if best_score <= 0.0 {
             self.period_inst = f32::NAN;
-            self.phase_inst  = f32::NAN;
-            self.score_inst  = 0.0;
+            self.phase_inst = f32::NAN;
+            self.score_inst = 0.0;
         } else {
             self.period_inst = self.candidates[3 * best_i];
-            self.phase_inst  = self.pulse_phi[best_i];
-            self.score_inst  = best_score;
+            self.phase_inst = self.pulse_phi[best_i];
+            self.score_inst = best_score;
         }
     }
 
@@ -537,17 +566,22 @@ impl Dsp {
                 self.tea[tau] = (1.0 - alpha) * self.tea[tau] + alpha * g;
             }
         } else {
-            for v in self.tea.iter_mut() { *v *= 1.0 - alpha; }
+            for v in self.tea.iter_mut() {
+                *v *= 1.0 - alpha;
+            }
         }
 
         let upper = self.tau_max.min(self.tea.len() - 1);
         let mut best_i = self.tau_min;
         let mut best_v = -1.0f32;
         for i in self.tau_min..=upper {
-            if self.tea[i] > best_v { best_v = self.tea[i]; best_i = i; }
+            if self.tea[i] > best_v {
+                best_v = self.tea[i];
+                best_i = i;
+            }
         }
         if best_v <= 0.0 {
-            self.tau_smoothed   = f32::NAN;
+            self.tau_smoothed = f32::NAN;
             self.phase_smoothed = f32::NAN;
             return;
         }
@@ -580,10 +614,14 @@ impl Dsp {
             self.beat_state[2] = f32::NAN;
             self.beat_state[3] = f32::NAN;
         } else {
-            self.beat_grid[0]  = p;
-            self.beat_grid[1]  = phi;
-            self.beat_grid[2]  = s;
-            self.beat_state[0] = if p > 0.0 { 60.0 / (p * self.dt) } else { f32::NAN };
+            self.beat_grid[0] = p;
+            self.beat_grid[1] = phi;
+            self.beat_grid[2] = s;
+            self.beat_state[0] = if p > 0.0 {
+                60.0 / (p * self.dt)
+            } else {
+                f32::NAN
+            };
             self.beat_state[1] = s;
             self.beat_state[2] = f32::NAN; // beats_per_measure deferred
             self.beat_state[3] = f32::NAN; // measure_conf deferred
@@ -778,7 +816,9 @@ impl Dsp {
         let n = self.onset_acf_enhanced.len().min(src.len());
         self.onset_acf_enhanced[..n].copy_from_slice(&src[..n]);
         if n < self.onset_acf_enhanced.len() {
-            for v in &mut self.onset_acf_enhanced[n..] { *v = 0.0; }
+            for v in &mut self.onset_acf_enhanced[n..] {
+                *v = 0.0;
+            }
         }
     }
 
@@ -794,7 +834,9 @@ impl Dsp {
         let n = self.onset_history.len().min(src.len());
         self.onset_history[..n].copy_from_slice(&src[..n]);
         if n < self.onset_history.len() {
-            for v in &mut self.onset_history[n..] { *v = 0.0; }
+            for v in &mut self.onset_history[n..] {
+                *v = 0.0;
+            }
         }
     }
 
@@ -817,17 +859,24 @@ impl Dsp {
         (self.period_inst, self.phase_inst, self.score_inst)
     }
 
-    pub fn tea_len(&self) -> usize { self.tea.len() }
-    pub fn tea_alpha(&self) -> f32 { self.tea_alpha }
-    pub fn tea_argmax(&self) -> f32 { self.tau_smoothed }
+    pub fn tea_len(&self) -> usize {
+        self.tea.len()
+    }
+    pub fn tea_alpha(&self) -> f32 {
+        self.tea_alpha
+    }
+    pub fn tea_argmax(&self) -> f32 {
+        self.tau_smoothed
+    }
     pub fn test_set_tea(&mut self, src: &[f32]) {
         let n = self.tea.len().min(src.len());
         self.tea[..n].copy_from_slice(&src[..n]);
         if n < self.tea.len() {
-            for v in &mut self.tea[n..] { *v = 0.0; }
+            for v in &mut self.tea[n..] {
+                *v = 0.0;
+            }
         }
     }
-
 }
 
 #[cfg(test)]
@@ -948,9 +997,7 @@ mod tests {
     #[test]
     fn buffer_acf_zero_lag_is_one_for_nonzero_signal() {
         let mut dsp = Dsp::new(2048, 48000.0, 1024, 512);
-        let signal: Vec<f32> = (0..2048)
-            .map(|i| ((i as f32) * 0.1).sin())
-            .collect();
+        let signal: Vec<f32> = (0..2048).map(|i| ((i as f32) * 0.1).sin()).collect();
         dsp.process(&signal);
         let acf = dsp.buffer_acf();
         assert!((acf[0] - 1.0).abs() < 1e-6, "got {}", acf[0]);
@@ -970,9 +1017,23 @@ mod tests {
         // ACF of a sine has local maxima at integer multiples of the period.
         // Verify lag 48 is a local maximum (greater than its neighbors) AND
         // the correlation is strong (close to 1.0 after normalization).
-        assert!(acf[48] > acf[47], "expected acf[48]={} > acf[47]={}", acf[48], acf[47]);
-        assert!(acf[48] > acf[49], "expected acf[48]={} > acf[49]={}", acf[48], acf[49]);
-        assert!(acf[48] > 0.9, "expected strong peak at period, got acf[48]={}", acf[48]);
+        assert!(
+            acf[48] > acf[47],
+            "expected acf[48]={} > acf[47]={}",
+            acf[48],
+            acf[47]
+        );
+        assert!(
+            acf[48] > acf[49],
+            "expected acf[48]={} > acf[49]={}",
+            acf[48],
+            acf[49]
+        );
+        assert!(
+            acf[48] > 0.9,
+            "expected strong peak at period, got acf[48]={}",
+            acf[48]
+        );
     }
 
     #[test]
@@ -1052,7 +1113,8 @@ mod tests {
         let n = 2048usize;
         let hann_energy: f32 = (0..n)
             .map(|i| {
-                let h = 0.5 - 0.5 * (2.0 * std::f32::consts::PI * i as f32 / (n as f32 - 1.0)).cos();
+                let h =
+                    0.5 - 0.5 * (2.0 * std::f32::consts::PI * i as f32 / (n as f32 - 1.0)).cos();
                 h * h
             })
             .sum();
@@ -1093,7 +1155,12 @@ mod tests {
         let after_two = dsp.spectrum();
         // With alpha ≈ 1, EMA fully replaces each call → stable across calls.
         for (a, b) in after_one.iter().zip(after_two.iter()) {
-            assert!((a - b).abs() < 1e-5, "alpha≈1 EMA should be stable: {} vs {}", a, b);
+            assert!(
+                (a - b).abs() < 1e-5,
+                "alpha≈1 EMA should be stable: {} vs {}",
+                a,
+                b
+            );
         }
 
         // tau extremely large → alpha → 0 (no update).
@@ -1105,15 +1172,19 @@ mod tests {
         // Spectrum stays near zero because the EMA barely moves.
         let small = dsp.spectrum();
         let max = small.iter().cloned().fold(0.0_f32, f32::max);
-        assert!(max < 0.1, "expected sluggish EMA → near-zero spectrum after 3 calls, got max={}", max);
+        assert!(
+            max < 0.1,
+            "expected sluggish EMA → near-zero spectrum after 3 calls, got max={}",
+            max
+        );
     }
 
     #[test]
     fn set_db_floor_clamps() {
         let mut dsp = Dsp::new(2048, 48000.0, 1024, 512);
         dsp.set_db_floor(-1000.0); // should clamp to -200.0
-        // Silent input → spectrum should saturate to the (clamped) floor's normalized value.
-        // Since silent audio yields mag=0 → db=floor → normalized=0, spectrum stays zero.
+                                   // Silent input → spectrum should saturate to the (clamped) floor's normalized value.
+                                   // Since silent audio yields mag=0 → db=floor → normalized=0, spectrum stays zero.
         let silent = vec![0.0_f32; 2048];
         for _ in 0..5 {
             dsp.process(&silent);
@@ -1184,7 +1255,11 @@ mod tests {
         let low = *dsp.low_rms_history().last().unwrap();
         let mid = *dsp.mid_rms_history().last().unwrap();
         let high = *dsp.high_rms_history().last().unwrap();
-        assert!((high - 0.7071).abs() < 0.05, "high {} should be ≈ 0.707", high);
+        assert!(
+            (high - 0.7071).abs() < 0.05,
+            "high {} should be ≈ 0.707",
+            high
+        );
         assert!(low < 0.05, "low {} should be near zero", low);
         assert!(mid < 0.05, "mid {} should be near zero", mid);
     }
@@ -1237,12 +1312,16 @@ mod tests {
             .map(|i| (2.0 * std::f32::consts::PI * 93.75 * (i as f32 / 48000.0)).sin())
             .collect();
         let silent = vec![0.0_f32; 2048];
-        dsp.process(&loud_low);   // pushes a non-zero into history
-        dsp.process(&silent);     // pushes a zero
+        dsp.process(&loud_low); // pushes a non-zero into history
+        dsp.process(&silent); // pushes a zero
         let h = dsp.low_rms_history();
         let n = h.len();
         assert_eq!(h[n - 1], 0.0, "newest should be silent");
-        assert!(h[n - 2] > 0.5, "second-newest should be the loud sine, got {}", h[n - 2]);
+        assert!(
+            h[n - 2] > 0.5,
+            "second-newest should be the loud sine, got {}",
+            h[n - 2]
+        );
     }
 
     #[test]
@@ -1254,7 +1333,8 @@ mod tests {
         let sr = 48000.0_f32;
         let period_hops = 32usize;
         for k in 0..1500 {
-            let amp = 0.6 + 0.3 * (2.0 * std::f32::consts::PI * (k as f32) / (period_hops as f32)).sin();
+            let amp =
+                0.6 + 0.3 * (2.0 * std::f32::consts::PI * (k as f32) / (period_hops as f32)).sin();
             let signal: Vec<f32> = (0..2048)
                 .map(|i| {
                     let t = i as f32 / sr;
@@ -1268,7 +1348,8 @@ mod tests {
             assert!(
                 !v.is_nan() && (0.0..=1.0).contains(&v),
                 "pulse[{}] out of range: {}",
-                i, v
+                i,
+                v
             );
         }
         // Cycle 1 should change after one more hop (saw advances by 1/period
@@ -1285,8 +1366,17 @@ mod tests {
         let dp16 = (pulses_after[3] - p16_before).abs();
         // Cycle 16 should move 16× less than cycle 1 (loosely; allow some slack
         // for boundary wraps).
-        assert!(dp1 > 0.005, "cycle-1 should advance per hop, got Δ = {}", dp1);
-        assert!(dp16 < dp1, "cycle-16 should advance less than cycle-1: {} vs {}", dp16, dp1);
+        assert!(
+            dp1 > 0.005,
+            "cycle-1 should advance per hop, got Δ = {}",
+            dp1
+        );
+        assert!(
+            dp16 < dp1,
+            "cycle-16 should advance less than cycle-1: {} vs {}",
+            dp16,
+            dp1
+        );
     }
 
     #[test]
@@ -1297,7 +1387,8 @@ mod tests {
         let sr = 48000.0_f32;
         let period_hops = 36usize;
         for k in 0..1500 {
-            let amp = 0.6 + 0.3 * (2.0 * std::f32::consts::PI * (k as f32) / (period_hops as f32)).sin();
+            let amp =
+                0.6 + 0.3 * (2.0 * std::f32::consts::PI * (k as f32) / (period_hops as f32)).sin();
             let signal: Vec<f32> = (0..2048)
                 .map(|i| {
                     let t = i as f32 / sr;
@@ -1311,41 +1402,64 @@ mod tests {
         assert!(
             (grid[0] - period_hops as f32).abs() < 1.5,
             "expected period ≈ {}, got {}",
-            period_hops, grid[0]
+            period_hops,
+            grid[0]
         );
     }
 
     #[test]
-    fn onset_history_captures_positive_rms_diff() {
-        // RMS of a constant-amplitude signal A over a frame is A.
-        // Step ladder: silence (RMS 0) → 0.5 → 0.5 → 0.3.
-        // Expected onset values per process call (max(0, rms - prev_rms)):
-        //   process(silent): rms=0, prev=0 → onset=0
-        //   process(half):   rms=0.5, prev=0   → onset=0.5
-        //   process(half):   rms=0.5, prev=0.5 → onset=0
-        //   process(lower):  rms=0.3, prev=0.5 → onset=0  (negative diff clamped)
+    fn onset_history_captures_spectral_flux() {
+        // SF = Σ_k max(0, |X[k]| - |X_prev[k]|): half-wave-rectified bin-magnitude
+        // rise. Drive a 1 kHz sine ladder so the spectrum has a real peak that
+        // changes between frames. Expected pattern:
+        //   process(silent): all bins zero, prev zero → flux = 0
+        //   process(loud):   bins jump from 0 → big positive flux
+        //   process(loud):   identical input → identical FFT → flux = 0
+        //   process(quiet):  every bin decreased → flux = 0 (clamped)
         let mut dsp = Dsp::new(2048, 48000.0, 1024, 512);
+        let sr = 48000.0_f32;
+        let make_sine = |amp: f32| -> Vec<f32> {
+            (0..2048)
+                .map(|i| amp * (2.0 * std::f32::consts::PI * 1000.0 * (i as f32 / sr)).sin())
+                .collect()
+        };
         let silent = vec![0.0f32; 2048];
-        let half   = vec![0.5f32; 2048];
-        let lower  = vec![0.3f32; 2048];
+        let loud = make_sine(0.5);
+        let quiet = make_sine(0.2);
+
         dsp.process(&silent);
-        dsp.process(&half);
-        dsp.process(&half);
-        dsp.process(&lower);
+        dsp.process(&loud);
+        dsp.process(&loud);
+        dsp.process(&quiet);
+
         let onset = dsp.onset_history();
         let n = onset.len();
         // newest at index n-1, oldest at index 0
-        assert!((onset[n - 1] - 0.0).abs() < 1e-3, "newest = {}", onset[n - 1]);
-        assert!((onset[n - 2] - 0.0).abs() < 1e-3, "newest-1 = {}", onset[n - 2]);
-        assert!((onset[n - 3] - 0.5).abs() < 1e-2, "newest-2 = {}", onset[n - 3]);
-        assert!((onset[n - 4] - 0.0).abs() < 1e-3, "newest-3 = {}", onset[n - 4]);
+        assert!(onset[n - 4].abs() < 1e-4, "silent = {}", onset[n - 4]);
+        assert!(
+            onset[n - 3] > 0.1,
+            "silence→sine should be a positive spike, got {}",
+            onset[n - 3]
+        );
+        assert!(
+            onset[n - 2].abs() < 1e-4,
+            "identical frames = {}",
+            onset[n - 2]
+        );
+        assert!(
+            onset[n - 1].abs() < 1e-4,
+            "amplitude decrease should clamp to 0, got {}",
+            onset[n - 1]
+        );
     }
 
     #[test]
     fn gen_acf_silent_input_is_zero() {
         let mut dsp = Dsp::new(2048, 48000.0, 1024, 512);
         let silent = vec![0.0f32; 2048];
-        for _ in 0..5 { dsp.process(&silent); }
+        for _ in 0..5 {
+            dsp.process(&silent);
+        }
         let acf = dsp.onset_acf();
         for &v in acf.iter() {
             assert!(!v.is_nan(), "silent gen-ACF must not be NaN, got {}", v);
@@ -1361,7 +1475,8 @@ mod tests {
         let sr = 48000.0_f32;
         let period_hops = 32usize;
         for k in 0..1500 {
-            let amp = 0.6 + 0.3 * (2.0 * std::f32::consts::PI * (k as f32) / (period_hops as f32)).sin();
+            let amp =
+                0.6 + 0.3 * (2.0 * std::f32::consts::PI * (k as f32) / (period_hops as f32)).sin();
             let signal: Vec<f32> = (0..2048)
                 .map(|i| amp * (2.0 * std::f32::consts::PI * 1000.0 * (i as f32 / sr)).sin())
                 .collect();
@@ -1369,14 +1484,20 @@ mod tests {
         }
         let acf = dsp.onset_acf();
         let p = period_hops;
-        let around = (p - 5..=p + 5).map(|i| acf[i]).fold(f32::NEG_INFINITY, f32::max);
+        let around = (p - 5..=p + 5)
+            .map(|i| acf[i])
+            .fold(f32::NEG_INFINITY, f32::max);
         // Avoid lags near period/2 = 16 (a natural ACF harmonic of the sine envelope)
         // and lags very close to 0 (trivially high by normalization). Use lags 5-12
         // as a "genuinely non-periodic" reference region.
         let far = (5..=12).map(|i| acf[i]).fold(f32::NEG_INFINITY, f32::max);
-        assert!(around > far,
+        assert!(
+            around > far,
             "peak near lag {} ({:.3}) should exceed nearby non-period max ({:.3})",
-            p, around, far);
+            p,
+            around,
+            far
+        );
     }
 
     #[test]
@@ -1391,18 +1512,32 @@ mod tests {
         acf[40] = 0.2;
         let mut enhanced = vec![0.0f32; 64];
         compute_harmonic_enhanced(&acf, &mut enhanced);
-        assert!((enhanced[10] - 1.0).abs() < 1e-6, "enhanced[10] = {}", enhanced[10]);
+        assert!(
+            (enhanced[10] - 1.0).abs() < 1e-6,
+            "enhanced[10] = {}",
+            enhanced[10]
+        );
         // enhanced[20] = acf[20] + acf[40] + acf[80(oob)] = 0.3 + 0.2 + 0 = 0.5
-        assert!((enhanced[20] - 0.5).abs() < 1e-6, "enhanced[20] = {}", enhanced[20]);
+        assert!(
+            (enhanced[20] - 0.5).abs() < 1e-6,
+            "enhanced[20] = {}",
+            enhanced[20]
+        );
         // enhanced[40] = acf[40] + acf[80(oob)] + acf[160(oob)] = 0.2
-        assert!((enhanced[40] - 0.2).abs() < 1e-6, "enhanced[40] = {}", enhanced[40]);
+        assert!(
+            (enhanced[40] - 0.2).abs() < 1e-6,
+            "enhanced[40] = {}",
+            enhanced[40]
+        );
     }
 
     #[test]
     fn pick_candidates_silent_all_nan() {
         let mut dsp = Dsp::new(2048, 48000.0, 1024, 512);
         let silent = vec![0.0f32; 2048];
-        for _ in 0..5 { dsp.process(&silent); }
+        for _ in 0..5 {
+            dsp.process(&silent);
+        }
         let cands = dsp.candidates();
         assert_eq!(cands.len(), 30);
         for &v in cands.iter() {
@@ -1413,14 +1548,14 @@ mod tests {
     #[test]
     fn pick_candidates_top_n_within_tau_range() {
         let mut dsp = Dsp::new(2048, 48000.0, 1024, 512);
-        let n = dsp.onset_acf_enhanced_len();  // = rms_history_len / 2 = 256
+        let n = dsp.onset_acf_enhanced_len(); // = rms_history_len / 2 = 256
         let mut enhanced = vec![0.0f32; n];
         let positions = [14usize, 18, 22, 26, 30, 34, 38, 42, 46, 50, 54, 58];
         for (i, &p) in positions.iter().enumerate() {
             // Make each a strict local max with descending magnitude
             let mag = 1.0 - 0.05 * i as f32;
             enhanced[p - 1] = mag * 0.5;
-            enhanced[p]     = mag;
+            enhanced[p] = mag;
             enhanced[p + 1] = mag * 0.5;
         }
         dsp.test_set_onset_acf_enhanced(&enhanced);
@@ -1431,7 +1566,12 @@ mod tests {
             let lag = cands[3 * i];
             let mag = cands[3 * i + 1];
             assert!(!lag.is_nan(), "slot {} should have a peak, got NaN", i);
-            assert!(mag <= last_mag, "magnitudes should be descending: {} > {}", mag, last_mag);
+            assert!(
+                mag <= last_mag,
+                "magnitudes should be descending: {} > {}",
+                mag,
+                last_mag
+            );
             last_mag = mag;
         }
     }
@@ -1441,16 +1581,23 @@ mod tests {
         let mut dsp = Dsp::new(2048, 48000.0, 1024, 512);
         let n = dsp.onset_acf_enhanced_len();
         let mut enhanced = vec![0.0f32; n];
-        enhanced[5] = 1.0; enhanced[4] = 0.5; enhanced[6] = 0.5;
-        enhanced[100] = 1.0; enhanced[99] = 0.5; enhanced[101] = 0.5;
+        enhanced[5] = 1.0;
+        enhanced[4] = 0.5;
+        enhanced[6] = 0.5;
+        enhanced[100] = 1.0;
+        enhanced[99] = 0.5;
+        enhanced[101] = 0.5;
         dsp.test_set_onset_acf_enhanced(&enhanced);
         dsp.test_run_pick_candidates();
         let cands = dsp.candidates();
         for i in 0..10 {
             let lag = cands[3 * i];
             if !lag.is_nan() {
-                assert!(lag >= 12.0 && lag <= 70.0,
-                    "picked lag {} outside [12, 70]", lag);
+                assert!(
+                    lag >= 12.0 && lag <= 70.0,
+                    "picked lag {} outside [12, 70]",
+                    lag
+                );
             }
         }
     }
@@ -1473,11 +1620,23 @@ mod tests {
         dsp.test_set_onset_history(&onset);
         dsp.test_run_pick_and_score();
         let (period_inst, phase_inst, score_inst) = dsp.test_per_frame_estimate();
-        assert!(score_inst > 0.0, "expected nonzero score, got {}", score_inst);
-        assert!((period_inst - period as f32).abs() < 1.5,
-            "expected period ≈ {}, got {}", period, period_inst);
-        assert!(phase_inst >= 0.0 && phase_inst < period_inst,
-            "phase {} should be in [0, period={})", phase_inst, period_inst);
+        assert!(
+            score_inst > 0.0,
+            "expected nonzero score, got {}",
+            score_inst
+        );
+        assert!(
+            (period_inst - period as f32).abs() < 1.5,
+            "expected period ≈ {}, got {}",
+            period,
+            period_inst
+        );
+        assert!(
+            phase_inst >= 0.0 && phase_inst < period_inst,
+            "phase {} should be in [0, period={})",
+            phase_inst,
+            period_inst
+        );
     }
 
     #[test]
@@ -1494,13 +1653,18 @@ mod tests {
         let mut onset = vec![0.0f32; n];
         for k in 1..(n / 36 + 1) {
             let i = k * 36;
-            if i < n { onset[i] = 1.0; }
+            if i < n {
+                onset[i] = 1.0;
+            }
         }
         dsp.test_set_onset_history(&onset);
         dsp.test_run_pick_and_score();
         let (period_inst, _, _) = dsp.test_per_frame_estimate();
-        assert!((period_inst - 36.0).abs() < 1.5,
-            "sub-period disambiguation failed: expected 36, got {}", period_inst);
+        assert!(
+            (period_inst - 36.0).abs() < 1.5,
+            "sub-period disambiguation failed: expected 36, got {}",
+            period_inst
+        );
     }
 
     #[test]
@@ -1513,12 +1677,18 @@ mod tests {
         dsp.process(&silent);
         let after = dsp.tea();
         for i in 0..n {
-            assert!(after[i] < pre_charged[i] + 1e-6,
+            assert!(
+                after[i] < pre_charged[i] + 1e-6,
                 "tea[{}] should not increase under silence: before={}, after={}",
-                i, pre_charged[i], after[i]);
+                i,
+                pre_charged[i],
+                after[i]
+            );
         }
         // 3 × τ at 4 s default, at ~47 Hz hop rate ≈ 565 hops; 600 is safely past that.
-        for _ in 0..600 { dsp.process(&silent); }
+        for _ in 0..600 {
+            dsp.process(&silent);
+        }
         let later = dsp.tea();
         for &v in &later {
             assert!(v < 0.05, "after long silence TEA should be ~0, got {}", v);
@@ -1532,7 +1702,8 @@ mod tests {
         let sr = 48000.0_f32;
         let period_hops = 36usize;
         for k in 0..1500 {
-            let amp = 0.6 + 0.3 * (2.0 * std::f32::consts::PI * (k as f32) / (period_hops as f32)).sin();
+            let amp =
+                0.6 + 0.3 * (2.0 * std::f32::consts::PI * (k as f32) / (period_hops as f32)).sin();
             let signal: Vec<f32> = (0..2048)
                 .map(|i| amp * (2.0 * std::f32::consts::PI * 1000.0 * (i as f32 / sr)).sin())
                 .collect();
@@ -1540,8 +1711,12 @@ mod tests {
         }
         let tau_smoothed = dsp.tea_argmax();
         assert!(!tau_smoothed.is_nan(), "expected fit");
-        assert!((tau_smoothed - period_hops as f32).abs() < 1.5,
-            "expected ~{}, got {}", period_hops, tau_smoothed);
+        assert!(
+            (tau_smoothed - period_hops as f32).abs() < 1.5,
+            "expected ~{}, got {}",
+            period_hops,
+            tau_smoothed
+        );
     }
 
     #[test]
@@ -1566,7 +1741,8 @@ mod tests {
         let sr = 48000.0_f32;
         let period_hops = 36usize;
         for k in 0..1500 {
-            let amp = 0.6 + 0.3 * (2.0 * std::f32::consts::PI * (k as f32) / (period_hops as f32)).sin();
+            let amp =
+                0.6 + 0.3 * (2.0 * std::f32::consts::PI * (k as f32) / (period_hops as f32)).sin();
             let signal: Vec<f32> = (0..2048)
                 .map(|i| amp * (2.0 * std::f32::consts::PI * 1000.0 * (i as f32 / sr)).sin())
                 .collect();
@@ -1575,13 +1751,29 @@ mod tests {
         let grid = dsp.beat_grid();
         let state = dsp.beat_state();
         assert!(!grid[0].is_nan(), "expected period fit");
-        assert!((grid[0] - period_hops as f32).abs() < 1.5,
-            "period: expected ~{}, got {}", period_hops, grid[0]);
+        assert!(
+            (grid[0] - period_hops as f32).abs() < 1.5,
+            "period: expected ~{}, got {}",
+            period_hops,
+            grid[0]
+        );
         let bpm_expected = 60.0 / (period_hops as f32 * (1024.0 / 48000.0));
-        assert!((state[0] - bpm_expected).abs() < 4.0,
-            "bpm: expected ~{:.1}, got {:.1}", bpm_expected, state[0]);
-        assert!(state[2].is_nan(), "beats_per_measure should be NaN, got {}", state[2]);
-        assert!(state[3].is_nan(), "measure_conf should be NaN, got {}", state[3]);
+        assert!(
+            (state[0] - bpm_expected).abs() < 4.0,
+            "bpm: expected ~{:.1}, got {:.1}",
+            bpm_expected,
+            state[0]
+        );
+        assert!(
+            state[2].is_nan(),
+            "beats_per_measure should be NaN, got {}",
+            state[2]
+        );
+        assert!(
+            state[3].is_nan(),
+            "measure_conf should be NaN, got {}",
+            state[3]
+        );
     }
 
     #[test]
@@ -1591,10 +1783,17 @@ mod tests {
         // `beat_pulses_free_run_at_default_rate_under_silence`.)
         let mut dsp = Dsp::new(2048, 48000.0, 1024, 512);
         let silent = vec![0.0f32; 2048];
-        for _ in 0..50 { dsp.process(&silent); }
+        for _ in 0..50 {
+            dsp.process(&silent);
+        }
         let pulses = dsp.beat_pulses();
         for (i, &v) in pulses.iter().enumerate() {
-            assert!(v.is_nan(), "pulse[{}] expected NaN under silence, got {}", i, v);
+            assert!(
+                v.is_nan(),
+                "pulse[{}] expected NaN under silence, got {}",
+                i,
+                v
+            );
         }
     }
 }

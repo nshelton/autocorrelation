@@ -21,7 +21,9 @@ let panel: ParamPanel | null = null;
 let bridge: WorkletBridge | null = null;
 let initialBootstrap = true;
 
-async function buildPageDeps(factory: () => Promise<AudioSourceBundle>): Promise<AppDeps> {
+async function buildPageDeps(
+  factory: () => Promise<AudioSourceBundle>,
+): Promise<AppDeps> {
   const { context, source, stream } = await factory();
 
   console.log("[audio] context.sampleRate:", context.sampleRate, "Hz");
@@ -63,9 +65,15 @@ async function buildPageDeps(factory: () => Promise<AudioSourceBundle>): Promise
   const sr = context.sampleRate;
   const fftSize = paramStore.get("dsp.windowSize");
   console.log(
-    "[audio] FFT bins map: bin0=DC, bin1=" + (sr / fftSize).toFixed(1) + "Hz, " +
-    `bin${fftSize / 2 - 1}=` + (((fftSize / 2 - 1) * sr) / fftSize).toFixed(0) + "Hz, " +
-    "Nyquist=" + (sr / 2).toFixed(0) + "Hz",
+    "[audio] FFT bins map: bin0=DC, bin1=" +
+      (sr / fftSize).toFixed(1) +
+      "Hz, " +
+      `bin${fftSize / 2 - 1}=` +
+      (((fftSize / 2 - 1) * sr) / fftSize).toFixed(0) +
+      "Hz, " +
+      "Nyquist=" +
+      (sr / 2).toFixed(0) +
+      "Hz",
   );
 
   return { canvas, renderer, audioContext: context, workletNode, paramStore };
@@ -93,11 +101,15 @@ function teardownAppLayer(): void {
 
 const startMic = document.getElementById("start-mic") as HTMLButtonElement;
 const startTab = document.getElementById("start-tab") as HTMLButtonElement;
-const startTest = document.getElementById("start-test") as HTMLButtonElement | null;
+const startTest = document.getElementById(
+  "start-test",
+) as HTMLButtonElement | null;
 const buttons = document.getElementById("start-buttons") as HTMLDivElement;
 
 let started = false;
-const onStart = async (factory: () => Promise<AudioSourceBundle>): Promise<void> => {
+const onStart = async (
+  factory: () => Promise<AudioSourceBundle>,
+): Promise<void> => {
   if (started) return;
   started = true;
   startMic.disabled = true;
@@ -158,7 +170,8 @@ if (import.meta.hot) {
       // change in this update batch — keep the existing constructor ref.
       if (appMod && appMod.App) AppCtor = appMod.App;
       if (panelMod && panelMod.ParamPanel) ParamPanelCtor = panelMod.ParamPanel;
-      if (bridgeMod && bridgeMod.WorkletBridge) WorkletBridgeCtor = bridgeMod.WorkletBridge;
+      if (bridgeMod && bridgeMod.WorkletBridge)
+        WorkletBridgeCtor = bridgeMod.WorkletBridge;
       if (!pageDeps) return;
       teardownAppLayer();
       try {

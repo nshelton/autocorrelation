@@ -1,8 +1,7 @@
 import { Scene } from "three";
-import { LineRenderer } from "./LineRenderer";
+import { LineRenderer, type LineLayout } from "./LineRenderer";
 import { PeakMarkers } from "./PeakMarkers";
 import { BeatDebugView } from "./BeatDebugView";
-import { linearLayout, logSpectrumLayout } from "./LineLayouts";
 import type { FeatureStore } from "../store/FeatureStore";
 import type { ParamStore } from "../params/ParamStore";
 
@@ -45,6 +44,92 @@ export interface DebugSizes {
   beatStateLen: number;
 }
 
+type LineStoreKey =
+  | "waveform"
+  | "bufferAcf"
+  | "spectrum"
+  | "rmsLowAuto"
+  | "rmsMidAuto"
+  | "rmsHighAuto"
+  | "rmsAuto"
+  | "onset"
+  | "onsetAcf"
+  | "onsetAcfEnhanced"
+  | "tea";
+
+interface LineSpec {
+  key: LineStoreKey;
+  color: number;
+  layout?: LineLayout;
+  position?: [number, number, number];
+  scale?: [number, number, number];
+}
+
+const LINE_SPECS: readonly LineSpec[] = [
+  { key: "waveform", color: 0x66ffcc, position: [-1, 1, 0] },
+  {
+    key: "bufferAcf",
+    color: 0xcc99ff,
+    position: [1, 0.8, 0],
+    scale: [1, 0.5, 1],
+  },
+  {
+    key: "spectrum",
+    color: 0xffaa66,
+    layout: "log",
+    position: [0, 1.23, 0],
+    scale: [2, 0.5, 1],
+  },
+  {
+    key: "rmsLowAuto",
+    color: 0xaa2222,
+    scale: [4, 0.5, 1],
+    position: [-2, 0, 0],
+  },
+  {
+    key: "rmsMidAuto",
+    color: 0x22aa22,
+    scale: [4, 0.5, 1],
+    position: [-2, 0, 0],
+  },
+  {
+    key: "rmsHighAuto",
+    color: 0x2222aa,
+    scale: [4, 0.5, 1],
+    position: [-2, 0, 0],
+  },
+  {
+    key: "rmsAuto",
+    color: 0xffffff,
+    scale: [4, 0.5, 1],
+    position: [-2, 0, 0],
+  },
+  {
+    key: "onset",
+    color: 0xff9966,
+    scale: [4, 5, 1],
+    position: [-2, -0.2, 0],
+  },
+  {
+    key: "onsetAcf",
+    color: 0x66ffff,
+    position: [1, -1, 0],
+    scale: [1, 10, 1],
+  },
+  {
+    key: "onsetAcfEnhanced",
+    color: 0xff99cc,
+    position: [1, -1.5, 0],
+    scale: [1, 10, 1],
+  },
+  {
+    key: "tea",
+    color: 0xffff66,
+    position: [-1, -1, 0],
+    scale: [1, 2, 1],
+  },
+];
+
 /**
  * Owns every visualization layer for the audio-feature stream:
  *   - waveform / spectrum / buffer-ACF
@@ -67,19 +152,9 @@ export interface DebugSizes {
  * audio I/O wiring) stay in App.
  */
 export class DebugView {
-  private waveformLine?: LineRenderer;
-  private spectrumLine?: LineRenderer;
-  private rmsLine?: LineRenderer;
-  private bufferAcfLine?: LineRenderer;
-  private onsetLine?: LineRenderer;
-  private onsetAcfLine?: LineRenderer;
-  private onsetAcfEnhancedLine?: LineRenderer;
-  private teaLine?: LineRenderer;
+  private lines = new Map<LineStoreKey, LineRenderer>();
   private peakMarkers?: PeakMarkers;
-  private lowRmsLine?: LineRenderer;
-  private midRmsLine?: LineRenderer;
-  private highRmsLine?: LineRenderer;
-  private beatDebug: BeatDebugView;
+  // private beatDebug: BeatDebugView;
 
   // Per-channel running peak for the autogained RMS-history lines. See
   // `applyAutoGain` for the EMA-style decay semantics. Zero means
@@ -93,7 +168,7 @@ export class DebugView {
   };
 
   constructor(private deps: DebugViewDeps) {
-    this.beatDebug = new BeatDebugView(deps.scene, deps.store);
+    // this.beatDebug = new BeatDebugView(deps.scene, deps.store);
   }
 
   applyFeatures(msg: DebugFeatures): void {
@@ -103,7 +178,8 @@ export class DebugView {
     if (msg.bufferAcf) store.set("bufferAcf", msg.bufferAcf);
     if (msg.onset) store.set("onset", msg.onset);
     if (msg.onsetAcf) store.set("onsetAcf", msg.onsetAcf);
-    if (msg.onsetAcfEnhanced) store.set("onsetAcfEnhanced", msg.onsetAcfEnhanced);
+    if (msg.onsetAcfEnhanced)
+      store.set("onsetAcfEnhanced", msg.onsetAcfEnhanced);
     if (msg.tea) store.set("tea", msg.tea);
     if (msg.candidates) store.set("candidates", msg.candidates);
     if (msg.rms) {
@@ -122,25 +198,11 @@ export class DebugView {
       store.set("rmsHigh", msg.rmsHigh);
       this.applyAutoGain("rmsHigh", msg.rmsHigh);
     }
-    this.beatDebug.applyFeatures(msg);
+    // this.beatDebug.applyFeatures(msg);
   }
 
   applyConfigured(sizes: DebugSizes): void {
-    for (const line of [
-      this.waveformLine,
-      this.bufferAcfLine,
-      this.spectrumLine,
-      this.lowRmsLine,
-      this.midRmsLine,
-      this.highRmsLine,
-      this.rmsLine,
-      this.onsetLine,
-      this.onsetAcfLine,
-      this.onsetAcfEnhancedLine,
-      this.teaLine,
-    ]) {
-      line?.dispose();
-    }
+    this.disposeLines();
     this.peakMarkers?.dispose();
 
     const { store, scene } = this.deps;
@@ -169,82 +231,7 @@ export class DebugView {
     store.set("rmsHighAuto", new Float32Array(sizes.rmsLen));
     for (const k of Object.keys(this.runningMax)) this.runningMax[k] = 0;
 
-    this.waveformLine = new LineRenderer({
-      source: () => store.get("waveform"),
-      layout: linearLayout(1.0, 0.4),
-      color: 0x66ffcc,
-    });
-    scene.add(this.waveformLine.object3d);
-
-    this.bufferAcfLine = new LineRenderer({
-      source: () => store.get("bufferAcf"),
-      layout: linearLayout(0.5, 0.4),
-      color: 0xcc99ff,
-    });
-    scene.add(this.bufferAcfLine.object3d);
-
-    this.spectrumLine = new LineRenderer({
-      source: () => store.get("spectrum"),
-      layout: logSpectrumLayout(0.0, 0.4),
-      color: 0xffaa66,
-    });
-    scene.add(this.spectrumLine.object3d);
-
-    this.lowRmsLine = new LineRenderer({
-      source: () => store.get("rmsLowAuto"),
-      layout: linearLayout(-0.5, 0.4),
-      color: 0xaa2222,
-    });
-    scene.add(this.lowRmsLine.object3d);
-
-    this.midRmsLine = new LineRenderer({
-      source: () => store.get("rmsMidAuto"),
-      layout: linearLayout(-0.5, 0.4),
-      color: 0x22aa22,
-    });
-    scene.add(this.midRmsLine.object3d);
-
-    this.highRmsLine = new LineRenderer({
-      source: () => store.get("rmsHighAuto"),
-      layout: linearLayout(-0.5, 0.4),
-      color: 0x2222aa,
-    });
-    scene.add(this.highRmsLine.object3d);
-
-    this.rmsLine = new LineRenderer({
-      source: () => store.get("rmsAuto"),
-      layout: linearLayout(-0.5, 0.4),
-      color: 0xffffff,
-    });
-    scene.add(this.rmsLine.object3d);
-
-    this.onsetLine = new LineRenderer({
-      source: () => store.get("onset"),
-      layout: linearLayout(0.0, 0.4),
-      color: 0xff9966,
-    });
-    scene.add(this.onsetLine.object3d);
-
-    this.onsetAcfLine = new LineRenderer({
-      source: () => store.get("onsetAcf"),
-      layout: linearLayout(-1.0, 0.4),
-      color: 0x66ffff,
-    });
-    scene.add(this.onsetAcfLine.object3d);
-
-    this.onsetAcfEnhancedLine = new LineRenderer({
-      source: () => store.get("onsetAcfEnhanced"),
-      layout: linearLayout(-1.0, 0.4),
-      color: 0xff99cc,
-    });
-    scene.add(this.onsetAcfEnhancedLine.object3d);
-
-    this.teaLine = new LineRenderer({
-      source: () => store.get("tea"),
-      layout: linearLayout(-1.0, 0.4),
-      color: 0xffff66,
-    });
-    scene.add(this.teaLine.object3d);
+    this.createLines();
 
     this.peakMarkers = new PeakMarkers({
       source: () => store.get("candidates"),
@@ -252,51 +239,45 @@ export class DebugView {
       lagDomain: sizes.onsetAcfLen,
       yCenter: -1.0,
       ySpan: 0.4,
-      // Mirrors linearLayout's x-formula. If you change one, change the other —
-      // markers must sit on the exact x-positions of the accumulator line they
-      // annotate, or peaks will visually drift off the line they describe.
       xForLag: (lag, n) => (n <= 1 ? 0 : (lag / (n - 1)) * 2 - 1),
       baseColor: 0x888888,
     });
     scene.add(this.peakMarkers.object3d);
 
-    this.beatDebug.applyConfigured(sizes);
+    // this.beatDebug.applyConfigured(sizes);
   }
 
   update(): void {
-    this.waveformLine?.update();
-    this.bufferAcfLine?.update();
-    this.spectrumLine?.update();
-    this.lowRmsLine?.update();
-    this.midRmsLine?.update();
-    this.highRmsLine?.update();
-    this.rmsLine?.update();
-    this.onsetLine?.update();
-    this.onsetAcfLine?.update();
-    this.onsetAcfEnhancedLine?.update();
-    this.teaLine?.update();
+    for (const line of this.lines.values()) line.update();
     this.peakMarkers?.update();
-    this.beatDebug.update();
+    // this.beatDebug.update();
   }
 
   dispose(): void {
-    for (const line of [
-      this.waveformLine,
-      this.bufferAcfLine,
-      this.spectrumLine,
-      this.lowRmsLine,
-      this.midRmsLine,
-      this.highRmsLine,
-      this.rmsLine,
-      this.onsetLine,
-      this.onsetAcfLine,
-      this.onsetAcfEnhancedLine,
-      this.teaLine,
-    ]) {
-      line?.dispose();
-    }
+    this.disposeLines();
     this.peakMarkers?.dispose();
-    this.beatDebug.dispose();
+    // this.beatDebug.dispose();
+  }
+
+  private createLines(): void {
+    const { store, scene } = this.deps;
+
+    for (const spec of LINE_SPECS) {
+      const line = new LineRenderer({
+        source: () => store.get(spec.key),
+        color: spec.color,
+        layout: spec.layout,
+      });
+      if (spec.position) line.object3d.position.set(...spec.position);
+      if (spec.scale) line.object3d.scale.set(...spec.scale);
+      scene.add(line.object3d);
+      this.lines.set(spec.key, line);
+    }
+  }
+
+  private disposeLines(): void {
+    for (const line of this.lines.values()) line.dispose();
+    this.lines.clear();
   }
 
   /**
@@ -332,7 +313,8 @@ export class DebugView {
     }
     const tauSecs = this.deps.paramStore.get("dsp.autoGain");
     const dt =
-      this.deps.paramStore.get("dsp.hopSize") / this.deps.audioContext.sampleRate;
+      this.deps.paramStore.get("dsp.hopSize") /
+      this.deps.audioContext.sampleRate;
     const retention = Math.exp(-dt / tauSecs);
     const latest = raw[raw.length - 1];
     this.runningMax[key] = Math.max(latest, retention * this.runningMax[key]);
