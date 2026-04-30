@@ -101,6 +101,33 @@ impl Dsp {
         crate::acf::autocorrelate(&self.buffers.waveform, &mut self.buffers.bufferAcf);
     }
 
+    /// String-keyed buffer accessor. Returns a copy of the named buffer's
+    /// current contents, or an empty Vec if the name is unknown. Callers
+    /// should rely on `buffer_names()` for the authoritative list.
+    pub fn get_buffer(&self, name: &str) -> Vec<f32> {
+        self.buffers.get(name).map(|s| s.to_vec()).unwrap_or_default()
+    }
+
+    /// All public buffer names in stable order. Worklet caches this once at
+    /// boot; the names are static across reconfigurations.
+    pub fn buffer_names(&self) -> Vec<String> {
+        self.buffers.descriptors()
+            .into_iter()
+            .map(|(name, _)| name.to_string())
+            .collect()
+    }
+
+    /// Set a tunable param. Unknown keys are silently ignored.
+    /// Recognized keys: "smoothingTauSecs", "teaTauSecs", "dbFloor".
+    pub fn set_param(&mut self, key: &str, value: f32) {
+        match key {
+            "smoothingTauSecs" => self.spectrum.set_smoothing_tau(value, self.dt),
+            "teaTauSecs" => self.beat.set_tea_tau(value, self.dt),
+            "dbFloor" => self.db_floor = value.clamp(-200.0, 0.0),
+            _ => {}
+        }
+    }
+
     pub fn waveform(&self) -> Vec<f32> { self.buffers.waveform.clone() }
     pub fn spectrum(&self) -> Vec<f32> { self.buffers.spectrum.clone() }
     pub fn buffer_acf(&self) -> Vec<f32> { self.buffers.bufferAcf.clone() }
