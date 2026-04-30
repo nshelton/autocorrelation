@@ -43,14 +43,6 @@ const BEAT_GRID_LEN: usize = 3;
 /// LCM of these (= 16) is also the wrap-around modulus for `beat_position`.
 const BEAT_PULSE_CYCLES: [f32; 4] = [1.0, 2.0, 4.0, 8.0];
 const BEAT_PULSES_LEN: usize = 4;
-/// Harmonic stretch factors for `compute_harmonic_enhanced`. Per Percival &
-/// Tzanetakis 2014 §II-B.3: [2, 4] are the two factors that reliably reinforce
-/// the fundamental without introducing sub-octave artifacts.
-const HARMONIC_MULTIPLES: [usize; 2] = [2, 4];
-/// Number of pulses per train in `score_phase_for_tau`. The paper recommends
-/// enough pulses to span the onset_history window; 4 covers ~4 beats at the
-/// slowest tracked tempo (40 BPM) without wasting work at fast tempos.
-const PULSE_N: usize = 4;
 /// Gaussian kernel width (σ in lag units) for smearing a TEA vote. Wider σ
 /// means the vote from `period_inst` spreads over more lag bins — enough to
 /// bridge sub-bin variation between frames without hiding adjacent peaks.
@@ -178,8 +170,8 @@ impl Dsp {
         let mag_scale = 2.0 / hann.iter().sum::<f32>();
         let dt = hop_size as f32 / sample_rate;
         let smoothing_alpha = 1.0 - (-dt / SMOOTHING_TAU_SECS).exp();
-        let low_band_bin_end = bin_for_hz(LOW_BAND_HZ_MAX, sample_rate, window_size);
-        let mid_band_bin_end = bin_for_hz(MID_BAND_HZ_MAX, sample_rate, window_size);
+        let low_band_bin_end = crate::acf::bin_for_hz(LOW_BAND_HZ_MAX, sample_rate, window_size);
+        let mid_band_bin_end = crate::acf::bin_for_hz(MID_BAND_HZ_MAX, sample_rate, window_size);
         let hann_energy: f32 = hann.iter().map(|h| h * h).sum();
         let parseval_band_scale = 2.0 / (window_size as f32 * hann_energy);
         let tea_alpha = 1.0 - (-dt / TEA_TAU_DEFAULT_SECS).exp();
@@ -353,7 +345,7 @@ impl Dsp {
             history[last] = value;
         }
 
-        compute_gen_acf(
+        crate::acf::compute_gen_acf(
             &self.onset_history,
             &mut self.onset_acf,
             &self.gen_acf_fft_forward,
@@ -361,14 +353,14 @@ impl Dsp {
             &mut self.gen_acf_time_buf,
             &mut self.gen_acf_freq_buf,
         );
-        compute_harmonic_enhanced(&self.onset_acf, &mut self.onset_acf_enhanced);
+        crate::acf::compute_harmonic_enhanced(&self.onset_acf, &mut self.onset_acf_enhanced);
         self.pick_candidates();
         self.score_candidates();
         self.update_tea();
         self.write_beat_outputs();
         self.update_beat_pulses_v2();
 
-        autocorrelate(&self.waveform, &mut self.buffer_acf);
+        crate::acf::autocorrelate(&self.waveform, &mut self.buffer_acf);
     }
 
     pub fn waveform(&self) -> Vec<f32> {
@@ -502,7 +494,7 @@ impl Dsp {
             if lag.is_nan() {
                 break;
             }
-            let (phi, x, sum, sum_sq, n_phi) = score_phase_for_tau(&self.onset_history, lag);
+            let (phi, x, sum, sum_sq, n_phi) = crate::beat::score_phase_for_tau(&self.onset_history, lag);
             let n = n_phi as f32;
             let mean = if n > 0.0 { sum / n } else { 0.0 };
             let var = if n > 0.0 {
@@ -602,7 +594,7 @@ impl Dsp {
             }
         }
         self.tau_smoothed = tau;
-        let (phi, _, _, _, _) = score_phase_for_tau(&self.onset_history, tau);
+        let (phi, _, _, _, _) = crate::beat::score_phase_for_tau(&self.onset_history, tau);
         self.phase_smoothed = phi as f32;
     }
 
@@ -660,157 +652,6 @@ impl Dsp {
     }
 }
 
-/// Generalized autocorrelation per Percival & Tzanetakis 2014 §II-B.2:
-/// zero-pad input to 2N, forward FFT, magnitude compression `|X|^0.5`, inverse
-/// FFT, take the first N/2 lags, normalize so output[0] == 1.0. Allocation-
-/// free: caller passes scratch buffers (`time_buf` length 2N, `freq_buf`
-/// length N+1) and pre-built `realfft` planners.
-///
-/// `c = 0.5` (the paper's empirically best choice) gives narrower ACF peaks
-/// than `c = 2.0` (regular ACF) — this is what makes downstream peak picking
-/// and pulse-train scoring more discriminative.
-fn compute_gen_acf(
-    input: &[f32],
-    output: &mut [f32],
-    fft_forward: &Arc<dyn RealToComplex<f32>>,
-    fft_inverse: &Arc<dyn ComplexToReal<f32>>,
-    time_buf: &mut [f32],
-    freq_buf: &mut [Complex<f32>],
-) {
-    let n = input.len();
-    debug_assert_eq!(time_buf.len(), 2 * n);
-    debug_assert_eq!(freq_buf.len(), n + 1);
-
-    time_buf[..n].copy_from_slice(input);
-    time_buf[n..].fill(0.0);
-
-    let _ = fft_forward.process(time_buf, freq_buf);
-
-    // |X|^0.5 magnitude compression (Percival & Tzanetakis c=0.5). After
-    // squaring re²+im² this becomes (·)^0.25; the division by time_buf[0]
-    // below cancels realfft's unnormalized IFFT scale.
-    for x in freq_buf.iter_mut() {
-        let compressed = (x.re * x.re + x.im * x.im).powf(0.25);
-        *x = Complex::new(compressed, 0.0);
-    }
-
-    let _ = fft_inverse.process(freq_buf, time_buf);
-
-    let zero = time_buf[0].max(1e-12);
-    for i in 0..output.len() {
-        output[i] = time_buf[i] / zero;
-    }
-}
-
-/// Score one tempo lag `tau` against the OSS by sweeping integer phases
-/// `phi ∈ [0, ceil(tau))`. Returns `(best_phi, best_corr, sum_corr,
-/// sum_corr_sq, n_phases)`. Pulse-train is the paper's combined
-/// `Φ₁ (w=1.0) + Φ₂ (w=0.5) + Φ₁.₅ (w=0.5)` with N=4 pulses each. Pulses
-/// are placed *backward* from the most-recent onset sample so `phi = 0`
-/// means "a beat just landed". Out-of-frame pulses are omitted, per the
-/// paper's "if an index falls outside the OSS frame, that pulse is omitted".
-fn score_phase_for_tau(onset: &[f32], tau: f32) -> (usize, f32, f32, f32, usize) {
-    let n = onset.len();
-    if n == 0 || tau < 1.0 {
-        return (0, 0.0, 0.0, 0.0, 0);
-    }
-    let last = (n - 1) as i32;
-    let phi_max = (tau.ceil() as usize).max(1);
-
-    let mut best_phi = 0usize;
-    let mut best_corr = -1.0f32;
-    let mut sum = 0.0f32;
-    let mut sum_sq = 0.0f32;
-
-    for phi in 0..phi_max {
-        let mut corr = 0.0f32;
-        // Φ₁ at k·τ, weight 1.0
-        for k in 0..PULSE_N {
-            let off = (k as f32 * tau).round() as i32;
-            let pos = last - phi as i32 - off;
-            if pos >= 0 && (pos as usize) < n {
-                corr += onset[pos as usize];
-            }
-        }
-        // Φ₂ at k·2τ, weight 0.5
-        for k in 0..PULSE_N {
-            let off = (k as f32 * 2.0 * tau).round() as i32;
-            let pos = last - phi as i32 - off;
-            if pos >= 0 && (pos as usize) < n {
-                corr += 0.5 * onset[pos as usize];
-            }
-        }
-        // Φ₁.₅ at (k+0.5)·τ, weight 0.5
-        for k in 0..PULSE_N {
-            let off = ((k as f32 + 0.5) * tau).round() as i32;
-            let pos = last - phi as i32 - off;
-            if pos >= 0 && (pos as usize) < n {
-                corr += 0.5 * onset[pos as usize];
-            }
-        }
-
-        sum += corr;
-        sum_sq += corr * corr;
-        if corr > best_corr {
-            best_corr = corr;
-            best_phi = phi;
-        }
-    }
-
-    (best_phi, best_corr.max(0.0), sum, sum_sq, phi_max)
-}
-
-/// Per Percival & Tzanetakis 2014 §II-B.3: boost peaks corresponding to
-/// integer multiples of the underlying tempo by adding time-stretched
-/// versions of the ACF. For each `mult ∈ HARMONIC_MULTIPLES`, `enhanced[τ] +=
-/// acf[mult * τ]` when `mult * τ < acf.len()`. `enhanced` should be the
-/// same length as `acf` (caller's responsibility).
-fn compute_harmonic_enhanced(acf: &[f32], enhanced: &mut [f32]) {
-    let n = acf.len();
-    for tau in 0..n {
-        let mut sum = acf[tau];
-        for &mult in &HARMONIC_MULTIPLES {
-            let idx = tau * mult;
-            if idx < n {
-                sum += acf[idx];
-            }
-        }
-        enhanced[tau] = sum;
-    }
-}
-
-/// Direct time-domain autocorrelation, normalized so output[0] == 1.0
-/// for any nonzero input. For all-zero input the output is filled with
-/// zeros (no NaN from division by zero). The caller chooses how many
-/// lags to compute via the length of `output`.
-fn autocorrelate(input: &[f32], output: &mut [f32]) {
-    let n = input.len();
-    for k in 0..output.len() {
-        let mut sum = 0.0f32;
-        if k < n {
-            for i in 0..(n - k) {
-                sum += input[i] * input[i + k];
-            }
-        }
-        output[k] = sum;
-    }
-    let zero = output[0];
-    if zero > 0.0 {
-        for v in output.iter_mut() {
-            *v /= zero;
-        }
-    } else {
-        output.fill(0.0);
-    }
-}
-
-/// Snap a frequency in Hz to the nearest one-sided real-FFT bin index,
-/// clamped to [1, N/2 - 1] (DC and Nyquist are excluded by design).
-fn bin_for_hz(hz: f32, sample_rate: f32, n: usize) -> usize {
-    let bin = (hz * n as f32 / sample_rate).round() as usize;
-    bin.clamp(1, n / 2 - 1)
-}
-
 /// Shift a history buffer left by one slot (oldest at index 0 falls off)
 /// and write `value` at the end. No-op for empty buffers.
 fn push_history(buf: &mut [f32], value: f32) {
@@ -858,7 +699,7 @@ impl Dsp {
 
     pub fn test_run_pick_and_score(&mut self) {
         // Recompute enhanced ACF from current onset_history, then pick & score.
-        compute_gen_acf(
+        crate::acf::compute_gen_acf(
             &self.onset_history,
             &mut self.onset_acf,
             &self.gen_acf_fft_forward,
@@ -866,7 +707,7 @@ impl Dsp {
             &mut self.gen_acf_time_buf,
             &mut self.gen_acf_freq_buf,
         );
-        compute_harmonic_enhanced(&self.onset_acf, &mut self.onset_acf_enhanced);
+        crate::acf::compute_harmonic_enhanced(&self.onset_acf, &mut self.onset_acf_enhanced);
         self.pick_candidates();
         self.score_candidates();
     }
@@ -998,7 +839,7 @@ mod tests {
         // Normalized by raw[0]=30: [1.0, 20/30, 11/30].
         let input = [1.0_f32, 2.0, 3.0, 4.0];
         let mut output = [0.0_f32; 3];
-        autocorrelate(&input, &mut output);
+        crate::acf::autocorrelate(&input, &mut output);
         assert!((output[0] - 1.0).abs() < 1e-6, "got {}", output[0]);
         assert!((output[1] - 20.0 / 30.0).abs() < 1e-6, "got {}", output[1]);
         assert!((output[2] - 11.0 / 30.0).abs() < 1e-6, "got {}", output[2]);
@@ -1111,8 +952,8 @@ mod tests {
     fn bin_for_hz_snaps_at_default_settings() {
         // 150 Hz at sr=48000, N=2048: 150 * 2048 / 48000 = 6.4 → 6.
         // 1500 Hz: 1500 * 2048 / 48000 = 64.0 → 64.
-        assert_eq!(bin_for_hz(150.0, 48000.0, 2048), 6);
-        assert_eq!(bin_for_hz(1500.0, 48000.0, 2048), 64);
+        assert_eq!(crate::acf::bin_for_hz(150.0, 48000.0, 2048), 6);
+        assert_eq!(crate::acf::bin_for_hz(1500.0, 48000.0, 2048), 64);
     }
 
     #[test]
@@ -1527,7 +1368,7 @@ mod tests {
         acf[20] = 0.3;
         acf[40] = 0.2;
         let mut enhanced = vec![0.0f32; 64];
-        compute_harmonic_enhanced(&acf, &mut enhanced);
+        crate::acf::compute_harmonic_enhanced(&acf, &mut enhanced);
         assert!(
             (enhanced[10] - 1.0).abs() < 1e-6,
             "enhanced[10] = {}",
