@@ -99,3 +99,26 @@ impl Buffers {
         ]
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn descriptors_lists_15_named_buffers() {
+        let b = Buffers::new(2048, 512);
+        let d = b.descriptors();
+        assert_eq!(d.len(), 15);
+        assert_eq!(d[0], ("waveform", 2048));
+        assert_eq!(d[1], ("spectrum", 1024));
+        assert!(d.iter().any(|&(n, _)| n == "beatPulses"));
+    }
+
+    #[test]
+    fn get_returns_some_for_known_keys_none_for_unknown() {
+        let b = Buffers::new(2048, 512);
+        assert!(b.get("waveform").is_some());
+        assert!(b.get("rmsHigh").is_some());
+        assert!(b.get("notARealKey").is_none());
+    }
+}

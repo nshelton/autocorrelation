@@ -42,25 +42,6 @@ impl Dsp {
         }
     }
 
-    /// Set the spectrum smoothing time constant (seconds). The internal
-    /// `smoothing_alpha` is recomputed from `tau` and the dt captured at
-    /// construction: `alpha = 1 - exp(-dt / tau)`. Smaller tau → faster
-    /// response. Clamped to [0.001, 10.0] to avoid divide-by-zero and
-    /// nonsensical multi-second settling times.
-    pub fn set_smoothing_tau(&mut self, tau_secs: f32) {
-        self.spectrum.set_smoothing_tau(tau_secs, self.dt);
-    }
-
-    /// EMA time constant for the TEA. `alpha = 1 - exp(-dt / tau)`. Smaller
-    /// τ ⇒ faster response, less stable. Clamped to [0.05, 60.0].
-    pub fn set_tea_tau_secs(&mut self, tau_secs: f32) {
-        self.beat.set_tea_tau(tau_secs, self.dt);
-    }
-
-    pub fn set_db_floor(&mut self, floor: f32) {
-        self.db_floor = floor.clamp(-200.0, 0.0);
-    }
-
     pub fn process(&mut self, input: &[f32]) {
         let n = input.len().min(self.buffers.waveform.len());
         self.buffers.waveform[..n].copy_from_slice(&input[..n]);
@@ -128,21 +109,6 @@ impl Dsp {
         }
     }
 
-    pub fn waveform(&self) -> Vec<f32> { self.buffers.waveform.clone() }
-    pub fn spectrum(&self) -> Vec<f32> { self.buffers.spectrum.clone() }
-    pub fn buffer_acf(&self) -> Vec<f32> { self.buffers.bufferAcf.clone() }
-    pub fn rms_history(&self) -> Vec<f32> { self.buffers.rms.clone() }
-    pub fn onset_history(&self) -> Vec<f32> { self.buffers.onset.clone() }
-    pub fn onset_acf(&self) -> Vec<f32> { self.buffers.onsetAcf.clone() }
-    pub fn onset_acf_enhanced(&self) -> Vec<f32> { self.buffers.onsetAcfEnhanced.clone() }
-    pub fn candidates(&self) -> Vec<f32> { self.buffers.candidates.clone() }
-    pub fn tea(&self) -> Vec<f32> { self.buffers.tea.clone() }
-    pub fn low_rms_history(&self) -> Vec<f32> { self.buffers.rmsLow.clone() }
-    pub fn mid_rms_history(&self) -> Vec<f32> { self.buffers.rmsMid.clone() }
-    pub fn high_rms_history(&self) -> Vec<f32> { self.buffers.rmsHigh.clone() }
-    pub fn beat_grid(&self) -> Vec<f32> { self.buffers.beatGrid.clone() }
-    pub fn beat_pulses(&self) -> Vec<f32> { self.buffers.beatPulses.clone() }
-    pub fn beat_state(&self) -> Vec<f32> { self.buffers.beatState.clone() }
 }
 
 /// Shift a history buffer left by one slot (oldest at index 0 falls off)
@@ -250,13 +216,13 @@ mod tests {
         let mut dsp = Dsp::new(8, 48000.0, 4, 512);
         let input: Vec<f32> = (0..8).map(|i| i as f32 * 0.1).collect();
         dsp.process(&input);
-        assert_eq!(dsp.waveform(), input);
+        assert_eq!(dsp.get_buffer("waveform"), input);
     }
 
     #[test]
     fn spectrum_has_window_size_div_2_bins() {
         let dsp = Dsp::new(2048, 48000.0, 1024, 512);
-        assert_eq!(dsp.spectrum().len(), 1024);
+        assert_eq!(dsp.get_buffer("spectrum").len(), 1024);
     }
 
     #[test]
@@ -266,7 +232,7 @@ mod tests {
         for _ in 0..30 {
             dsp.process(&silent);
         }
-        let spec = dsp.spectrum();
+        let spec = dsp.get_buffer("spectrum");
         for &v in &spec {
             assert!(v < 0.1, "expected silent → near-zero bin, got {}", v);
         }
@@ -277,7 +243,7 @@ mod tests {
         let mut dsp = Dsp::new(8, 48000.0, 4, 512);
         let constant = vec![1.0_f32; 8];
         dsp.process(&constant);
-        let h = dsp.rms_history();
+        let h = dsp.get_buffer("rms");
         assert_eq!(h.len(), 512);
         // Newest sample at the end
         let last = h[h.len() - 1];
@@ -288,7 +254,7 @@ mod tests {
     fn rms_of_silence_is_zero() {
         let mut dsp = Dsp::new(8, 48000.0, 4, 512);
         dsp.process(&vec![0.0_f32; 8]);
-        let h = dsp.rms_history();
+        let h = dsp.get_buffer("rms");
         assert_eq!(h[h.len() - 1], 0.0);
     }
 
@@ -299,7 +265,7 @@ mod tests {
         dsp.process(&[1.0, 1.0, 1.0, 1.0]); // rms = 1
         dsp.process(&[2.0, 2.0, 2.0, 2.0]); // rms = 2
         dsp.process(&[0.0, 0.0, 0.0, 0.0]); // rms = 0
-        let h = dsp.rms_history();
+        let h = dsp.get_buffer("rms");
         let n = h.len();
         // Newest three values are at the end in the order pushed
         assert_eq!(h[n - 3], 1.0);
@@ -321,7 +287,7 @@ mod tests {
         for _ in 0..30 {
             dsp.process(&signal);
         }
-        let spec = dsp.spectrum();
+        let spec = dsp.get_buffer("spectrum");
         let (argmax, &peak) = spec
             .iter()
             .enumerate()
@@ -353,7 +319,7 @@ mod tests {
     #[test]
     fn buffer_acf_has_correct_length() {
         let dsp = Dsp::new(2048, 48000.0, 1024, 512);
-        assert_eq!(dsp.buffer_acf().len(), 1024);
+        assert_eq!(dsp.get_buffer("bufferAcf").len(), 1024);
     }
 
     #[test]
@@ -361,7 +327,7 @@ mod tests {
         let mut dsp = Dsp::new(2048, 48000.0, 1024, 512);
         let signal: Vec<f32> = (0..2048).map(|i| ((i as f32) * 0.1).sin()).collect();
         dsp.process(&signal);
-        let acf = dsp.buffer_acf();
+        let acf = dsp.get_buffer("bufferAcf");
         assert!((acf[0] - 1.0).abs() < 1e-6, "got {}", acf[0]);
     }
 
@@ -375,7 +341,7 @@ mod tests {
             .map(|i| (2.0 * std::f32::consts::PI * freq * (i as f32 / sr)).sin())
             .collect();
         dsp.process(&signal);
-        let acf = dsp.buffer_acf();
+        let acf = dsp.get_buffer("bufferAcf");
         // ACF of a sine has local maxima at integer multiples of the period.
         // Verify lag 48 is a local maximum (greater than its neighbors) AND
         // the correlation is strong (close to 1.0 after normalization).
@@ -402,7 +368,7 @@ mod tests {
     fn acf_of_silence_is_zero() {
         let mut dsp = Dsp::new(2048, 48000.0, 1024, 512);
         dsp.process(&vec![0.0_f32; 2048]);
-        for &v in dsp.buffer_acf().iter() {
+        for &v in dsp.get_buffer("bufferAcf").iter() {
             assert_eq!(v, 0.0);
         }
     }
@@ -422,7 +388,7 @@ mod tests {
 
         // tau = 0.0956 s (the SMOOTHING_TAU_SECS_DEFAULT in spectrum.rs)
         //   → alpha ≈ 1 - exp(-21.33/95.6) ≈ 0.20
-        dsp.set_smoothing_tau(0.0956);
+        dsp.set_param("smoothingTauSecs", 0.0956);
         // Drive a steady sine and verify the spectrum stabilizes (i.e. EMA is sane).
         let signal: Vec<f32> = (0..2048)
             .map(|i| (2.0 * std::f32::consts::PI * 1000.0 * (i as f32 / 48000.0)).sin())
@@ -430,18 +396,18 @@ mod tests {
         for _ in 0..30 {
             dsp.process(&signal);
         }
-        let stable = dsp.spectrum();
+        let stable = dsp.get_buffer("spectrum");
         // Find peak — should be a recognizable lobe, not flat.
         let max = stable.iter().cloned().fold(0.0_f32, f32::max);
         assert!(max > 0.5, "expected a clear spectrum peak, got max={}", max);
 
         // tau extremely small → alpha → 1 (one-shot replacement).
         let mut dsp = Dsp::new(2048, 48000.0, 1024, 512);
-        dsp.set_smoothing_tau(0.0001); // clamps to 0.001 → alpha ≈ 1.0 since dt >> tau
+        dsp.set_param("smoothingTauSecs", 0.0001); // clamps to 0.001 → alpha ≈ 1.0 since dt >> tau
         dsp.process(&signal);
-        let after_one = dsp.spectrum();
+        let after_one = dsp.get_buffer("spectrum");
         dsp.process(&signal);
-        let after_two = dsp.spectrum();
+        let after_two = dsp.get_buffer("spectrum");
         // With alpha ≈ 1, EMA fully replaces each call → stable across calls.
         for (a, b) in after_one.iter().zip(after_two.iter()) {
             assert!(
@@ -454,12 +420,12 @@ mod tests {
 
         // tau extremely large → alpha → 0 (no update).
         let mut dsp = Dsp::new(2048, 48000.0, 1024, 512);
-        dsp.set_smoothing_tau(1000.0); // clamps to 10.0 → alpha tiny
+        dsp.set_param("smoothingTauSecs", 1000.0); // clamps to 10.0 → alpha tiny
         for _ in 0..3 {
             dsp.process(&signal);
         }
         // Spectrum stays near zero because the EMA barely moves.
-        let small = dsp.spectrum();
+        let small = dsp.get_buffer("spectrum");
         let max = small.iter().cloned().fold(0.0_f32, f32::max);
         assert!(
             max < 0.1,
@@ -471,27 +437,27 @@ mod tests {
     #[test]
     fn set_db_floor_clamps() {
         let mut dsp = Dsp::new(2048, 48000.0, 1024, 512);
-        dsp.set_db_floor(-1000.0); // should clamp to -200.0
+        dsp.set_param("dbFloor", -1000.0); // should clamp to -200.0
                                    // Silent input → spectrum should saturate to the (clamped) floor's normalized value.
                                    // Since silent audio yields mag=0 → db=floor → normalized=0, spectrum stays zero.
         let silent = vec![0.0_f32; 2048];
         for _ in 0..5 {
             dsp.process(&silent);
         }
-        assert!(dsp.spectrum().iter().all(|&v| v == 0.0));
+        assert!(dsp.get_buffer("spectrum").iter().all(|&v| v == 0.0));
 
         // Above 0 should clamp to 0.0.
-        dsp.set_db_floor(50.0);
+        dsp.set_param("dbFloor", 50.0);
         // floor==0 makes the normalized formula degenerate (clipped - 0) / -0 = NaN.
         // Verify the setter clamped to 0.0; we don't actually call process() here
         // because that would divide by zero — the clamp itself is the test.
         // This test is structural: the field must equal 0.0 after the setter call.
         // Re-create dsp and verify by querying after a different setter result.
         let mut dsp = Dsp::new(2048, 48000.0, 1024, 512);
-        dsp.set_db_floor(-50.0); // valid
+        dsp.set_param("dbFloor", -50.0); // valid
         dsp.process(&silent);
         // Silent input still yields zero spectrum (mag=0 → db=floor → normalized=0).
-        assert!(dsp.spectrum().iter().all(|&v| v == 0.0));
+        assert!(dsp.get_buffer("spectrum").iter().all(|&v| v == 0.0));
     }
 
     #[test]
@@ -505,9 +471,9 @@ mod tests {
             .map(|i| (2.0 * std::f32::consts::PI * freq * (i as f32 / sr)).sin())
             .collect();
         dsp.process(&signal);
-        let low = *dsp.low_rms_history().last().unwrap();
-        let mid = *dsp.mid_rms_history().last().unwrap();
-        let high = *dsp.high_rms_history().last().unwrap();
+        let low = *dsp.get_buffer("rmsLow").last().unwrap();
+        let mid = *dsp.get_buffer("rmsMid").last().unwrap();
+        let high = *dsp.get_buffer("rmsHigh").last().unwrap();
         assert!((low - 0.7071).abs() < 0.05, "low {} should be ≈ 0.707", low);
         assert!(mid < 0.05, "mid {} should be near zero", mid);
         assert!(high < 0.05, "high {} should be near zero", high);
@@ -523,9 +489,9 @@ mod tests {
             .map(|i| (2.0 * std::f32::consts::PI * freq * (i as f32 / sr)).sin())
             .collect();
         dsp.process(&signal);
-        let low = *dsp.low_rms_history().last().unwrap();
-        let mid = *dsp.mid_rms_history().last().unwrap();
-        let high = *dsp.high_rms_history().last().unwrap();
+        let low = *dsp.get_buffer("rmsLow").last().unwrap();
+        let mid = *dsp.get_buffer("rmsMid").last().unwrap();
+        let high = *dsp.get_buffer("rmsHigh").last().unwrap();
         assert!((mid - 0.7071).abs() < 0.05, "mid {} should be ≈ 0.707", mid);
         assert!(low < 0.05, "low {} should be near zero", low);
         assert!(high < 0.05, "high {} should be near zero", high);
@@ -541,9 +507,9 @@ mod tests {
             .map(|i| (2.0 * std::f32::consts::PI * freq * (i as f32 / sr)).sin())
             .collect();
         dsp.process(&signal);
-        let low = *dsp.low_rms_history().last().unwrap();
-        let mid = *dsp.mid_rms_history().last().unwrap();
-        let high = *dsp.high_rms_history().last().unwrap();
+        let low = *dsp.get_buffer("rmsLow").last().unwrap();
+        let mid = *dsp.get_buffer("rmsMid").last().unwrap();
+        let high = *dsp.get_buffer("rmsHigh").last().unwrap();
         assert!(
             (high - 0.7071).abs() < 0.05,
             "high {} should be ≈ 0.707",
@@ -570,10 +536,10 @@ mod tests {
             })
             .collect();
         dsp.process(&signal);
-        let low = *dsp.low_rms_history().last().unwrap();
-        let mid = *dsp.mid_rms_history().last().unwrap();
-        let high = *dsp.high_rms_history().last().unwrap();
-        let full = *dsp.rms_history().last().unwrap();
+        let low = *dsp.get_buffer("rmsLow").last().unwrap();
+        let mid = *dsp.get_buffer("rmsMid").last().unwrap();
+        let high = *dsp.get_buffer("rmsHigh").last().unwrap();
+        let full = *dsp.get_buffer("rms").last().unwrap();
         let summed = (low * low + mid * mid + high * high).sqrt();
         let rel_err = (summed - full).abs() / full;
         assert!(
@@ -589,9 +555,9 @@ mod tests {
     fn band_rms_silence_is_zero() {
         let mut dsp = Dsp::new(2048, 48000.0, 1024, 512);
         dsp.process(&vec![0.0_f32; 2048]);
-        assert_eq!(*dsp.low_rms_history().last().unwrap(), 0.0);
-        assert_eq!(*dsp.mid_rms_history().last().unwrap(), 0.0);
-        assert_eq!(*dsp.high_rms_history().last().unwrap(), 0.0);
+        assert_eq!(*dsp.get_buffer("rmsLow").last().unwrap(), 0.0);
+        assert_eq!(*dsp.get_buffer("rmsMid").last().unwrap(), 0.0);
+        assert_eq!(*dsp.get_buffer("rmsHigh").last().unwrap(), 0.0);
     }
 
     #[test]
@@ -603,7 +569,7 @@ mod tests {
         let silent = vec![0.0_f32; 2048];
         dsp.process(&loud_low); // pushes a non-zero into history
         dsp.process(&silent); // pushes a zero
-        let h = dsp.low_rms_history();
+        let h = dsp.get_buffer("rmsLow");
         let n = h.len();
         assert_eq!(h[n - 1], 0.0, "newest should be silent");
         assert!(
@@ -632,7 +598,7 @@ mod tests {
                 .collect();
             dsp.process(&signal);
         }
-        let pulses = dsp.beat_pulses();
+        let pulses = dsp.get_buffer("beatPulses");
         for (i, &v) in pulses.iter().enumerate() {
             assert!(
                 !v.is_nan() && (0.0..=1.0).contains(&v),
@@ -650,7 +616,7 @@ mod tests {
             .map(|i| 0.5 * (2.0 * std::f32::consts::PI * 1000.0 * (i as f32 / sr)).sin())
             .collect();
         dsp.process(&signal);
-        let pulses_after = dsp.beat_pulses();
+        let pulses_after = dsp.get_buffer("beatPulses");
         let dp1 = (pulses_after[0] - p1_before).abs();
         let dp16 = (pulses_after[3] - p16_before).abs();
         // Cycle 16 should move 16× less than cycle 1 (loosely; allow some slack
@@ -686,7 +652,7 @@ mod tests {
                 .collect();
             dsp.process(&signal);
         }
-        let grid = dsp.beat_grid();
+        let grid = dsp.get_buffer("beatGrid");
         assert!(!grid[0].is_nan(), "expected a fit after convergence");
         assert!(
             (grid[0] - period_hops as f32).abs() < 1.5,
@@ -721,7 +687,7 @@ mod tests {
         dsp.process(&loud);
         dsp.process(&quiet);
 
-        let onset = dsp.onset_history();
+        let onset = dsp.get_buffer("onset");
         let n = onset.len();
         // newest at index n-1, oldest at index 0
         assert!(onset[n - 4].abs() < 1e-4, "silent = {}", onset[n - 4]);
@@ -749,7 +715,7 @@ mod tests {
         for _ in 0..5 {
             dsp.process(&silent);
         }
-        let acf = dsp.onset_acf();
+        let acf = dsp.get_buffer("onsetAcf");
         for &v in acf.iter() {
             assert!(!v.is_nan(), "silent gen-ACF must not be NaN, got {}", v);
             assert!(v.abs() < 1e-3, "silent gen-ACF should be ~0, got {}", v);
@@ -771,7 +737,7 @@ mod tests {
                 .collect();
             dsp.process(&signal);
         }
-        let acf = dsp.onset_acf();
+        let acf = dsp.get_buffer("onsetAcf");
         let p = period_hops;
         let around = (p - 5..=p + 5)
             .map(|i| acf[i])
@@ -827,7 +793,7 @@ mod tests {
         for _ in 0..5 {
             dsp.process(&silent);
         }
-        let cands = dsp.candidates();
+        let cands = dsp.get_buffer("candidates");
         assert_eq!(cands.len(), 30);
         for &v in cands.iter() {
             assert!(v.is_nan(), "silent → all candidate slots NaN, got {}", v);
@@ -849,7 +815,7 @@ mod tests {
         }
         dsp.test_set_onset_acf_enhanced(&enhanced);
         dsp.test_run_pick_candidates();
-        let cands = dsp.candidates();
+        let cands = dsp.get_buffer("candidates");
         let mut last_mag = f32::INFINITY;
         for i in 0..10 {
             let lag = cands[3 * i];
@@ -878,7 +844,7 @@ mod tests {
         enhanced[101] = 0.5;
         dsp.test_set_onset_acf_enhanced(&enhanced);
         dsp.test_run_pick_candidates();
-        let cands = dsp.candidates();
+        let cands = dsp.get_buffer("candidates");
         for i in 0..10 {
             let lag = cands[3 * i];
             if !lag.is_nan() {
@@ -964,7 +930,7 @@ mod tests {
         dsp.test_set_tea(&pre_charged);
         let silent = vec![0.0f32; 2048];
         dsp.process(&silent);
-        let after = dsp.tea();
+        let after = dsp.get_buffer("tea");
         for i in 0..n {
             assert!(
                 after[i] < pre_charged[i] + 1e-6,
@@ -978,7 +944,7 @@ mod tests {
         for _ in 0..600 {
             dsp.process(&silent);
         }
-        let later = dsp.tea();
+        let later = dsp.get_buffer("tea");
         for &v in &later {
             assert!(v < 0.05, "after long silence TEA should be ~0, got {}", v);
             assert!(!v.is_nan());
@@ -1012,9 +978,9 @@ mod tests {
     fn set_tea_tau_secs_clamps_and_recomputes() {
         let mut dsp = Dsp::new(2048, 48000.0, 1024, 512);
         let alpha_default = dsp.tea_alpha();
-        dsp.set_tea_tau_secs(0.001);
+        dsp.set_param("teaTauSecs", 0.001);
         let alpha_low = dsp.tea_alpha();
-        dsp.set_tea_tau_secs(120.0);
+        dsp.set_param("teaTauSecs", 120.0);
         let alpha_high = dsp.tea_alpha();
         assert!(alpha_low > alpha_default, "smaller tau ⇒ larger alpha");
         assert!(alpha_high < alpha_default, "larger tau ⇒ smaller alpha");
@@ -1037,8 +1003,8 @@ mod tests {
                 .collect();
             dsp.process(&signal);
         }
-        let grid = dsp.beat_grid();
-        let state = dsp.beat_state();
+        let grid = dsp.get_buffer("beatGrid");
+        let state = dsp.get_buffer("beatState");
         assert!(!grid[0].is_nan(), "expected period fit");
         assert!(
             (grid[0] - period_hops as f32).abs() < 1.5,
@@ -1075,7 +1041,7 @@ mod tests {
         for _ in 0..50 {
             dsp.process(&silent);
         }
-        let pulses = dsp.beat_pulses();
+        let pulses = dsp.get_buffer("beatPulses");
         for (i, &v) in pulses.iter().enumerate() {
             assert!(
                 v.is_nan(),
