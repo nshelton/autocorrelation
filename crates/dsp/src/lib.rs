@@ -1063,6 +1063,30 @@ mod tests {
     }
 
     #[test]
+    fn score_phase_top_k_returns_local_maxima() {
+        use crate::beat::{score_phase_for_tau, PHI_CANDIDATE_COUNT};
+        // n=189, tau=20.0; pulses at i=0,20,...,180 → true phi=8 for the kick
+        // (last=188, 188-180=8). Distractor pulses at i=15,35,...,175 → true
+        // phi=13 (188-175=13). Both phi values are interior to [0,20), so the
+        // local-max picker (which skips endpoints) can see them.
+        let n = 189usize;
+        let tau = 20.0f32;
+        let mut onset = vec![0.0f32; n];
+        for i in (0..n).step_by(20) { onset[i] = 1.0; }
+        for i in (15..n).step_by(20) { onset[i] = 0.4; }
+
+        let (cands, _sum, _sum_sq, _n_phi) = score_phase_for_tau(&onset, tau);
+        assert_eq!(cands.len(), PHI_CANDIDATE_COUNT);
+        assert_eq!(cands[0].0, 8, "kick phi=8 expected at slot 0, got {:?}", cands);
+        assert!(cands[0].1 > 0.0);
+        let distractor = cands.iter().skip(1).find(|(phi, c)| *c > 0.0 && *phi == 13);
+        assert!(
+            distractor.is_some(),
+            "distractor phi=13 expected somewhere in top-K, got {:?}", cands,
+        );
+    }
+
+    #[test]
     fn beat_pulses_silent_input_all_nan() {
         // New behavior under silence: score_inst=0 → all-NaN beat_pulses.
         // (Replaces the old "free-run" behavior tested by the now-removed

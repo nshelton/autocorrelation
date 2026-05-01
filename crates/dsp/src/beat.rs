@@ -3,56 +3,92 @@
 /// Number of pulses per train in `score_phase_for_tau`.
 pub const PULSE_N: usize = 4;
 
+/// Number of top φ local maxima returned by `score_phase_for_tau`. The PLL
+/// in `update_tea` picks among these by snapping to its prediction; a fixed
+/// stack-allocated array keeps the hot path allocation-free.
+pub const PHI_CANDIDATE_COUNT: usize = 5;
+
 /// Score one tempo lag `tau` against the OSS by sweeping integer phases
-/// `phi ∈ [0, ceil(tau))`. Returns `(best_phi, best_corr, sum_corr,
-/// sum_corr_sq, n_phases)`. Pulse-train is the paper's combined
-/// `Φ₁ (w=1.0) + Φ₂ (w=0.5) + Φ₁.₅ (w=0.5)` with N=4 pulses each.
-pub fn score_phase_for_tau(onset: &[f32], tau: f32) -> (usize, f32, f32, f32, usize) {
+/// `phi ∈ [0, ceil(tau))`. Returns the top-`PHI_CANDIDATE_COUNT` local maxima
+/// of the per-phase correlation (sorted descending by `corr`; empty slots
+/// have `corr == 0.0` and `phi` unspecified) plus `(sum, sum_sq, n_phases)`
+/// summary stats. Pulse-train is the paper's combined `Φ₁ (w=1.0) + Φ₂
+/// (w=0.5) + Φ₁.₅ (w=0.5)` with N=4 pulses each. Local maxima skip endpoints
+/// of the φ range (matches `pick_candidates`).
+pub fn score_phase_for_tau(
+    onset: &[f32],
+    tau: f32,
+) -> ([(usize, f32); PHI_CANDIDATE_COUNT], f32, f32, usize) {
+    let mut top = [(0usize, 0.0f32); PHI_CANDIDATE_COUNT];
     let n = onset.len();
     if n == 0 || tau < 1.0 {
-        return (0, 0.0, 0.0, 0.0, 0);
+        return (top, 0.0, 0.0, 0);
     }
     let last = (n - 1) as i32;
     let phi_max = (tau.ceil() as usize).max(1);
 
-    let mut best_phi = 0usize;
-    let mut best_corr = -1.0f32;
+    // Compute per-phi correlations into a scratch vec so we can scan for
+    // local maxima after the fact. phi_max is bounded by tau_max ≈ 70 hops
+    // so the allocation is small and short-lived.
+    let mut corr = vec![0.0f32; phi_max];
     let mut sum = 0.0f32;
     let mut sum_sq = 0.0f32;
 
     for phi in 0..phi_max {
-        let mut corr = 0.0f32;
+        let mut c = 0.0f32;
         for k in 0..PULSE_N {
             let off = (k as f32 * tau).round() as i32;
             let pos = last - phi as i32 - off;
             if pos >= 0 && (pos as usize) < n {
-                corr += onset[pos as usize];
+                c += onset[pos as usize];
             }
         }
         for k in 0..PULSE_N {
             let off = (k as f32 * 2.0 * tau).round() as i32;
             let pos = last - phi as i32 - off;
             if pos >= 0 && (pos as usize) < n {
-                corr += 0.5 * onset[pos as usize];
+                c += 0.5 * onset[pos as usize];
             }
         }
         for k in 0..PULSE_N {
             let off = ((k as f32 + 0.5) * tau).round() as i32;
             let pos = last - phi as i32 - off;
             if pos >= 0 && (pos as usize) < n {
-                corr += 0.5 * onset[pos as usize];
+                c += 0.5 * onset[pos as usize];
             }
         }
+        corr[phi] = c;
+        sum += c;
+        sum_sq += c * c;
+    }
 
-        sum += corr;
-        sum_sq += corr * corr;
-        if corr > best_corr {
-            best_corr = corr;
-            best_phi = phi;
+    // Insertion-sort local maxima into the top-K buffer (descending by corr).
+    // Endpoints are skipped: phi=0 has no left neighbor, phi=phi_max-1 no
+    // right neighbor. Equal-valued plateaus are not flagged (strict `>`).
+    if phi_max >= 3 {
+        for phi in 1..phi_max - 1 {
+            let c = corr[phi];
+            if c <= 0.0 || c <= corr[phi - 1] || c <= corr[phi + 1] {
+                continue;
+            }
+            // Insertion sort into top[].
+            let mut insert_at = PHI_CANDIDATE_COUNT;
+            for i in 0..PHI_CANDIDATE_COUNT {
+                if c > top[i].1 {
+                    insert_at = i;
+                    break;
+                }
+            }
+            if insert_at < PHI_CANDIDATE_COUNT {
+                for j in (insert_at + 1..PHI_CANDIDATE_COUNT).rev() {
+                    top[j] = top[j - 1];
+                }
+                top[insert_at] = (phi, c);
+            }
         }
     }
 
-    (best_phi, best_corr.max(0.0), sum, sum_sq, phi_max)
+    (top, sum, sum_sq, phi_max)
 }
 
 /// Maximum number of tempo candidates tracked per hop. Shared with `Buffers`,
@@ -366,7 +402,9 @@ impl BeatState {
         let count = self.beat_count;
         for i in 0..count {
             let lag = self.beat_lag[i];
-            let (phi, x, sum, sum_sq, n_phi) = score_phase_for_tau(onset, lag);
+            let (phi_cands, sum, sum_sq, n_phi) = score_phase_for_tau(onset, lag);
+            let phi = phi_cands[0].0;
+            let x = phi_cands[0].1;
             let n = n_phi as f32;
             let mean = if n > 0.0 { sum / n } else { 0.0 };
             let var = if n > 0.0 {
@@ -504,8 +542,8 @@ impl BeatState {
             }
         }
         self.tau_smoothed = tau;
-        let (phi, _, _, _, _) = score_phase_for_tau(onset, tau);
-        let observed_phase = phi as f32;
+        let (phi_cands, _, _, _) = score_phase_for_tau(onset, tau);
+        let observed_phase = phi_cands[0].0 as f32;
         self.phase_smoothed = if self.phase_smoothed.is_finite() && self.phase_updated_at != 0 {
             let elapsed_hops = self
                 .frame_index
