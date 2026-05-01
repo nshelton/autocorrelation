@@ -102,7 +102,7 @@ impl Dsp {
 
     /// Set a tunable param. Unknown keys are silently ignored.
     /// Recognized keys: "smoothingTauSecs", "onsetSmoothingTauSecs",
-    /// "teaTauSecs", "teaSigma", "acfSmoothingSigma", "dbFloor".
+    /// "teaTauSecs", "teaSigma", "acfSmoothingSigma", "dbFloor", "phaseLock".
     pub fn set_param(&mut self, key: &str, value: f32) {
         match key {
             "smoothingTauSecs" => self.spectrum.set_smoothing_tau(value, self.dt),
@@ -111,6 +111,7 @@ impl Dsp {
             "teaSigma" => self.beat.set_tea_sigma(value),
             "acfSmoothingSigma" => self.acf.set_smoothing_sigma(value),
             "dbFloor" => self.db_floor = value.clamp(-200.0, 0.0),
+            "phaseLock" => self.beat.set_phase_lock_tau(value, self.dt),
             _ => {}
         }
     }
@@ -1006,6 +1007,92 @@ mod tests {
     }
 
     #[test]
+    fn beat_confidence_silent_input_is_zero() {
+        let mut dsp = Dsp::new(2048, 48000.0, 1024, 512);
+        let silent = vec![0.0f32; 2048];
+        for _ in 0..50 {
+            dsp.process(&silent);
+        }
+        let grid = dsp.get_buffer("beatGrid");
+        let state = dsp.get_buffer("beatState");
+        assert_eq!(
+            grid[2], 0.0,
+            "beatGrid[2] confidence should be zero under silence"
+        );
+        assert_eq!(
+            state[1], 0.0,
+            "beatState[1] confidence should be zero under silence"
+        );
+    }
+
+    #[test]
+    fn beat_confidence_periodic_input_rises_and_is_bounded() {
+        let mut dsp = Dsp::new(2048, 48000.0, 1024, 512);
+        let sr = 48000.0_f32;
+        let period_hops = 36usize;
+        for k in 0..1500 {
+            let amp =
+                0.6 + 0.3 * (2.0 * std::f32::consts::PI * (k as f32) / (period_hops as f32)).sin();
+            let signal: Vec<f32> = (0..2048)
+                .map(|i| amp * (2.0 * std::f32::consts::PI * 1000.0 * (i as f32 / sr)).sin())
+                .collect();
+            dsp.process(&signal);
+        }
+        let grid = dsp.get_buffer("beatGrid");
+        let state = dsp.get_buffer("beatState");
+        assert!(
+            grid[2].is_finite() && (0.0..=1.0).contains(&grid[2]),
+            "beatGrid[2] confidence should be finite and bounded, got {}",
+            grid[2]
+        );
+        assert!(
+            state[1].is_finite() && (0.0..=1.0).contains(&state[1]),
+            "beatState[1] confidence should be finite and bounded, got {}",
+            state[1]
+        );
+        assert!(
+            grid[2] > 0.05,
+            "steady periodic input should produce nontrivial confidence, got {}",
+            grid[2]
+        );
+        assert!(
+            (grid[2] - state[1]).abs() < 1e-6,
+            "beatGrid[2] and beatState[1] should expose the same confidence"
+        );
+    }
+
+    #[test]
+    fn beat_confidence_decays_to_zero_after_silence() {
+        let mut dsp = Dsp::new(2048, 48000.0, 1024, 512);
+        let sr = 48000.0_f32;
+        let period_hops = 36usize;
+        for k in 0..800 {
+            let amp =
+                0.6 + 0.3 * (2.0 * std::f32::consts::PI * (k as f32) / (period_hops as f32)).sin();
+            let signal: Vec<f32> = (0..2048)
+                .map(|i| amp * (2.0 * std::f32::consts::PI * 1000.0 * (i as f32 / sr)).sin())
+                .collect();
+            dsp.process(&signal);
+        }
+        let before = dsp.get_buffer("beatGrid")[2];
+        assert!(
+            before >= 0.0 && before <= 1.0,
+            "confidence should be bounded before silence"
+        );
+
+        let silent = vec![0.0f32; 2048];
+        for _ in 0..700 {
+            dsp.process(&silent);
+        }
+        let after = dsp.get_buffer("beatGrid")[2];
+        assert!(
+            after < 0.05,
+            "public confidence should decay toward zero after sustained silence, got {}",
+            after
+        );
+    }
+
+    #[test]
     fn set_tea_tau_secs_clamps_and_recomputes() {
         let mut dsp = Dsp::new(2048, 48000.0, 1024, 512);
         let alpha_default = dsp.tea_alpha();
@@ -1072,26 +1159,40 @@ mod tests {
         let n = 189usize;
         let tau = 20.0f32;
         let mut onset = vec![0.0f32; n];
-        for i in (0..n).step_by(20) { onset[i] = 1.0; }
-        for i in (15..n).step_by(20) { onset[i] = 0.4; }
+        for i in (0..n).step_by(20) {
+            onset[i] = 1.0;
+        }
+        for i in (15..n).step_by(20) {
+            onset[i] = 0.4;
+        }
 
         let (cands, _sum, _sum_sq, _n_phi) = score_phase_for_tau(&onset, tau);
         assert_eq!(cands.len(), PHI_CANDIDATE_COUNT);
-        assert_eq!(cands[0].0, 8, "kick phi=8 expected at slot 0, got {:?}", cands);
+        assert_eq!(
+            cands[0].0, 8,
+            "kick phi=8 expected at slot 0, got {:?}",
+            cands
+        );
         assert!(cands[0].1 > 0.0);
         let distractor = cands.iter().skip(1).find(|(phi, c)| *c > 0.0 && *phi == 13);
         assert!(
             distractor.is_some(),
-            "distractor phi=13 expected somewhere in top-K, got {:?}", cands,
+            "distractor phi=13 expected somewhere in top-K, got {:?}",
+            cands,
         );
-        assert_eq!(cands[1].0, 13, "distractor expected at slot 1 (second-best), got {:?}", cands);
+        assert_eq!(
+            cands[1].0, 13,
+            "distractor expected at slot 1 (second-best), got {:?}",
+            cands
+        );
         assert!(cands[0].1 > cands[1].1, "slot 0 must outrank slot 1");
         // phi=9 sits on the descending side of the kick peak — corr(9)=0 in this
         // synthetic input but more importantly NOT a local maximum, so it must
         // not appear anywhere in top-K. Catches a broken local-max filter.
         assert!(
             !cands.iter().any(|(p, c)| *c > 0.0 && *p == 9),
-            "non-local-max phi=9 should not appear in top-K, got {:?}", cands,
+            "non-local-max phi=9 should not appear in top-K, got {:?}",
+            cands,
         );
     }
 
@@ -1124,7 +1225,10 @@ mod tests {
         cands[1] = (5, 0.8);
         cands[2] = (15, 0.4);
         let phi = pick_snapped_phi(&cands, 6.0, 20.0);
-        assert_eq!(phi, 5.0, "phi=5 (corr 0.8 ≥ floor 0.7) is closest to expected=6");
+        assert_eq!(
+            phi, 5.0,
+            "phi=5 (corr 0.8 ≥ floor 0.7) is closest to expected=6"
+        );
     }
 
     #[test]

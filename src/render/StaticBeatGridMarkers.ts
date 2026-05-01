@@ -77,7 +77,6 @@ export class StaticBeatGridMarkers {
     this.segments = new LineSegments(this.geometry, this.material);
     this.object3d.add(this.segments);
 
-    const denom = Math.max(1, this.maxLines - 1);
     for (let i = 0; i < this.maxLines; i++) {
       this.writeLine(i, i);
     }

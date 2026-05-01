@@ -95,4 +95,14 @@ export const analysisSchemas: ParamSchema[] = [
     default: 1.0,
     reconfig: false,
   },
+  {
+    key: "dsp.phaseLock",
+    label: "phaseLockIn (s)",
+    kind: "continuous",
+    min: 0.05,
+    max: 20.0,
+    step: 0.05,
+    default: 1.0,
+    reconfig: false,
+  },
 ];

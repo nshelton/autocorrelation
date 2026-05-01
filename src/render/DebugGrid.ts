@@ -6,7 +6,7 @@ export class DebugGrid {
   constructor() {
     const geometry = new PlaneGeometry(4, 4, 4, 4);
     const material = new MeshBasicMaterial({
-      color: 0x666666,
+      color: 0x333333,
       wireframe: true,
     });
     this.object3d = new Mesh(geometry, material);

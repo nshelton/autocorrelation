@@ -118,10 +118,18 @@ const TEA_CANDIDATE_VOTE_COUNT: usize = 5;
 const COMB_MAX_DIVISOR: usize = 8;
 const COMB_MAX_MULTIPLE: usize = 16;
 const COMB_ALIGNMENT_TOLERANCE: f32 = 2.0;
-// PLL gain on the per-frame phase observation. With top-K snap-to-prediction
-// doing observation disambiguation, α only needs to absorb sub-hop noise; a
-// faster α makes the grid responsive to genuine drift. ~20-frame TC at 47 Hz.
-const PHASE_CORRECTION_ALPHA: f32 = 0.05;
+const COMB_CONF_KNEE: f32 = 0.05;
+const ACTIVITY_KNEE: f32 = 0.01;
+const PHASE_STRENGTH_KNEE: f32 = 0.1;
+const PHASE_Z_LOW: f32 = 1.0;
+const PHASE_Z_HIGH: f32 = 4.0;
+const PHASE_EPS: f32 = 1e-6;
+const CONFIDENCE_ATTACK_ALPHA: f32 = 0.2;
+const CONFIDENCE_RELEASE_ALPHA: f32 = 0.03;
+// Default time constant for the phase-smoothing PLL. EMA gain is derived as
+// `α = 1 − exp(−dt / τ)`. Larger τ ⇒ slower α ⇒ harder lock. Settable at
+// runtime via `set_phase_lock_tau` (param key "phaseLock").
+const PHASE_LOCK_DEFAULT_SECS: f32 = 1.0;
 
 fn wrap_phase(phase: f32, period: f32) -> f32 {
     if period > 0.0 && period.is_finite() {
@@ -185,25 +193,79 @@ fn comb_tolerance(multiple: usize) -> f32 {
     (COMB_ALIGNMENT_TOLERANCE + 0.25 * (multiple as f32).sqrt()).min(6.0)
 }
 
+fn knee_confidence(x: f32, knee: f32) -> f32 {
+    if !x.is_finite() || x <= 0.0 {
+        0.0
+    } else {
+        (x / (x + knee)).clamp(0.0, 1.0)
+    }
+}
+
+fn activity_confidence(onset: &[f32]) -> f32 {
+    if onset.is_empty() {
+        return 0.0;
+    }
+    let mut sum_sq = 0.0f32;
+    let mut count = 0usize;
+    for &x in onset {
+        if x.is_finite() {
+            sum_sq += x.max(0.0) * x.max(0.0);
+            count += 1;
+        }
+    }
+    if count == 0 {
+        0.0
+    } else {
+        knee_confidence((sum_sq / count as f32).sqrt(), ACTIVITY_KNEE)
+    }
+}
+
+fn phase_confidence(top_corr: f32, sum: f32, sum_sq: f32, n_phi: usize) -> f32 {
+    if n_phi == 0 || !top_corr.is_finite() || top_corr <= 0.0 {
+        return 0.0;
+    }
+    let n = n_phi as f32;
+    let mean = sum / n;
+    let var = (sum_sq / n - mean * mean).max(0.0);
+    let z = (top_corr - mean) / (var.sqrt() + PHASE_EPS);
+    let strength = knee_confidence(top_corr, PHASE_STRENGTH_KNEE);
+    let contrast = ((z - PHASE_Z_LOW) / (PHASE_Z_HIGH - PHASE_Z_LOW)).clamp(0.0, 1.0);
+    (strength * contrast).clamp(0.0, 1.0)
+}
+
+#[derive(Clone, Copy)]
+struct CombEvidence {
+    score: f32,
+    confidence: f32,
+}
+
 pub struct BeatState {
     tau_min: usize,
     tau_max: usize,
     beat_tau_min: usize,
     beat_tau_max: usize,
     cand_scratch: Vec<(usize, f32)>,
-    beat_scratch: Vec<(f32, f32)>,
+    beat_scratch: Vec<(f32, f32, f32)>,
     beat_lag: [f32; MAX_PEAKS],
     beat_comb_score: [f32; MAX_PEAKS],
+    beat_comb_conf: [f32; MAX_PEAKS],
     beat_count: usize,
     pulse_x: [f32; MAX_PEAKS],
     pulse_v: [f32; MAX_PEAKS],
     pulse_phi: [f32; MAX_PEAKS],
     pulse_score: [f32; MAX_PEAKS],
+    pulse_conf: [f32; MAX_PEAKS],
     period_inst: f32,
     phase_inst: f32,
     score_inst: f32,
+    comb_conf_inst: f32,
+    phase_conf_inst: f32,
+    tea_conf_inst: f32,
+    confidence_inst: f32,
+    confidence_smoothed: f32,
     tea_alpha: f32,
     tea_sigma: f32,
+    phase_correction_alpha: f32,
     tau_smoothed: f32,
     phase_smoothed: f32,
     frame_index: u64,
@@ -221,6 +283,7 @@ impl BeatState {
         let beat_tau_max_unbounded = ((60.0 / BEAT_HYPOTHESIS_MIN_BPM) / dt).ceil() as usize;
         let beat_tau_max = beat_tau_max_unbounded.min(onset_acf_len.saturating_sub(2));
         let tea_alpha = 1.0 - (-dt / TEA_TAU_DEFAULT_SECS).exp();
+        let phase_correction_alpha = 1.0 - (-dt / PHASE_LOCK_DEFAULT_SECS).exp();
         Self {
             tau_min,
             tau_max,
@@ -230,16 +293,24 @@ impl BeatState {
             beat_scratch: Vec::with_capacity(MAX_PEAKS * COMB_MAX_DIVISOR),
             beat_lag: [f32::NAN; MAX_PEAKS],
             beat_comb_score: [0.0; MAX_PEAKS],
+            beat_comb_conf: [0.0; MAX_PEAKS],
             beat_count: 0,
             pulse_x: [0.0; MAX_PEAKS],
             pulse_v: [0.0; MAX_PEAKS],
             pulse_phi: [0.0; MAX_PEAKS],
             pulse_score: [0.0; MAX_PEAKS],
+            pulse_conf: [0.0; MAX_PEAKS],
             period_inst: f32::NAN,
             phase_inst: f32::NAN,
             score_inst: 0.0,
+            comb_conf_inst: 0.0,
+            phase_conf_inst: 0.0,
+            tea_conf_inst: 0.0,
+            confidence_inst: 0.0,
+            confidence_smoothed: 0.0,
             tea_alpha,
             tea_sigma: TEA_GAUSSIAN_SIGMA_DEFAULT,
+            phase_correction_alpha,
             tau_smoothed: f32::NAN,
             phase_smoothed: f32::NAN,
             frame_index: 0,
@@ -255,6 +326,11 @@ impl BeatState {
 
     pub fn set_tea_sigma(&mut self, sigma: f32) {
         self.tea_sigma = sigma.clamp(0.1, 100.0);
+    }
+
+    pub fn set_phase_lock_tau(&mut self, tau_secs: f32, dt: f32) {
+        let tau = tau_secs.clamp(0.01, 60.0);
+        self.phase_correction_alpha = 1.0 - (-dt / tau).exp();
     }
 
     /// Run one beat-tracker frame: pick candidates, score phases, update TEA,
@@ -345,9 +421,15 @@ impl BeatState {
         candidate_count
     }
 
-    fn comb_score_for_tau(&self, tau: f32, candidates: &[f32], raw_count: usize) -> f32 {
+    fn comb_evidence_for_tau(
+        &self,
+        tau: f32,
+        candidates: &[f32],
+        raw_count: usize,
+    ) -> CombEvidence {
         let mut score = 0.0f32;
         let mut total_weight = 0.0f32;
+        let mut hit_weight = 0.0f32;
         let mut hit_count = 0usize;
 
         for multiple in 1..=COMB_MAX_MULTIPLE {
@@ -376,14 +458,24 @@ impl BeatState {
             total_weight += weight;
             if best_hit > 0.0 {
                 hit_count += 1;
+                hit_weight += weight;
                 score += weight * best_hit;
             }
         }
 
         if hit_count == 0 || total_weight <= 0.0 {
-            0.0
+            CombEvidence {
+                score: 0.0,
+                confidence: 0.0,
+            }
         } else {
-            score / total_weight.sqrt()
+            let normalized_strength = score / total_weight;
+            let strength = knee_confidence(normalized_strength, COMB_CONF_KNEE);
+            let coverage = (hit_weight / total_weight).clamp(0.0, 1.0);
+            CombEvidence {
+                score: score / total_weight.sqrt(),
+                confidence: (strength * coverage).sqrt().clamp(0.0, 1.0),
+            }
         }
     }
 
@@ -391,6 +483,7 @@ impl BeatState {
         self.beat_scratch.clear();
         self.beat_lag.fill(f32::NAN);
         self.beat_comb_score.fill(0.0);
+        self.beat_comb_conf.fill(0.0);
         self.beat_count = 0;
 
         let raw_count = Self::raw_candidate_count(candidates);
@@ -410,23 +503,24 @@ impl BeatState {
                     continue;
                 }
 
-                let score = self.comb_score_for_tau(tau, candidates, raw_count);
-                if score <= 0.0 {
+                let evidence = self.comb_evidence_for_tau(tau, candidates, raw_count);
+                if evidence.score <= 0.0 {
                     continue;
                 }
 
                 let mut merged = false;
                 for existing in &mut self.beat_scratch {
                     if (existing.0 - tau).abs() < MIN_BEAT_HYPOTHESIS_SPACING {
-                        if score > existing.1 {
-                            *existing = (tau, score);
+                        if evidence.score > existing.1 {
+                            *existing = (tau, evidence.score, evidence.confidence);
                         }
                         merged = true;
                         break;
                     }
                 }
                 if !merged {
-                    self.beat_scratch.push((tau, score));
+                    self.beat_scratch
+                        .push((tau, evidence.score, evidence.confidence));
                 }
             }
         }
@@ -438,6 +532,7 @@ impl BeatState {
         for i in 0..count {
             self.beat_lag[i] = self.beat_scratch[i].0;
             self.beat_comb_score[i] = self.beat_scratch[i].1;
+            self.beat_comb_conf[i] = self.beat_scratch[i].2;
         }
         self.beat_count = count;
     }
@@ -460,17 +555,21 @@ impl BeatState {
             self.pulse_x[i] = x;
             self.pulse_v[i] = var;
             self.pulse_phi[i] = phi as f32;
+            self.pulse_conf[i] = phase_confidence(x, sum, sum_sq, n_phi);
         }
         for i in count..MAX_PEAKS {
             self.pulse_x[i] = 0.0;
             self.pulse_v[i] = 0.0;
             self.pulse_phi[i] = 0.0;
             self.pulse_score[i] = 0.0;
+            self.pulse_conf[i] = 0.0;
         }
         if count == 0 {
             self.period_inst = f32::NAN;
             self.phase_inst = f32::NAN;
             self.score_inst = 0.0;
+            self.comb_conf_inst = 0.0;
+            self.phase_conf_inst = 0.0;
             return;
         }
 
@@ -506,11 +605,69 @@ impl BeatState {
             self.period_inst = f32::NAN;
             self.phase_inst = f32::NAN;
             self.score_inst = 0.0;
+            self.comb_conf_inst = 0.0;
+            self.phase_conf_inst = 0.0;
         } else {
             self.period_inst = self.beat_lag[best_i];
             self.phase_inst = self.pulse_phi[best_i];
             self.score_inst = best_score;
+            self.comb_conf_inst = self.beat_comb_conf[best_i];
+            self.phase_conf_inst = self.pulse_conf[best_i];
         }
+    }
+
+    fn tea_lock_confidence(&self, tea: &[f32], best_i: usize, best_v: f32, upper: usize) -> f32 {
+        if !best_v.is_finite() || best_v <= 0.0 || tea.is_empty() || upper < self.beat_tau_min {
+            return 0.0;
+        }
+
+        let guard = (2.0 * self.tea_sigma).ceil().max(1.0) as usize;
+        let mut second_v = 0.0f32;
+        for i in self.beat_tau_min..=upper {
+            let dist = if i > best_i { i - best_i } else { best_i - i };
+            if dist <= guard {
+                continue;
+            }
+            let v = tea[i];
+            if v.is_finite() && v > second_v {
+                second_v = v;
+            }
+        }
+
+        let peak_conf = best_v.clamp(0.0, 1.0);
+        let margin_conf = ((best_v - second_v) / (best_v + PHASE_EPS)).clamp(0.0, 1.0);
+        (peak_conf * margin_conf).sqrt().clamp(0.0, 1.0)
+    }
+
+    fn update_public_confidence(&mut self, onset: &[f32]) {
+        let target = if self.period_inst.is_finite()
+            && self.tau_smoothed.is_finite()
+            && self.score_inst > 0.0
+        {
+            let activity = activity_confidence(onset);
+            let evidence =
+                (self.comb_conf_inst * self.phase_conf_inst * self.tea_conf_inst).clamp(0.0, 1.0);
+            let agreement = if self.tea_sigma > 0.0 {
+                let delta = self.tau_smoothed - self.period_inst;
+                (-0.5 * delta * delta / (self.tea_sigma * self.tea_sigma)).exp()
+            } else {
+                0.0
+            };
+            activity * evidence.sqrt() * agreement.clamp(0.0, 1.0)
+        } else {
+            0.0
+        }
+        .clamp(0.0, 1.0);
+
+        self.confidence_inst = target;
+        let alpha = if target > self.confidence_smoothed {
+            CONFIDENCE_ATTACK_ALPHA
+        } else {
+            CONFIDENCE_RELEASE_ALPHA
+        };
+        self.confidence_smoothed = (self.confidence_smoothed
+            + alpha * (target - self.confidence_smoothed))
+            .clamp(0.0, 1.0);
     }
 
     fn update_tea(&mut self, onset: &[f32], tea: &mut [f32]) {
@@ -573,8 +730,11 @@ impl BeatState {
         if best_v <= 0.0 {
             self.tau_smoothed = f32::NAN;
             self.phase_smoothed = f32::NAN;
+            self.tea_conf_inst = 0.0;
+            self.update_public_confidence(onset);
             return;
         }
+        self.tea_conf_inst = self.tea_lock_confidence(tea, best_i, best_v, upper);
         let mut tau = best_i as f32;
         if best_i > self.beat_tau_min && best_i < upper {
             let y0 = tea[best_i - 1];
@@ -601,7 +761,7 @@ impl BeatState {
             let expected_phase = wrap_phase(self.phase_smoothed + elapsed_hops, tau);
             let observed_phase = pick_snapped_phi(&phi_cands, expected_phase, tau);
             if observed_phase.is_finite() {
-                let correction = PHASE_CORRECTION_ALPHA
+                let correction = self.phase_correction_alpha
                     * signed_phase_delta(expected_phase, observed_phase, tau);
                 wrap_phase(expected_phase + correction, tau)
             } else {
@@ -612,13 +772,14 @@ impl BeatState {
             phi_cands[0].0 as f32
         };
         self.phase_updated_at = self.frame_index;
+        self.update_public_confidence(onset);
     }
 
     fn write_beat_outputs(&self, beat_grid: &mut [f32], beat_state: &mut [f32], dt: f32) {
         let p = self.tau_smoothed;
         let phi = self.phase_smoothed;
-        let s = self.score_inst;
-        if p.is_nan() || s <= 0.0 {
+        let confidence = self.confidence_smoothed.clamp(0.0, 1.0);
+        if p.is_nan() || phi.is_nan() || self.score_inst <= 0.0 {
             beat_grid[0] = f32::NAN;
             beat_grid[1] = f32::NAN;
             beat_grid[2] = 0.0;
@@ -629,9 +790,9 @@ impl BeatState {
         } else {
             beat_grid[0] = p;
             beat_grid[1] = phi;
-            beat_grid[2] = s;
+            beat_grid[2] = confidence;
             beat_state[0] = if p > 0.0 { 60.0 / (p * dt) } else { f32::NAN };
-            beat_state[1] = s;
+            beat_state[1] = confidence;
             beat_state[2] = f32::NAN;
             beat_state[3] = f32::NAN;
         }

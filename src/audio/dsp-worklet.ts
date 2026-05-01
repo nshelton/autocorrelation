@@ -20,6 +20,7 @@ class DSPProcessor extends AudioWorkletProcessor {
   private teaSigma = 5.0;
   private acfSmoothingSigma = 2.0;
   private dbFloor = -100;
+  private phaseLock = 1.0;
   private bufferNames: string[] = [];
   private pendingConfigure: {
     windowSize: number;
@@ -78,6 +79,7 @@ class DSPProcessor extends AudioWorkletProcessor {
       else if (msg.key === "acfSmoothingSigma")
         this.acfSmoothingSigma = msg.value;
       else if (msg.key === "dbFloor") this.dbFloor = msg.value;
+      else if (msg.key === "phaseLock") this.phaseLock = msg.value;
       // Forward any other Dsp-recognized key directly. Unknown keys are
       // silently dropped on the Rust side.
       if (this.ready && this.dsp) this.dsp.set_param(msg.key, msg.value);
@@ -109,6 +111,7 @@ class DSPProcessor extends AudioWorkletProcessor {
     this.dsp.set_param("teaSigma", this.teaSigma);
     this.dsp.set_param("acfSmoothingSigma", this.acfSmoothingSigma);
     this.dsp.set_param("dbFloor", this.dbFloor);
+    this.dsp.set_param("phaseLock", this.phaseLock);
     // Cache the buffer name list. Names are static across reconfigurations,
     // so this could fire only at boot, but rebuilding it on each configure
     // is cheap and removes the "did names change?" question.

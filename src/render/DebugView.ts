@@ -9,6 +9,7 @@ import { TimeSeriesBarRenderer } from "./TimeSeriesBarRenderer";
 import { TimeSeriesLineRenderer } from "./TimeSeriesLineRenderer";
 import type { FeatureStore } from "../store/FeatureStore";
 import type { ParamStore } from "../params/ParamStore";
+import { BeatPulseSquares } from "./BeatPulseSquares";
 
 export interface DebugViewDeps {
   scene: Scene;
@@ -58,10 +59,14 @@ export class DebugView {
   private peakMarkers: PeakMarkers;
   private scrollingBeatGridMarkers: BeatGridMarkers;
   private staticBeatGridMarkers: StaticBeatGridMarkers;
+  private beatPulseSquares: BeatPulseSquares;
   private labels: DebugLabels;
 
   constructor(private deps: DebugViewDeps) {
     this.peakMarkers = new PeakMarkers({ baseColor: 0xffff66 });
+    this.beatPulseSquares = new BeatPulseSquares();
+    this.deps.scene.add(this.beatPulseSquares.object3d);
+
     this.scrollingBeatGridMarkers = new BeatGridMarkers({
       baseColor: 0x66ccff,
     });
@@ -95,6 +100,7 @@ export class DebugView {
     );
 
     this.labels.update();
+    this.beatPulseSquares.update(this.deps.store.get("beatPulses"));
   }
 
   dispose(): void {
@@ -104,6 +110,7 @@ export class DebugView {
     this.scrollingBeatGridMarkers.dispose();
     this.staticBeatGridMarkers.dispose();
     this.labels.dispose();
+    this.beatPulseSquares.dispose();
   }
 
   private createLines(): void {
@@ -146,6 +153,7 @@ export class DebugView {
       this.lines.get("rms")!.object3d,
     );
     const group = new Object3D();
+
     group.add(
       this.lines.get("rmsLow")!.object3d,
       this.lines.get("rmsMid")!.object3d,
@@ -157,7 +165,7 @@ export class DebugView {
     group.scale.set(4, 0.5, 1);
     group.position.set(-2, 0.5, 0);
 
-    this.scrollingBeatGridMarkers.object3d.position.set(-2, -0.5, 0);
+    this.scrollingBeatGridMarkers.object3d.position.set(-2, 0, 0);
     this.scrollingBeatGridMarkers.object3d.scale.set(4, 1, 1);
 
     this.staticBeatGridMarkers.object3d.position.set(-2, -1.5, 0);
@@ -166,7 +174,7 @@ export class DebugView {
     this.lines.get("onset")!.object3d.position.set(-2, 0, 0);
     this.lines.get("onset")!.object3d.scale.set(4, 0.5, 1);
 
-    this.lines.get("onsetAcf")!.object3d.position.set(-2, -2, 0);
+    this.lines.get("onsetAcf")!.object3d.position.set(-2, -1, 0);
     this.lines.get("onsetAcf")!.object3d.scale.set(4, 5, 1);
 
     this.lines.get("onsetAcfEnhanced")!.object3d.position.set(-2, -2, 0);
