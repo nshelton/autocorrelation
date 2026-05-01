@@ -8,6 +8,12 @@ pub const PULSE_N: usize = 4;
 /// stack-allocated array keeps the hot path allocation-free.
 pub const PHI_CANDIDATE_COUNT: usize = 5;
 
+/// Relative-correlation floor for the snap-to-prediction picker. A φ
+/// candidate must have `corr ≥ PHI_CANDIDATE_MIN_RATIO * top_corr` to be
+/// eligible to override the global max — stops tiny secondary peaks from
+/// winning just because they happen to sit closer to the prediction.
+pub(crate) const PHI_CANDIDATE_MIN_RATIO: f32 = 0.7;
+
 /// Upper bound on `phi_max` (= ceil(tau)). At BEAT_TRACKER_MIN_BPM=40 and
 /// dt=1024/48000, tau_max ≈ 70 hops, so 80 leaves headroom. Used to size
 /// the per-φ correlation scratch buffer as a stack array — keeps
@@ -129,6 +135,37 @@ fn signed_phase_delta(from: f32, to: f32, period: f32) -> f32 {
         delta -= period;
     }
     delta
+}
+
+/// Pick the φ candidate closest to `expected` (circular distance mod `tau`),
+/// among those with correlation at least `PHI_CANDIDATE_MIN_RATIO` of the
+/// top correlation. Returns NaN if all slots are empty (`corr == 0.0`).
+/// `candidates` must be sorted descending by correlation (as produced by
+/// `score_phase_for_tau`).
+pub(crate) fn pick_snapped_phi(
+    candidates: &[(usize, f32); PHI_CANDIDATE_COUNT],
+    expected: f32,
+    tau: f32,
+) -> f32 {
+    let top_corr = candidates[0].1;
+    if top_corr <= 0.0 {
+        return f32::NAN;
+    }
+    let floor = PHI_CANDIDATE_MIN_RATIO * top_corr;
+    let mut best_phi = candidates[0].0 as f32;
+    let mut best_dist = signed_phase_delta(expected, best_phi, tau).abs();
+    for &(phi, corr) in &candidates[1..] {
+        if corr < floor || corr <= 0.0 {
+            break;
+        }
+        let phi_f = phi as f32;
+        let d = signed_phase_delta(expected, phi_f, tau).abs();
+        if d < best_dist {
+            best_dist = d;
+            best_phi = phi_f;
+        }
+    }
+    best_phi
 }
 
 fn comb_weight(multiple: usize) -> f32 {
@@ -549,17 +586,35 @@ impl BeatState {
         }
         self.tau_smoothed = tau;
         let (phi_cands, _, _, _) = score_phase_for_tau(onset, tau);
-        let observed_phase = phi_cands[0].0 as f32;
+        // Cold start: no prediction available, take the global max.
+        // Tracking: snap to the candidate nearest the predicted phase.
+        let observed_phase = if self.phase_smoothed.is_finite() && self.phase_updated_at != 0 {
+            let predicted = wrap_phase(
+                self.phase_smoothed
+                    + self
+                        .frame_index
+                        .saturating_sub(self.phase_updated_at)
+                        .max(1) as f32,
+                tau,
+            );
+            pick_snapped_phi(&phi_cands, predicted, tau)
+        } else {
+            phi_cands[0].0 as f32
+        };
         self.phase_smoothed = if self.phase_smoothed.is_finite() && self.phase_updated_at != 0 {
             let elapsed_hops = self
                 .frame_index
                 .saturating_sub(self.phase_updated_at)
                 .max(1) as f32;
             let expected_phase = wrap_phase(self.phase_smoothed + elapsed_hops, tau);
-            let correction = (PHASE_CORRECTION_ALPHA
-                * signed_phase_delta(expected_phase, observed_phase, tau))
-            .clamp(-PHASE_CORRECTION_MAX_HOPS, PHASE_CORRECTION_MAX_HOPS);
-            wrap_phase(expected_phase + correction, tau)
+            if observed_phase.is_finite() {
+                let correction = (PHASE_CORRECTION_ALPHA
+                    * signed_phase_delta(expected_phase, observed_phase, tau))
+                .clamp(-PHASE_CORRECTION_MAX_HOPS, PHASE_CORRECTION_MAX_HOPS);
+                wrap_phase(expected_phase + correction, tau)
+            } else {
+                expected_phase
+            }
         } else {
             observed_phase
         };

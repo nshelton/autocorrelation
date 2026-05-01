@@ -1115,4 +1115,49 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn pick_snapped_phi_picks_nearest_above_floor() {
+        use crate::beat::{pick_snapped_phi, PHI_CANDIDATE_COUNT};
+        let mut cands = [(0usize, 0.0f32); PHI_CANDIDATE_COUNT];
+        cands[0] = (10, 1.0);
+        cands[1] = (5, 0.8);
+        cands[2] = (15, 0.4);
+        let phi = pick_snapped_phi(&cands, 6.0, 20.0);
+        assert_eq!(phi, 5.0, "phi=5 (corr 0.8 ≥ floor 0.7) is closest to expected=6");
+    }
+
+    #[test]
+    fn pick_snapped_phi_keeps_strongest_when_alternatives_below_floor() {
+        use crate::beat::{pick_snapped_phi, PHI_CANDIDATE_COUNT};
+        let mut cands = [(0usize, 0.0f32); PHI_CANDIDATE_COUNT];
+        cands[0] = (10, 1.0);
+        cands[1] = (15, 0.5);
+        cands[2] = (12, 0.4);
+        let phi = pick_snapped_phi(&cands, 11.0, 20.0);
+        assert_eq!(phi, 10.0, "no candidate above floor 0.7 except slot 0");
+    }
+
+    #[test]
+    fn pick_snapped_phi_returns_nan_when_no_candidates() {
+        use crate::beat::{pick_snapped_phi, PHI_CANDIDATE_COUNT};
+        let cands = [(0usize, 0.0f32); PHI_CANDIDATE_COUNT];
+        let phi = pick_snapped_phi(&cands, 5.0, 20.0);
+        assert!(phi.is_nan());
+    }
+
+    #[test]
+    fn pick_snapped_phi_uses_circular_distance() {
+        use crate::beat::{pick_snapped_phi, PHI_CANDIDATE_COUNT};
+        // Expected=1, tau=20. Circular distance to phi=19 is 2 (wraps via 0);
+        // linear distance is 18. Circular distance to slot 0 phi=15 is 6. With
+        // circular distance the wrap-neighbor slot 1 wins despite slot 0 having
+        // higher corr; with linear distance slot 0 would falsely win. This
+        // test fails if signed_phase_delta is replaced with naive subtraction.
+        let mut cands = [(0usize, 0.0f32); PHI_CANDIDATE_COUNT];
+        cands[0] = (15, 1.0);
+        cands[1] = (19, 0.9);
+        let phi = pick_snapped_phi(&cands, 1.0, 20.0);
+        assert_eq!(phi, 19.0);
+    }
 }
