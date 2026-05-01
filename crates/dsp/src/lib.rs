@@ -800,7 +800,7 @@ mod tests {
             dsp.process(&silent);
         }
         let cands = dsp.get_buffer("candidates");
-        assert_eq!(cands.len(), 30);
+        assert_eq!(cands.len(), 3 * crate::beat::MAX_PEAKS);
         for &v in cands.iter() {
             assert!(v.is_nan(), "silent → all candidate slots NaN, got {}", v);
         }
@@ -838,7 +838,7 @@ mod tests {
     }
 
     #[test]
-    fn pick_candidates_excludes_out_of_range_lags() {
+    fn pick_candidates_includes_full_range_anchor_lags() {
         let mut dsp = Dsp::new(2048, 48000.0, 1024, 512);
         let n = dsp.onset_acf_enhanced_len();
         let mut enhanced = vec![0.0f32; n];
@@ -851,16 +851,14 @@ mod tests {
         dsp.test_set_onset_acf_enhanced(&enhanced);
         dsp.test_run_pick_candidates();
         let cands = dsp.get_buffer("candidates");
-        for i in 0..10 {
-            let lag = cands[3 * i];
-            if !lag.is_nan() {
-                assert!(
-                    lag >= 12.0 && lag <= 70.0,
-                    "picked lag {} outside [12, 70]",
-                    lag
-                );
-            }
-        }
+        assert!(
+            cands.chunks_exact(3).any(|c| (c[0] - 100.0).abs() < 1.5),
+            "full-range candidate scan should include the long-range anchor peak"
+        );
+        assert!(
+            !cands.chunks_exact(3).any(|c| (c[0] - 5.0).abs() < 1.5),
+            "candidate scan should still exclude lags below the fastest beat bound"
+        );
     }
 
     #[test]
@@ -925,6 +923,33 @@ mod tests {
             (period_inst - 36.0).abs() < 1.5,
             "sub-period disambiguation failed: expected 36, got {}",
             period_inst
+        );
+    }
+
+    #[test]
+    fn tea_votes_from_top_scored_candidates() {
+        let mut dsp = Dsp::new(2048, 48000.0, 1024, 512);
+        let n = dsp.onset_history_len();
+        let mut onset = vec![0.0f32; n];
+        for i in (0..n).step_by(24) {
+            onset[i] = 1.0;
+        }
+        dsp.test_set_onset_history(&onset);
+
+        let mut enhanced = vec![0.0f32; dsp.onset_acf_enhanced_len()];
+        for &(lag, mag) in &[(24usize, 1.0f32), (48, 0.9), (36, 0.2)] {
+            enhanced[lag - 1] = mag * 0.25;
+            enhanced[lag] = mag;
+            enhanced[lag + 1] = mag * 0.25;
+        }
+        dsp.test_set_onset_acf_enhanced(&enhanced);
+        dsp.test_run_pick_candidates();
+
+        let tea = dsp.get_buffer("tea");
+        assert!(
+            tea[48] > 1e-4,
+            "expected secondary top candidate to vote into TEA at lag 48, got {}",
+            tea[48]
         );
     }
 

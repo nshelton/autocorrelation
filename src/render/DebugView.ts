@@ -1,6 +1,7 @@
 import { Scene, Object3D } from "three";
 import { DebugGrid } from "./DebugGrid";
 import { BeatGridMarkers } from "./BeatGridMarkers";
+import { StaticBeatGridMarkers } from "./StaticBeatGridMarkers";
 import { DebugLabels } from "./DebugLabels";
 import { PeakMarkers } from "./PeakMarkers";
 import { TimeSeriesRenderer, type TimeSeriesScale } from "./TimeSeriesRenderer";
@@ -55,12 +56,20 @@ export class DebugView {
   private lines = new Map<LineStoreKey, TimeSeriesRenderer>();
   private backgroundGrid = new DebugGrid();
   private peakMarkers: PeakMarkers;
-  private beatGridMarkers: BeatGridMarkers;
+  private scrollingBeatGridMarkers: BeatGridMarkers;
+  private staticBeatGridMarkers: StaticBeatGridMarkers;
   private labels: DebugLabels;
 
   constructor(private deps: DebugViewDeps) {
     this.peakMarkers = new PeakMarkers({ baseColor: 0xffff66 });
-    this.beatGridMarkers = new BeatGridMarkers({ baseColor: 0x66ccff });
+    this.scrollingBeatGridMarkers = new BeatGridMarkers({
+      baseColor: 0x66ccff,
+    });
+    this.staticBeatGridMarkers = new StaticBeatGridMarkers({
+      baseColor: 0xffbb77,
+    });
+    this.deps.scene.add(this.scrollingBeatGridMarkers.object3d);
+    this.deps.scene.add(this.staticBeatGridMarkers.object3d);
     this.labels = new DebugLabels(deps);
     this.deps.scene.add(this.backgroundGrid.object3d);
     this.deps.scene.add(this.peakMarkers.object3d);
@@ -74,10 +83,17 @@ export class DebugView {
       this.deps.store.get("candidates"),
       this.deps.store.get("onsetAcf").length,
     );
-    this.beatGridMarkers.update(
+
+    this.scrollingBeatGridMarkers.update(
       this.deps.store.get("beatGrid"),
       this.deps.store.get("rms").length,
     );
+
+    this.staticBeatGridMarkers.update(
+      this.deps.store.get("beatGrid"),
+      this.deps.store.get("tea").length,
+    );
+
     this.labels.update();
   }
 
@@ -85,7 +101,8 @@ export class DebugView {
     for (const line of this.lines.values()) line.dispose();
     this.lines.clear();
     this.peakMarkers.dispose();
-    this.beatGridMarkers.dispose();
+    this.scrollingBeatGridMarkers.dispose();
+    this.staticBeatGridMarkers.dispose();
     this.labels.dispose();
   }
 
@@ -116,7 +133,9 @@ export class DebugView {
 
     this.lines.get("waveform")!.object3d.position.set(-2, 1.5, 0);
     this.lines.get("bufferAcf")!.object3d.position.set(-1, 1.5, 0);
+
     this.lines.get("bufferAcf")!.object3d.scale.set(1, 0.5, 1);
+
     this.lines.get("spectrum")!.object3d.position.set(0, 1, 0);
     this.lines.get("spectrum")!.object3d.scale.set(2, 1, 1);
 
@@ -127,19 +146,24 @@ export class DebugView {
       this.lines.get("rms")!.object3d,
     );
     const group = new Object3D();
-    scene.add(group);
     group.add(
       this.lines.get("rmsLow")!.object3d,
       this.lines.get("rmsMid")!.object3d,
       this.lines.get("rmsHigh")!.object3d,
       this.lines.get("rms")!.object3d,
-      this.beatGridMarkers.object3d,
     );
+    scene.add(group);
 
-    group.position.set(-2, 0, 0);
     group.scale.set(4, 0.5, 1);
+    group.position.set(-2, 0.5, 0);
 
-    this.lines.get("onset")!.object3d.position.set(-2, -0.5, 0);
+    this.scrollingBeatGridMarkers.object3d.position.set(-2, -0.5, 0);
+    this.scrollingBeatGridMarkers.object3d.scale.set(4, 1, 1);
+
+    this.staticBeatGridMarkers.object3d.position.set(-2, -1.5, 0);
+    this.staticBeatGridMarkers.object3d.scale.set(4, 1, 1);
+
+    this.lines.get("onset")!.object3d.position.set(-2, 0, 0);
     this.lines.get("onset")!.object3d.scale.set(4, 0.5, 1);
 
     this.lines.get("onsetAcf")!.object3d.position.set(-2, -2, 0);

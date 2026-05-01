@@ -60,8 +60,9 @@ export class PeakMarkers {
       }
 
       const x = lag / lagResolution;
+      const height = 3 * (curvature + mag);
       const brightness = 1.0 - 0.75 * (i / denom);
-      this.writeVertex(id1, x, 1, 0, brightness);
+      this.writeVertex(id1, x, height, 0, brightness);
       this.writeVertex(id2, x, 0, 0, brightness);
     }
 
