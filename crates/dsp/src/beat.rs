@@ -118,8 +118,10 @@ const TEA_CANDIDATE_VOTE_COUNT: usize = 5;
 const COMB_MAX_DIVISOR: usize = 8;
 const COMB_MAX_MULTIPLE: usize = 16;
 const COMB_ALIGNMENT_TOLERANCE: f32 = 2.0;
-const PHASE_CORRECTION_ALPHA: f32 = 0.01;
-const PHASE_CORRECTION_MAX_HOPS: f32 = 20.0;
+// PLL gain on the per-frame phase observation. With top-K snap-to-prediction
+// doing observation disambiguation, α only needs to absorb sub-hop noise; a
+// faster α makes the grid responsive to genuine drift. ~20-frame TC at 47 Hz.
+const PHASE_CORRECTION_ALPHA: f32 = 0.05;
 
 fn wrap_phase(phase: f32, period: f32) -> f32 {
     if period > 0.0 && period.is_finite() {
@@ -155,7 +157,7 @@ pub(crate) fn pick_snapped_phi(
     let mut best_phi = candidates[0].0 as f32;
     let mut best_dist = signed_phase_delta(expected, best_phi, tau).abs();
     for &(phi, corr) in &candidates[1..] {
-        if corr < floor || corr <= 0.0 {
+        if corr < floor {
             break;
         }
         let phi_f = phi as f32;
@@ -586,37 +588,28 @@ impl BeatState {
         }
         self.tau_smoothed = tau;
         let (phi_cands, _, _, _) = score_phase_for_tau(onset, tau);
-        // Cold start: no prediction available, take the global max.
-        // Tracking: snap to the candidate nearest the predicted phase.
-        let observed_phase = if self.phase_smoothed.is_finite() && self.phase_updated_at != 0 {
-            let predicted = wrap_phase(
-                self.phase_smoothed
-                    + self
-                        .frame_index
-                        .saturating_sub(self.phase_updated_at)
-                        .max(1) as f32,
-                tau,
-            );
-            pick_snapped_phi(&phi_cands, predicted, tau)
-        } else {
-            phi_cands[0].0 as f32
-        };
+        // On non-drum content the per-φ correlation curve has multiple
+        // near-equal local maxima; the global argmax flips frame-to-frame
+        // and yanks the grid. Snap to the candidate nearest the PLL
+        // prediction (above PHI_CANDIDATE_MIN_RATIO × top floor) to
+        // disambiguate. Cold start has no prediction, so take the global max.
         self.phase_smoothed = if self.phase_smoothed.is_finite() && self.phase_updated_at != 0 {
             let elapsed_hops = self
                 .frame_index
                 .saturating_sub(self.phase_updated_at)
                 .max(1) as f32;
             let expected_phase = wrap_phase(self.phase_smoothed + elapsed_hops, tau);
+            let observed_phase = pick_snapped_phi(&phi_cands, expected_phase, tau);
             if observed_phase.is_finite() {
-                let correction = (PHASE_CORRECTION_ALPHA
-                    * signed_phase_delta(expected_phase, observed_phase, tau))
-                .clamp(-PHASE_CORRECTION_MAX_HOPS, PHASE_CORRECTION_MAX_HOPS);
+                let correction = PHASE_CORRECTION_ALPHA
+                    * signed_phase_delta(expected_phase, observed_phase, tau);
                 wrap_phase(expected_phase + correction, tau)
             } else {
+                // Observation lost (silence, transient): coast on prediction.
                 expected_phase
             }
         } else {
-            observed_phase
+            phi_cands[0].0 as f32
         };
         self.phase_updated_at = self.frame_index;
     }
