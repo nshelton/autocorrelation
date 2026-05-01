@@ -9,12 +9,23 @@ export interface DebugLabelsOptions {
   audioContext: AudioContext;
 }
 
+// Mirror of crates/dsp/src/perf.rs PERF_METRIC_NAMES — same index order.
+const PERF_METRIC_NAMES = [
+  "total",
+  "inputRms",
+  "spectrum",
+  "onsetAcf",
+  "beat",
+  "bufferAcf",
+] as const;
+
 export class DebugLabels {
   readonly object3d: Object3D = new Group();
 
   private labels: TextLabel[] = [];
   private beatSummary: TextLabel;
   private configSummary: TextLabel;
+  private perfSummary: TextLabel;
   private nextDynamicUpdateMs = 0;
 
   constructor(private opts: DebugLabelsOptions) {
@@ -29,6 +40,7 @@ export class DebugLabels {
 
     this.beatSummary = this.createLabel("beat: --", 0x66ccff, 0, -0.7);
     this.configSummary = this.createLabel("cfg: --", 0xffffff, 0, 2);
+    this.perfSummary = this.createLabel("dsp: --", 0xaaffaa, 0, 1.7);
   }
 
   update(): void {
@@ -59,6 +71,21 @@ export class DebugLabels {
         "dsp.hopSize",
       )} sr=${Math.round(this.opts.audioContext.sampleRate)}`,
     );
+
+    this.perfSummary.setText(this.formatPerfLabel());
+  }
+
+  private formatPerfLabel(): string {
+    const perf = this.opts.store.get("dspPerfUs");
+    if (perf.length < PERF_METRIC_NAMES.length) return "dsp: --";
+    const parts: string[] = [];
+    for (let i = 0; i < PERF_METRIC_NAMES.length; i++) {
+      const v = perf[i];
+      const formatted =
+        Number.isFinite(v) && v >= 0 ? `${Math.round(v)}µs` : "--";
+      parts.push(`${PERF_METRIC_NAMES[i]}=${formatted}`);
+    }
+    return `dsp: ${parts.join(" ")}`;
   }
 
   dispose(): void {

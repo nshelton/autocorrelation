@@ -7,6 +7,7 @@
 //! these names.
 
 use crate::beat::MAX_PEAKS;
+use crate::perf::PERF_METRIC_COUNT;
 
 const BEAT_GRID_LEN: usize = 3;
 const BEAT_PULSES_LEN: usize = 4;
@@ -29,6 +30,7 @@ pub struct Buffers {
     pub beatGrid: Vec<f32>,
     pub beatPulses: Vec<f32>,
     pub beatState: Vec<f32>,
+    pub dspPerfUs: Vec<f32>,
 }
 
 impl Buffers {
@@ -50,6 +52,7 @@ impl Buffers {
             beatGrid: vec![f32::NAN; BEAT_GRID_LEN],
             beatPulses: vec![f32::NAN; BEAT_PULSES_LEN],
             beatState: vec![f32::NAN; BEAT_STATE_LEN],
+            dspPerfUs: vec![f32::NAN; PERF_METRIC_COUNT],
         }
     }
 
@@ -70,11 +73,12 @@ impl Buffers {
             ("beatGrid", self.beatGrid.len()),
             ("beatPulses", self.beatPulses.len()),
             ("beatState", self.beatState.len()),
+            ("dspPerfUs", self.dspPerfUs.len()),
         ]
     }
 
     /// Look up a buffer's current contents by string key. Returns `None`
-    /// for unknown names. The 15 keys here ARE the JS contract — keep this
+    /// for unknown names. The keys here ARE the JS contract — keep this
     /// match in sync with `descriptors()` and the `Buffers` field list.
     pub fn get(&self, name: &str) -> Option<&[f32]> {
         match name {
@@ -93,6 +97,7 @@ impl Buffers {
             "beatGrid" => Some(&self.beatGrid),
             "beatPulses" => Some(&self.beatPulses),
             "beatState" => Some(&self.beatState),
+            "dspPerfUs" => Some(&self.dspPerfUs),
             _ => None,
         }
     }
@@ -132,7 +137,18 @@ mod tests {
                 "beatGrid",
                 "beatPulses",
                 "beatState",
+                "dspPerfUs",
             ]
         );
+    }
+
+    #[test]
+    fn dsp_perf_us_is_nan_at_init_and_correct_length() {
+        let b = Buffers::new(2048, 512);
+        let v = b.get("dspPerfUs").unwrap();
+        assert_eq!(v.len(), PERF_METRIC_COUNT);
+        for &x in v {
+            assert!(x.is_nan());
+        }
     }
 }

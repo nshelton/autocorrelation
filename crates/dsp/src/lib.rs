@@ -3,11 +3,16 @@ use wasm_bindgen::prelude::*;
 mod acf;
 mod beat;
 mod buffers;
+mod perf;
 mod spectrum;
 
 use crate::acf::AcfState;
 use crate::beat::BeatState;
 use crate::buffers::Buffers;
+use crate::perf::{
+    elapsed_us, now_us, PERF_BEAT, PERF_BUFFER_ACF, PERF_INPUT_RMS, PERF_ONSET_ACF, PERF_SPECTRUM,
+    PERF_TOTAL,
+};
 use crate::spectrum::SpectrumState;
 
 #[wasm_bindgen]
@@ -43,15 +48,18 @@ impl Dsp {
     }
 
     pub fn process(&mut self, input: &[f32]) {
+        let t_start = now_us();
+
+        // Section 1: input waveform copy + full-window RMS + RMS history push.
         let n = input.len().min(self.buffers.waveform.len());
         self.buffers.waveform[..n].copy_from_slice(&input[..n]);
-
-        // RMS over the input window
         let mean_sq: f32 = input.iter().take(n).map(|&x| x * x).sum::<f32>() / n.max(1) as f32;
         let rms = mean_sq.sqrt();
-
         push_history(&mut self.buffers.rms, rms);
+        let t_after_input = now_us();
+        self.buffers.dspPerfUs[PERF_INPUT_RMS] = elapsed_us(t_start, t_after_input);
 
+        // Section 2: spectrum + band RMS / onset history.
         let (low_rms, mid_rms, high_rms, flux) =
             self.spectrum
                 .process(input, &mut self.buffers.spectrum, self.db_floor);
@@ -59,13 +67,19 @@ impl Dsp {
         push_history(&mut self.buffers.rmsMid, mid_rms);
         push_history(&mut self.buffers.rmsHigh, high_rms);
         push_history(&mut self.buffers.onset, flux);
+        let t_after_spectrum = now_us();
+        self.buffers.dspPerfUs[PERF_SPECTRUM] = elapsed_us(t_after_input, t_after_spectrum);
 
+        // Section 3: onset ACF (gen ACF + smoothing + harmonic enhancement).
         self.acf.process(
             &self.buffers.onset,
             &mut self.buffers.onsetAcf,
             &mut self.buffers.onsetAcfEnhanced,
         );
+        let t_after_onset_acf = now_us();
+        self.buffers.dspPerfUs[PERF_ONSET_ACF] = elapsed_us(t_after_spectrum, t_after_onset_acf);
 
+        // Section 4: beat tracking.
         self.beat.process(
             &self.buffers.onset,
             &self.buffers.onsetAcfEnhanced,
@@ -76,8 +90,15 @@ impl Dsp {
             &mut self.buffers.beatPulses,
             self.dt,
         );
+        let t_after_beat = now_us();
+        self.buffers.dspPerfUs[PERF_BEAT] = elapsed_us(t_after_onset_acf, t_after_beat);
 
+        // Section 5: time-domain waveform autocorrelation.
         crate::acf::autocorrelate(&self.buffers.waveform, &mut self.buffers.bufferAcf);
+        let t_after_buf_acf = now_us();
+        self.buffers.dspPerfUs[PERF_BUFFER_ACF] = elapsed_us(t_after_beat, t_after_buf_acf);
+
+        self.buffers.dspPerfUs[PERF_TOTAL] = elapsed_us(t_start, t_after_buf_acf);
     }
 
     /// String-keyed buffer accessor. Returns a copy of the named buffer's
@@ -1248,6 +1269,34 @@ mod tests {
         let cands = [(0usize, 0.0f32); PHI_CANDIDATE_COUNT];
         let phi = pick_snapped_phi(&cands, 5.0, 20.0);
         assert!(phi.is_nan());
+    }
+
+    #[test]
+    fn dsp_perf_us_populated_after_process() {
+        let mut dsp = Dsp::new(2048, 48000.0, 1024, 512);
+        let signal: Vec<f32> = (0..2048)
+            .map(|i| (2.0 * std::f32::consts::PI * 1000.0 * (i as f32 / 48000.0)).sin())
+            .collect();
+        dsp.process(&signal);
+        let perf = dsp.get_buffer("dspPerfUs");
+        assert_eq!(perf.len(), crate::perf::PERF_METRIC_COUNT);
+        for (i, &v) in perf.iter().enumerate() {
+            assert!(v.is_finite(), "perf[{}] should be finite, got {}", i, v);
+            assert!(v >= 0.0, "perf[{}] should be non-negative, got {}", i, v);
+        }
+        // total should be at least as large as any single section, modulo
+        // timer noise. Allow a small slack since native Instant resolution
+        // can produce identical readings on tiny sections.
+        let total = perf[crate::perf::PERF_TOTAL];
+        for i in 1..crate::perf::PERF_METRIC_COUNT {
+            assert!(
+                perf[i] <= total + 1.0,
+                "section {} ({}) exceeds total ({})",
+                i,
+                perf[i],
+                total
+            );
+        }
     }
 
     #[test]

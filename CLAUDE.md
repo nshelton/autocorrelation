@@ -27,7 +27,7 @@ Real-time audio visualizer. Audio flows: **source → AudioWorklet (Rust/WASM DS
 Five modules. Each pipeline stage owns its state struct; `lib.rs` is a thin orchestrator.
 
 - **`lib.rs`** — `Dsp` struct (the wasm-bindgen surface), short `process()` that sequences the stages, plus integration tests.
-- **`buffers.rs`** — `Buffers` struct: 15 named output `Vec<f32>` fields with **camelCase Rust field names** (`bufferAcf`, `rmsLow`, `onsetAcfEnhanced`, etc., via `#[allow(non_snake_case)]`) so the Rust field, the registry-lookup match arm, the worklet message field, and the FeatureStore key are all the same string. `Buffers::get(name) -> Option<&[f32]>` and `Buffers::descriptors() -> Vec<(&'static str, usize)>` are the only string-keyed entry points; stages use direct field access.
+- **`buffers.rs`** — `Buffers` struct: 16 named output `Vec<f32>` fields with **camelCase Rust field names** (`bufferAcf`, `rmsLow`, `onsetAcfEnhanced`, `dspPerfUs`, etc., via `#[allow(non_snake_case)]`) so the Rust field, the registry-lookup match arm, the worklet message field, and the FeatureStore key are all the same string. `Buffers::get(name) -> Option<&[f32]>` and `Buffers::descriptors() -> Vec<(&'static str, usize)>` are the only string-keyed entry points; stages use direct field access. `dspPerfUs` is diagnostic data (per-section microsecond runtimes from `crates/dsp/src/perf.rs`), not a visual time-series signal — see `DebugLabels` for the consumer.
 - **`spectrum.rs`** — `SpectrumState`: Hann-windowed real FFT (`realfft`), magnitude → dBFS → normalized [0,1] → temporally smoothed (α derived from `dsp.smoothingTauSecs`). `mag_scale = 2/sum(hann)` so a unit-amplitude sine peaks at ~1.0. Bin 0 (DC) dropped from output. Same FFT also produces low/mid/high-band RMS via Parseval-correct band-energy summation. Returns `(low_rms, mid_rms, high_rms, flux)` per call where `flux` is the spectral-flux onset signal.
 - **`acf.rs`** — `AcfState`: generalized autocorrelation (Percival & Tzanetakis 2014 §II-B.2, `|X|^0.5` magnitude compression) on the onset history → smoothes along the lag axis with a Gaussian kernel (σ in lag bins, configurable via `dsp.acfSmoothingSigma`) → harmonic-enhanced ACF (sum of acf[τ] + acf[2τ] + acf[4τ]). Smoothing happens **before** harmonic enhancement so the enhanced output inherits the lag-axis broadening. Module also hosts the free functions `compute_gen_acf`, `compute_harmonic_enhanced`, `autocorrelate` (time-domain, used for `bufferAcf`), `bin_for_hz`.
 - **`beat.rs`** — `BeatState`: tempo candidate picking → phase scoring → TEA accumulator → beat outputs. Diagram below.
@@ -94,7 +94,7 @@ Five methods total:
 - `new(window_size, sample_rate, hop_size, rms_history_len) -> Dsp`
 - `process(input: &[f32])`
 - `get_buffer(name: &str) -> Vec<f32>` — string-keyed buffer accessor (Float32Array on the JS side).
-- `buffer_names() -> Vec<String>` — list all 15 buffer keys; called once per configure to populate the worklet's name cache.
+- `buffer_names() -> Vec<String>` — list all 16 buffer keys; called once per configure to populate the worklet's name cache.
 - `set_param(key: &str, value: f32)` — recognized keys: `smoothingTauSecs`, `onsetSmoothingTauSecs`, `teaTauSecs`, `teaSigma`, `acfSmoothingSigma`, `dbFloor`. Unknown keys silently ignored.
 
 wasm-bindgen with `--target web` exports method names verbatim (snake_case). JS calls are `dsp.get_buffer("...")`, `dsp.set_param("...", v)` — NOT `getBuffer`/`setParam`.
@@ -122,7 +122,7 @@ wasm-bindgen with `--target web` exports method names verbatim (snake_case). JS 
 ## Pitfalls / non-obvious invariants
 
 - **`candidates` is stride 3.** Triples `[lag, mag, sharpness]`. Length `3 * MAX_PEAKS` (the constant lives in `beat.rs`). Anything iterating peaks must step in 3s. NaN means "empty slot."
-- **`TextDecoder` polyfill is load-bearing.** It's only installed if `globalThis.TextDecoder` is missing in the AudioWorkletGlobalScope (Chrome before ~116). If installed, it must implement real UTF-8 decoding — a no-op stub returns `""` and silently corrupts every Rust→JS string (including all 15 buffer names from `buffer_names()`, which makes the visualizer go dark with no obvious error).
+- **`TextDecoder` polyfill is load-bearing.** It's only installed if `globalThis.TextDecoder` is missing in the AudioWorkletGlobalScope (Chrome before ~116). If installed, it must implement real UTF-8 decoding — a no-op stub returns `""` and silently corrupts every Rust→JS string (including all 16 buffer names from `buffer_names()`, which makes the visualizer go dark with no obvious error).
 - **`MAX_PEAKS` is `pub(crate)` in `beat.rs`** and imported by `buffers.rs`. The two must agree because `Buffers` allocates `candidates` as `vec![f32::NAN; 3 * MAX_PEAKS]` and `BeatState` writes exactly `MAX_PEAKS` triples.
 - **HMR teardown.** `App.dispose()` clears `port.onmessage` so in-flight features messages stop landing on a half-disposed app. The new App instance re-wires onmessage and lazy-inits renderers from the next features message — there is no `sync` round-trip, no `applyConfigured` to re-fire.
 - **BPM bounds are hard.** `BEAT_TRACKER_MIN_BPM` / `MAX_BPM` = 40 / 220. Music outside this range is reported at the nearest octave inside it.
