@@ -28,18 +28,45 @@ describe("WorkletBridge", () => {
     localStorage.clear();
   });
 
-  it("bootstrap posts one configure + four param messages with current store values", () => {
+  it("bootstrap posts one configure + five param messages with current store values", () => {
     const store = makeStore();
     const port = makePort();
     const bridge = new WorkletBridge(store, port);
     bridge.bootstrap();
-    const calls = (port.postMessage as ReturnType<typeof vi.fn>).mock.calls.map((c) => c[0]);
-    expect(calls).toContainEqual({ type: "configure", windowSize: 2048, rmsHistoryLen: 512 });
-    expect(calls).toContainEqual({ type: "param", key: "hopSize", value: 1024 });
-    expect(calls).toContainEqual({ type: "param", key: "smoothingTauSecs", value: 0.0956 });
-    expect(calls).toContainEqual({ type: "param", key: "dbFloor", value: -100 });
-    expect(calls).toContainEqual({ type: "param", key: "teaTauSecs", value: 4.0 });
-    expect(calls.length).toBe(5);
+    const calls = (port.postMessage as ReturnType<typeof vi.fn>).mock.calls.map(
+      (c) => c[0],
+    );
+    expect(calls).toContainEqual({
+      type: "configure",
+      windowSize: 2048,
+      rmsHistoryLen: 512,
+    });
+    expect(calls).toContainEqual({
+      type: "param",
+      key: "hopSize",
+      value: 1024,
+    });
+    expect(calls).toContainEqual({
+      type: "param",
+      key: "smoothingTauSecs",
+      value: 0.0956,
+    });
+    expect(calls).toContainEqual({
+      type: "param",
+      key: "onsetSmoothingTauSecs",
+      value: 0.05,
+    });
+    expect(calls).toContainEqual({
+      type: "param",
+      key: "dbFloor",
+      value: -100,
+    });
+    expect(calls).toContainEqual({
+      type: "param",
+      key: "teaTauSecs",
+      value: 4.0,
+    });
+    expect(calls.length).toBe(6);
   });
 
   it("windowSize change posts a configure message with both reconfig params", () => {
@@ -65,6 +92,19 @@ describe("WorkletBridge", () => {
       type: "param",
       key: "smoothingTauSecs",
       value: 0.5,
+    });
+  });
+
+  it("onsetSmoothingTauSecs change posts a param message with the hot key (no dsp prefix)", () => {
+    const store = makeStore();
+    const port = makePort();
+    new WorkletBridge(store, port);
+    (port.postMessage as ReturnType<typeof vi.fn>).mockClear();
+    store.set("dsp.onsetSmoothingTauSecs", 0.15);
+    expect(port.postMessage).toHaveBeenCalledWith({
+      type: "param",
+      key: "onsetSmoothingTauSecs",
+      value: 0.15,
     });
   });
 

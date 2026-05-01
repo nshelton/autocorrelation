@@ -1,11 +1,22 @@
 import type { ParamStore } from "./ParamStore";
 
-const HOT_KEYS = ["hopSize", "smoothingTauSecs", "dbFloor", "teaTauSecs"] as const;
+const HOT_KEYS = [
+  "hopSize",
+  "smoothingTauSecs",
+  "onsetSmoothingTauSecs",
+  "dbFloor",
+  "teaTauSecs",
+  "teaSigma",
+  "acfSmoothingSigma",
+] as const;
 
 export class WorkletBridge {
   private unsubscribe: () => void;
 
-  constructor(private store: ParamStore, private port: MessagePort) {
+  constructor(
+    private store: ParamStore,
+    private port: MessagePort,
+  ) {
     this.unsubscribe = store.subscribe((key) => this.handleChange(key));
   }
 
@@ -30,7 +41,11 @@ export class WorkletBridge {
       rmsHistoryLen: this.store.get("dsp.rmsHistoryLen"),
     });
     for (const k of HOT_KEYS) {
-      this.port.postMessage({ type: "param", key: k, value: this.resolveHotValue(k) });
+      this.port.postMessage({
+        type: "param",
+        key: k,
+        value: this.resolveHotValue(k),
+      });
     }
   }
 
@@ -47,7 +62,11 @@ export class WorkletBridge {
       const suffix = key.slice("dsp.".length);
       if (!(HOT_KEYS as readonly string[]).includes(suffix)) return;
       const hotKey = suffix as (typeof HOT_KEYS)[number];
-      this.port.postMessage({ type: "param", key: hotKey, value: this.resolveHotValue(hotKey) });
+      this.port.postMessage({
+        type: "param",
+        key: hotKey,
+        value: this.resolveHotValue(hotKey),
+      });
     }
   }
 

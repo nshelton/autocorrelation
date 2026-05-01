@@ -1,4 +1,5 @@
 import {
+  AdditiveBlending,
   Group,
   InstancedMesh,
   Matrix4,
@@ -13,7 +14,7 @@ import {
 } from "./TimeSeriesRenderer";
 
 // Unit quad with its base at y=0, top at y=1, centered horizontally on x=0.
-// Per-instance scale.y = layout's y output → bar grows up to that value.
+// Per-instance scale.y = sample value → bar grows up to that value.
 const unitQuad = (): PlaneGeometry => {
   const g = new PlaneGeometry(1, 1);
   g.translate(0, 0.5, 0);
@@ -37,6 +38,8 @@ export class TimeSeriesBarRenderer extends TimeSeriesRenderer {
       color: this.color,
       transparent: true,
       depthWrite: false,
+      opacity: 1,
+      blending: AdditiveBlending,
     });
     this.update();
   }
@@ -60,10 +63,10 @@ export class TimeSeriesBarRenderer extends TimeSeriesRenderer {
     this.object3d.add(this.mesh);
   }
 
-  protected writeOne(i: number, n: number, v: Vector3): void {
+  protected writeOne(i: number, n: number, x: number, y: number): void {
     const w = n <= 1 ? 1 : 1 / n;
-    this.pos.set(v.x, 0, v.z);
-    this.scl.set(w, v.y, 1);
+    this.pos.set(x, 0, 0);
+    this.scl.set(w, y, 1);
     this.mat.compose(this.pos, this.quat, this.scl);
     this.mesh.setMatrixAt(i, this.mat);
   }

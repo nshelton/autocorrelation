@@ -9,77 +9,102 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - `npm test` — run TS tests once (vitest, `happy-dom` env, `tests/**/*.test.ts`).
 - `npm run test:watch` — vitest watch.
 - `npm run wasm` — rebuild Rust DSP crate to WASM. Runs `wasm-pack build --target web --out-dir ../../src/wasm-pkg` from `crates/dsp`. **Run this whenever `crates/dsp/` changes** — `src/wasm-pkg/` is gitignored and not produced by `npm run dev`/`build`.
-- Single TS test: `npx vitest run tests/render/CameraRig.test.ts` (or `-t "<test name pattern>"`).
+- Single TS test: `npx vitest run tests/render/<X>.test.ts` (or `-t "<test name pattern>"`).
 - Rust tests: `cargo test -p dsp` from repo root.
 
 ## Architecture
 
-Real-time audio visualizer. Audio flows: **source → AudioWorklet (Rust/WASM DSP) → main thread FeatureStore → Three.js WebGPU LineRenderers**. All DSP runs off the main thread; rendering and feature storage stay on it.
+Real-time audio visualizer. Audio flows: **source → AudioWorklet (Rust/WASM DSP) → main thread FeatureStore → Three.js WebGPU renderers**. All DSP runs off the main thread; rendering and feature storage stay on it.
 
 ### Audio path (`src/audio/` + `crates/dsp/`)
 
 - `AudioSource.ts` exposes three `AudioSourceBundle` factories: `createMicSource` (getUserMedia, no AGC/NS/EC), `createTabSource` (getDisplayMedia, drops video tracks immediately — picker requires both audio+video to surface tab-audio capture), `createTestSource` (in-process oscillator, no permissions — used for fast iteration; press `T` before any source is started).
-- `dsp-worklet.ts` is the AudioWorklet processor. It receives a precompiled `WebAssembly.Module` via `processorOptions` (compiled on the main thread, passed in — workers cannot `compileStreaming` their own URL). It maintains a sliding window (`windowSize`, default 2048) and fires the FFT every `hopSize` samples (default 1024 = 50 % overlap → ~47 Hz update rate at 48 kHz). Output buffers are transferred (zero-copy) to the main thread via `postMessage`.
-- `worklet-polyfills.ts` stubs `TextDecoder`/`TextEncoder` in `AudioWorkletGlobalScope` because wasm-pack `--target web` glue instantiates a `TextDecoder` at module load. **Must be imported before** the wasm-pack glue — keep the `import "./worklet-polyfills"` line first in `dsp-worklet.ts`.
-- `crates/dsp/src/lib.rs` (`Dsp` struct) does Hann-windowed real FFT (`realfft`), magnitude → dBFS → normalized [0,1] → temporally smoothed (α≈0.2 at default settings, configurable via `dsp.smoothingTauSecs`). `mag_scale = 2/sum(hann)` so a unit-amplitude sine peaks at ~1.0. Bin 0 (DC) is dropped from the output spectrum. The same window also produces `rms_history` (full-band envelope) plus `low_rms_history` / `mid_rms_history` / `high_rms_history` from Parseval-correct band-energy summation.
+- `dsp-worklet.ts` is the AudioWorklet processor. It receives a precompiled `WebAssembly.Module` via `processorOptions` (compiled on the main thread, passed in — workers cannot `compileStreaming` their own URL). It maintains a sliding window (`windowSize`, default 2048) and fires the FFT every `hopSize` samples (default 1024 = 50 % overlap → ~47 Hz update rate at 48 kHz). Output buffers go zero-copy via `postMessage` transfer list.
+- `worklet-polyfills.ts` provides UTF-8 `TextDecoder` / `TextEncoder` polyfills for `AudioWorkletGlobalScope` in browsers that lack them. wasm-pack `--target web` glue uses both at module load AND for every Rust↔JS string round-trip (e.g. `Dsp::buffer_names()`), so a no-op stub silently corrupts strings to `""`. **Must be imported before** the wasm-pack glue — keep `import "./worklet-polyfills"` first in `dsp-worklet.ts`.
 
-### Beat detection pipeline (`crates/dsp/src/lib.rs`)
+### DSP crate layout (`crates/dsp/src/`)
 
-This is the bottom half of `Dsp::process` — runs after the FFT/RMS stages and feeds the beat-related output buffers.
+Five modules. Each pipeline stage owns its state struct; `lib.rs` is a thin orchestrator.
+
+- **`lib.rs`** — `Dsp` struct (the wasm-bindgen surface), short `process()` that sequences the stages, plus integration tests.
+- **`buffers.rs`** — `Buffers` struct: 15 named output `Vec<f32>` fields with **camelCase Rust field names** (`bufferAcf`, `rmsLow`, `onsetAcfEnhanced`, etc., via `#[allow(non_snake_case)]`) so the Rust field, the registry-lookup match arm, the worklet message field, and the FeatureStore key are all the same string. `Buffers::get(name) -> Option<&[f32]>` and `Buffers::descriptors() -> Vec<(&'static str, usize)>` are the only string-keyed entry points; stages use direct field access.
+- **`spectrum.rs`** — `SpectrumState`: Hann-windowed real FFT (`realfft`), magnitude → dBFS → normalized [0,1] → temporally smoothed (α derived from `dsp.smoothingTauSecs`). `mag_scale = 2/sum(hann)` so a unit-amplitude sine peaks at ~1.0. Bin 0 (DC) dropped from output. Same FFT also produces low/mid/high-band RMS via Parseval-correct band-energy summation. Returns `(low_rms, mid_rms, high_rms, flux)` per call where `flux` is the spectral-flux onset signal.
+- **`acf.rs`** — `AcfState`: generalized autocorrelation (Percival & Tzanetakis 2014 §II-B.2, `|X|^0.5` magnitude compression) on the onset history → smoothes along the lag axis with a Gaussian kernel (σ in lag bins, configurable via `dsp.acfSmoothingSigma`) → harmonic-enhanced ACF (sum of acf[τ] + acf[2τ] + acf[4τ]). Smoothing happens **before** harmonic enhancement so the enhanced output inherits the lag-axis broadening. Module also hosts the free functions `compute_gen_acf`, `compute_harmonic_enhanced`, `autocorrelate` (time-domain, used for `bufferAcf`), `bin_for_hz`.
+- **`beat.rs`** — `BeatState`: tempo candidate picking → phase scoring → TEA accumulator → beat outputs. Diagram below.
+
+### Beat detection pipeline (`beat.rs`)
 
 ```
-rms_history (detrended) ──autocorrelate──▶  rms_acf
-                                              │ EMA τ=accumTauSecs
+onset_acf_enhanced ──pick_candidates──▶  candidates
+                                        (top-N, [lag, mag, sharpness] stride 3,
+                                         peak-spaced, parabolic-refined)
+                                              │
                                               ▼
-                                       rms_acf_accum  ──pick_acf_peaks──▶  acf_peaks
-                                              │                            (top-N, [lag, mag,
-                                              │                             sharpness] stride 3)
-                                              │                                   │
-                                              │                                   ▼
-                                              │                          BeatTracker.observe
-                                              │                            (state estimator)
-                                              │                                   │
-                                              ▼                                   ▼
-                                    fit_beat_phase  ◀────── bpm_period ────  beat_grid
-                                              │                              [period, phase, conf]
-                                              │                              beat_state
-                                              ▼                              [bpm, bpm_conf,
-                                       update_beat_pulses                     beats_per_measure,
-                                              │                               measure_conf]
+                onset ──score_candidates──▶ pulse_x, pulse_v, pulse_phi per candidate
+                                            (Φ₁ + Φ₂ + Φ₁.₅ pulse trains, max + variance)
+                                              │ pick winner: argmax(X_norm + V_norm)
                                               ▼
-                                       beat_pulses  (4 saws at 1×/2×/4×/8× period)
+                                       period_inst, phase_inst, score_inst (per-frame)
+                                              │
+                                              ▼
+                                       update_tea
+                                       (Gaussian-smear vote at period_inst into TEA;
+                                        EMA decay; argmax + parabolic refine
+                                        → tau_smoothed, phase_smoothed)
+                                              │
+                                              ▼
+                  write_beat_outputs    update_beat_pulses
+                  ▼                     ▼
+                  beat_grid             beat_pulses
+                  beat_state            (4 saws, brightness = phase
+                                         within 1×/2×/4×/8× period cycle)
 ```
 
-- `pick_acf_peaks` writes `[lag, mag, sharpness]` triples (stride 3). Sharpness = `-(y₀ - 2y₁ + y₂)` from parabolic interp — large for narrow real beats, small for broad smeared lobes; the tracker uses it to prefer pointy peaks at `m·period` for measure detection.
-- `BeatTracker` is a state estimator: holds smoothed `bpm_period` (continuous, EMA with confidence-gated rate `α(c) = α_max · c`) and discrete `beats_per_measure` (changes only with 1.3× hysteresis margin). Initial state: 120 BPM, 4/4. Bounded by `BEAT_TRACKER_MIN_BPM`/`MAX_BPM` (80–190) — observations whose `lag/k` falls outside this range are filtered, and `bpm_period` is clamped, so sub-period peaks (hi-hats, 16th-note patterns) can't pull the tracker into reporting absurd tempos.
-- `fit_beat_phase` returns NaN when `rms_history` is silent; `update_beat_pulses` then **free-runs** the saws by advancing `beat_position += 1/period` each frame instead of locking to a bogus phase=0. This keeps the squares pulsing at the tracker's default rate during silence rather than sticking on full white.
-- `acf_peaks` is consumed by both the tracker (BPM/measure observations) and `PeakMarkers` (rendered markers on the autocorr lane). Length = `3 * MAX_PEAKS` = 30 — keep stride-3 indexing in any new consumer.
+- **`candidates`** is the public top-N tempo candidate list. `[lag, mag, sharpness]` triples, stride 3, length `3 * MAX_PEAKS` (capacity defined in `beat.rs`, currently being tuned). NaN means empty slot. `sharpness = -(y₀ - 2y₁ + y₂)` from parabolic interpolation — large for narrow real beats, small for broad smeared lobes. Consumed by both the scorer and `PeakMarkers`.
+- **`score_phase_for_tau`** is the paper's pulse-train scoring — three combs (Φ₁ at k·τ weight 1.0, Φ₂ at k·2τ weight 0.5, Φ₁.₅ at (k+0.5)·τ weight 0.5) with N=4 pulses each. Returns max correlation (X) and variance across phases (V) for a given lag.
+- **`tea`** is the Tempo Estimate Accumulator — per-lag EMA across frames with a Gaussian-smeared vote per frame (σ = `dsp.teaSigma` in lag bins, τ = `dsp.teaTauSecs` for the EMA). Smooths `period_inst` jitter.
+- **Tempo bounds:** lags clamped to BPM range [`BEAT_TRACKER_MIN_BPM`, `BEAT_TRACKER_MAX_BPM`] = [40, 220]. At default sr/hop (48000/1024) that's tau_min ≈ 13, tau_max ≈ 70 lags. Music outside the range gets reported at the nearest octave inside it.
+- **Beat phase NaN:** when no candidate scores positively (silence / no rhythmic content), `period_inst`/`phase_inst`/`tau_smoothed`/`phase_smoothed` are all NaN. `write_beat_outputs` and `update_beat_pulses` NaN-fill their outputs. Renderers expect NaN as the "no value" sentinel and should no-op in that case.
 
 ### Rendering path (`src/render/`, `src/store/`, `src/App.ts`)
 
 - `Scene.ts` creates a `WebGPURenderer` (from `three/webgpu`) — **not** the default WebGL renderer. `await renderer.init()` is required before first render.
-- `App.ts` is the **thin orchestrator** (~130 lines): scene + camera + `CameraRig` presets (`1`=front, `2`=side, `3`=spectrum, `4`=rms, `5`=buffer-acf, `6`=rms-acf; space toggles front↔side), keyboard/resize listeners, the RAF loop, and worklet message routing. Each `features` and `configured` message is forwarded straight to `DebugView` — App owns no per-feature state.
-- `DebugView` (`src/render/DebugView.ts`) owns every visualization layer: waveform / spectrum / buffer-ACF / multi-band RMS (full + low/mid/high, with autogain) / rms-ACF lines, peak markers, and a nested `BeatDebugView`. `applyConfigured` rebuilds renderers + allocates `FeatureStore` buffers, `applyFeatures` ingests the worklet's payload, `update` ticks all renderers, `dispose` tears down. Layout constants (Y offsets, colors) are baked in here.
-- `BeatDebugView` owns the three beat-debug renderers: `BeatGridRenderer` (vertical lines at `k·period` over the autocorr lane), `BeatGridScrollingRenderer` (same but in rms-history-buffer-index space, scrolling left with phase), `BeatPulseSquares` (4 grayscale squares pulsing at `BEAT_PULSE_CYCLES = [1, 2, 4, 8]` cycles of the period — saw waves whose brightness encodes phase within each cycle).
-- Per-channel **autogain** lives on the TS side (`DebugView.applyAutoGain`), not in the DSP. The 4 RMS-history lines (full + 3 bands) are normalized by a running peak per channel, decayed at `dsp.autoGain` τ (seconds). The renderer reads from parallel `${key}Auto` store entries; raw `rmsLow` / `rmsMid` etc. stay untouched.
-- `LineRenderer` reads its `Float32Array` via a `source: () => Float32Array` callback (so the buffer can be swapped in the store without re-wiring), maps each sample through a `LineLayoutFn` into a `BufferAttribute` with `DynamicDrawUsage`, and reallocates if buffer length changes.
-- `LineLayouts.ts` provides `linearLayout` (used for waveform & RMS) and `logSpectrumLayout` (log2 x-axis for the spectrum). All grid/marker renderers (`BeatGridRenderer`, `PeakMarkers`, …) use the same `xForLag = (i, n) => (i / (n-1)) * 2 - 1` formula so overlays stay pixel-aligned with the chart lines.
+- `App.ts` is a thin orchestrator: scene + camera + `CameraRig` presets, keyboard/resize listeners, RAF loop, and worklet message routing. The `features` handler is a 3-line loop that copies `msg.buffers[name]` into the FeatureStore for every name. Renderers pick up the buffers on the next update tick via `source: () => store.get(name)` callbacks. App owns no per-feature state.
+- `DebugView` (`src/render/DebugView.ts`) is the visualization layer — owns the line/bar renderers + `PeakMarkers`, plus their position/scale wiring. Driven by a static `LINE_COLORS` table specifying per-buffer color, render type (line vs bar), and autogain. No `applyConfigured` — renderers self-init from their source on first non-empty buffer (via `TimeSeriesLineRenderer.update()`'s zero-length early return).
+- `BeatDebugView.ts` is currently a stub awaiting a lazy-init refactor — sub-renderers (grid, scrolling grid, pulse squares) are not yet rewired.
+- `TimeSeriesRenderer` (abstract base) owns the per-frame loop: read source, optional autogain, hand each sample to `writeOne(i, n, x, y)` where `x = i / (n-1)` (or `log2(i+1) / log2(n)` if `scale: "logx"` was set). Subclasses `TimeSeriesLineRenderer` (Line strip) and `TimeSeriesBarRenderer` (instanced quads) render the data — each Object3D output is in `[0, 1] × [0, 1]` space, positioned/scaled by the consumer.
+- **Autogain** lives in `TimeSeriesRenderer.applyAutoGain` — per-channel running peak with `exp(-dt/τ)` decay, normalizes raw → auto. Auto buffer advances **in lockstep with raw** (detected via reference change + `raw[N-2] === lastRaw[N-1]` check) so older auto entries keep their time-of-arrival denom — the line doesn't pump amplitude when peaks shift, and scroll rate matches an un-gained line. Tab-resume gaps trigger a full re-normalize.
+- `PeakMarkers` renders markers on the autocorr lane from the `candidates` buffer.
 - `CameraRig` supports named presets, eased tweens (`goTo`), and an optional procedural controller; `goTo` returns a promise that resolves on tween completion.
-- `FeatureStore` is intentionally a thin `Map<string, Float32Array>` — buffers in, buffers out; no events.
+- `FeatureStore` is intentionally a thin `Map<string, Float32Array>` — buffers in, buffers out; no events. Missing keys return a shared empty `Float32Array` so renderers can no-op safely before the first features message arrives.
 
 ### Worklet ↔ main message protocol
 
-Three message types (declared in `src/audio/dsp-worklet.ts`):
+Two main → worklet message types and one worklet → main:
 
-- **`configured`** (worklet → main): emitted on boot and whenever the worklet's `applyConfigure` runs. Carries every output buffer's length (`waveformLen`, `spectrumLen`, `rmsLen`, `rmsAcfLen`, `acfPeaksLen`, `beatGridLen`, `beatPulsesLen`, `beatStateLen`, …). The worklet **caches the last `configured` payload** so it can re-emit without recreating `Dsp`.
-- **`features`** (worklet → main, ~47 Hz): one `Float32Array` per output buffer. Buffers are zero-copied via `transfer` — the worklet allocates fresh arrays each frame.
-- **`sync`** (main → worklet, HMR-only): triggers re-emission of the cached `configured` payload. Posted by `App.start()` after the new instance wires `onmessage`. This is what lets HMR rebuild every line renderer at the right sizes **without resetting any DSP state** (rms_history accumulator, beat tracker, etc.) — the page-lifetime `Dsp` keeps running while the App-lifetime renderers tear down and rebuild.
+- **`features`** (worklet → main, ~47 Hz): `{ type, buffers: { [name]: Float32Array } }`. The buffer name set comes from `dsp.buffer_names()`, cached at boot/configure. Each frame the worklet builds the dict by calling `dsp.get_buffer(name)` for every cached name, posting them all in one transfer-list batch.
+- **`configure`** (main → worklet): `{ type, windowSize, rmsHistoryLen }`. Triggers `dsp.free()` + fresh `Dsp::new(...)`, re-applies cached params, refreshes `bufferNames`.
+- **`param`** (main → worklet): `{ type, key: string, value: number }`. `hopSize` is intercepted (it controls the worklet's own dispatch cadence, not Dsp); everything else is forwarded to `dsp.set_param(key, value)` and cached worklet-side so `applyConfigure` can re-apply it across rebuilds.
+
+There is **no `configured` event and no `sync` round-trip** — App reads sizes from `Float32Array.length` on the per-frame features messages.
+
+### Wasm-bindgen surface (`Dsp`)
+
+Five methods total:
+- `new(window_size, sample_rate, hop_size, rms_history_len) -> Dsp`
+- `process(input: &[f32])`
+- `get_buffer(name: &str) -> Vec<f32>` — string-keyed buffer accessor (Float32Array on the JS side).
+- `buffer_names() -> Vec<String>` — list all 15 buffer keys; called once per configure to populate the worklet's name cache.
+- `set_param(key: &str, value: f32)` — recognized keys: `smoothingTauSecs`, `onsetSmoothingTauSecs`, `teaTauSecs`, `teaSigma`, `acfSmoothingSigma`, `dbFloor`. Unknown keys silently ignored.
+
+wasm-bindgen with `--target web` exports method names verbatim (snake_case). JS calls are `dsp.get_buffer("...")`, `dsp.set_param("...", v)` — NOT `getBuffer`/`setParam`.
 
 ### Param store & WorkletBridge (`src/params/`)
 
-- `ParamStore` holds `dsp.*` keys with continuous/discrete schemas (`schemas.ts`). `WorkletBridge` subscribes to changes and forwards them to the worklet — `windowSize`/`rmsHistoryLen` are **reconfig** (rebuild Dsp); `hopSize`/`smoothingTauSecs`/`dbFloor`/`accumTauSecs` are **hot keys** (in-place setter on the live Dsp).
-- `dsp.autoGain` is **TS-only** — it controls the autogain τ in `DebugView`, never reaches the worklet. Don't add it to `HOT_KEYS`.
-- `bridge.bootstrap()` is called once per page-lifetime in `main.ts`. On HMR the bridge is recreated but `bootstrap()` does **not** re-run — the worklet keeps its current Dsp + params; the App's new renderers come up via the `sync` mechanism above.
+- `ParamStore` holds `dsp.*` keys with continuous/discrete schemas (`schemas.ts`).
+- `WorkletBridge` subscribes to changes and forwards them to the worklet. `windowSize`/`rmsHistoryLen` are **reconfig** (rebuild Dsp). Hot keys (in-place `dsp.set_param` calls): `hopSize`, `smoothingTauSecs`, `onsetSmoothingTauSecs`, `dbFloor`, `teaTauSecs`, `teaSigma`, `acfSmoothingSigma`. Add new hot keys to `HOT_KEYS` AND ensure the worklet handles them.
+- `dsp.autoGain` is **TS-only** — controls the autogain τ in `TimeSeriesRenderer`, never reaches the worklet. Don't add it to `HOT_KEYS`.
+- `bridge.bootstrap()` is called once per page-lifetime in `main.ts`. On HMR the bridge is recreated but `bootstrap()` does **not** re-run — the worklet keeps its current Dsp + params; the App's new renderers come up via lazy init on the next features message.
 
 ### Build pipeline notes
 
@@ -91,13 +116,16 @@ Three message types (declared in `src/audio/dsp-worklet.ts`):
 
 - Comments explain **why** (non-obvious invariants, hidden constraints, pitfalls like the polyfill ordering or `mag_scale` derivation), not what. Existing code is the reference for tone — match it.
 - TypeScript is strict (`noUnusedLocals`, `noUnusedParameters`, `noFallthroughCasesInSwitch`). Keep it that way.
+- **Buffer keys are one canonical string each.** The same string is used as the Rust struct field (camelCase via `#[allow(non_snake_case)]`), the `Buffers::get` match arm, the worklet message field, and the FeatureStore key. Adding a new buffer is a 3-line edit in `buffers.rs` + the consumer.
 - Specs and plans live in `docs/superpowers/specs/` and `docs/superpowers/plans/`. The roadmap (`ROADMAP.md`) tracks deferred work — check it before starting a new feature.
 
 ## Pitfalls / non-obvious invariants
 
-- **`acf_peaks` is stride 3.** Triples `[lag, mag, sharpness]`. Length 30 (= 3 × `MAX_PEAKS`). Anything iterating peaks must step in 3s. NaN means "empty slot."
-- **Worklet `sync` is HMR-only.** App posts it once on `start()`. Don't post it from feature-update paths or you'll churn line renderers each frame.
-- **HMR teardown order matters.** `App.dispose()` sets `port.onmessage = null` before disposing `DebugView` — otherwise an in-flight features message could land on a half-disposed renderer.
-- **BeatTracker bounds are hard.** `bpm_period` is clamped to ~14.8–35.2 lags (190–80 BPM at default sr/hop). Music outside this range is reported at the nearest octave, not at its true tempo.
-- **Beat phase NaN ≠ broken.** `fit_beat_phase` returns NaN under silence; renderers + `update_beat_pulses` handle this by free-running. Don't "fix" the NaN by defaulting to 0 — that locks the saws on full white.
+- **`candidates` is stride 3.** Triples `[lag, mag, sharpness]`. Length `3 * MAX_PEAKS` (the constant lives in `beat.rs`). Anything iterating peaks must step in 3s. NaN means "empty slot."
+- **`TextDecoder` polyfill is load-bearing.** It's only installed if `globalThis.TextDecoder` is missing in the AudioWorkletGlobalScope (Chrome before ~116). If installed, it must implement real UTF-8 decoding — a no-op stub returns `""` and silently corrupts every Rust→JS string (including all 15 buffer names from `buffer_names()`, which makes the visualizer go dark with no obvious error).
+- **`MAX_PEAKS` is `pub(crate)` in `beat.rs`** and imported by `buffers.rs`. The two must agree because `Buffers` allocates `candidates` as `vec![f32::NAN; 3 * MAX_PEAKS]` and `BeatState` writes exactly `MAX_PEAKS` triples.
+- **HMR teardown.** `App.dispose()` clears `port.onmessage` so in-flight features messages stop landing on a half-disposed app. The new App instance re-wires onmessage and lazy-inits renderers from the next features message — there is no `sync` round-trip, no `applyConfigured` to re-fire.
+- **BPM bounds are hard.** `BEAT_TRACKER_MIN_BPM` / `MAX_BPM` = 40 / 220. Music outside this range is reported at the nearest octave inside it.
+- **Beat NaN ≠ broken.** Silence / no rhythmic content → `period_inst`, `phase_inst`, `tau_smoothed`, `phase_smoothed` are all NaN; outputs are NaN-filled. Renderers must treat NaN as "no value" and no-op, not default to 0.
 - **`port.onmessage = null` then `= handler` does NOT replay queued messages.** Anything posted between dispose and the next `start()` is dropped. Counted on for HMR; don't try to recover it.
+- **Worklet `process()` posts only `features`.** The old `configured` and `sync` events are gone. Don't reintroduce them — App reads sizes from the per-frame `Float32Array.length` and lazy-inits.

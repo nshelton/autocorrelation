@@ -15,14 +15,24 @@ class DSPProcessor extends AudioWorkletProcessor {
   private hopSize = 1024;
   private rmsHistoryLen = 512;
   private smoothingTauSecs = 0.0956;
+  private onsetSmoothingTauSecs = 0.05;
   private teaTauSecs = 4.0;
+  private teaSigma = 5.0;
+  private acfSmoothingSigma = 2.0;
   private dbFloor = -100;
   private bufferNames: string[] = [];
-  private pendingConfigure: { windowSize: number; rmsHistoryLen: number } | null = null;
+  private pendingConfigure: {
+    windowSize: number;
+    rmsHistoryLen: number;
+  } | null = null;
 
   constructor(options?: AudioWorkletNodeOptions) {
     super();
-    const wasmModule = (options?.processorOptions as { wasmModule?: WebAssembly.Module } | undefined)?.wasmModule;
+    const wasmModule = (
+      options?.processorOptions as
+        | { wasmModule?: WebAssembly.Module }
+        | undefined
+    )?.wasmModule;
     if (!wasmModule) {
       throw new Error("[dsp-worklet] missing wasmModule in processorOptions");
     }
@@ -32,7 +42,10 @@ class DSPProcessor extends AudioWorkletProcessor {
 
   private async boot(wasmModule: WebAssembly.Module) {
     await init({ module_or_path: wasmModule });
-    const cfg = this.pendingConfigure ?? { windowSize: this.windowSize, rmsHistoryLen: this.rmsHistoryLen };
+    const cfg = this.pendingConfigure ?? {
+      windowSize: this.windowSize,
+      rmsHistoryLen: this.rmsHistoryLen,
+    };
     this.applyConfigure(cfg);
     this.ready = true;
   }
@@ -40,7 +53,10 @@ class DSPProcessor extends AudioWorkletProcessor {
   private onMessage(msg: WorkletInbound) {
     if (msg.type === "configure") {
       if (!this.ready) {
-        this.pendingConfigure = { windowSize: msg.windowSize, rmsHistoryLen: msg.rmsHistoryLen };
+        this.pendingConfigure = {
+          windowSize: msg.windowSize,
+          rmsHistoryLen: msg.rmsHistoryLen,
+        };
         return;
       }
       this.applyConfigure(msg);
@@ -55,7 +71,12 @@ class DSPProcessor extends AudioWorkletProcessor {
       }
       // Cache so applyConfigure can re-apply across rebuilds.
       if (msg.key === "smoothingTauSecs") this.smoothingTauSecs = msg.value;
+      else if (msg.key === "onsetSmoothingTauSecs")
+        this.onsetSmoothingTauSecs = msg.value;
       else if (msg.key === "teaTauSecs") this.teaTauSecs = msg.value;
+      else if (msg.key === "teaSigma") this.teaSigma = msg.value;
+      else if (msg.key === "acfSmoothingSigma")
+        this.acfSmoothingSigma = msg.value;
       else if (msg.key === "dbFloor") this.dbFloor = msg.value;
       // Forward any other Dsp-recognized key directly. Unknown keys are
       // silently dropped on the Rust side.
@@ -76,9 +97,17 @@ class DSPProcessor extends AudioWorkletProcessor {
     this.window = new Float32Array(this.windowSize);
     this.hopCounter = 0;
     this.hopSize = Math.min(this.hopSize, this.windowSize);
-    this.dsp = new Dsp(this.windowSize, sampleRate, this.hopSize, this.rmsHistoryLen);
+    this.dsp = new Dsp(
+      this.windowSize,
+      sampleRate,
+      this.hopSize,
+      this.rmsHistoryLen,
+    );
     this.dsp.set_param("smoothingTauSecs", this.smoothingTauSecs);
+    this.dsp.set_param("onsetSmoothingTauSecs", this.onsetSmoothingTauSecs);
     this.dsp.set_param("teaTauSecs", this.teaTauSecs);
+    this.dsp.set_param("teaSigma", this.teaSigma);
+    this.dsp.set_param("acfSmoothingSigma", this.acfSmoothingSigma);
     this.dsp.set_param("dbFloor", this.dbFloor);
     // Cache the buffer name list. Names are static across reconfigurations,
     // so this could fire only at boot, but rebuilding it on each configure

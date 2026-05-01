@@ -57,12 +57,12 @@ pub fn score_phase_for_tau(onset: &[f32], tau: f32) -> (usize, f32, f32, f32, us
 
 /// Maximum number of tempo candidates tracked per hop. Shared with `Buffers`,
 /// which sizes `candidates` as `3 * MAX_PEAKS` triples (lag, mag, sharpness).
-pub(crate) const MAX_PEAKS: usize = 10;
+pub(crate) const MAX_PEAKS: usize = 50;
 const MIN_PEAK_SPACING: usize = 3;
 const BEAT_TRACKER_MIN_BPM: f32 = 40.0;
 const BEAT_TRACKER_MAX_BPM: f32 = 220.0;
 const BEAT_PULSE_CYCLES: [f32; 4] = [1.0, 2.0, 4.0, 8.0];
-const TEA_GAUSSIAN_SIGMA: f32 = 5.0;
+const TEA_GAUSSIAN_SIGMA_DEFAULT: f32 = 5.0;
 const TEA_TAU_DEFAULT_SECS: f32 = 4.0;
 
 pub struct BeatState {
@@ -77,6 +77,7 @@ pub struct BeatState {
     phase_inst: f32,
     score_inst: f32,
     tea_alpha: f32,
+    tea_sigma: f32,
     tau_smoothed: f32,
     phase_smoothed: f32,
     beat_position: f32,
@@ -101,6 +102,7 @@ impl BeatState {
             phase_inst: f32::NAN,
             score_inst: 0.0,
             tea_alpha,
+            tea_sigma: TEA_GAUSSIAN_SIGMA_DEFAULT,
             tau_smoothed: f32::NAN,
             phase_smoothed: f32::NAN,
             beat_position: 0.0,
@@ -110,6 +112,10 @@ impl BeatState {
     pub fn set_tea_tau(&mut self, tau_secs: f32, dt: f32) {
         let tau = tau_secs.clamp(0.05, 60.0);
         self.tea_alpha = 1.0 - (-dt / tau).exp();
+    }
+
+    pub fn set_tea_sigma(&mut self, sigma: f32) {
+        self.tea_sigma = sigma.clamp(0.1, 100.0);
     }
 
     /// Run one beat-tracker frame: pick candidates, score phases, update TEA,
@@ -217,8 +223,16 @@ impl BeatState {
         let mut best_i = 0usize;
         let mut best_score = -1.0f32;
         for i in 0..count {
-            let xn = if sum_x > 0.0 { self.pulse_x[i] / sum_x } else { 0.0 };
-            let vn = if sum_v > 0.0 { self.pulse_v[i] / sum_v } else { 0.0 };
+            let xn = if sum_x > 0.0 {
+                self.pulse_x[i] / sum_x
+            } else {
+                0.0
+            };
+            let vn = if sum_v > 0.0 {
+                self.pulse_v[i] / sum_v
+            } else {
+                0.0
+            };
             let s = xn + vn;
             self.pulse_score[i] = s;
             if s > best_score {
@@ -240,7 +254,7 @@ impl BeatState {
     fn update_tea(&mut self, onset: &[f32], tea: &mut [f32]) {
         let alpha = self.tea_alpha;
         if self.score_inst > 0.0 && self.period_inst.is_finite() {
-            let inv_2sig2 = 1.0 / (2.0 * TEA_GAUSSIAN_SIGMA * TEA_GAUSSIAN_SIGMA);
+            let inv_2sig2 = 1.0 / (2.0 * self.tea_sigma * self.tea_sigma);
             for tau in 0..tea.len() {
                 let delta = tau as f32 - self.period_inst;
                 let g = (-delta * delta * inv_2sig2).exp();

@@ -53,6 +53,26 @@ impl Buffers {
         }
     }
 
+    pub fn descriptors(&self) -> Vec<(&'static str, usize)> {
+        vec![
+            ("waveform", self.waveform.len()),
+            ("spectrum", self.spectrum.len()),
+            ("bufferAcf", self.bufferAcf.len()),
+            ("rms", self.rms.len()),
+            ("rmsLow", self.rmsLow.len()),
+            ("rmsMid", self.rmsMid.len()),
+            ("rmsHigh", self.rmsHigh.len()),
+            ("onset", self.onset.len()),
+            ("onsetAcf", self.onsetAcf.len()),
+            ("onsetAcfEnhanced", self.onsetAcfEnhanced.len()),
+            ("tea", self.tea.len()),
+            ("candidates", self.candidates.len()),
+            ("beatGrid", self.beatGrid.len()),
+            ("beatPulses", self.beatPulses.len()),
+            ("beatState", self.beatState.len()),
+        ]
+    }
+
     /// Look up a buffer's current contents by string key. Returns `None`
     /// for unknown names. The 15 keys here ARE the JS contract — keep this
     /// match in sync with `descriptors()` and the `Buffers` field list.
@@ -76,28 +96,6 @@ impl Buffers {
             _ => None,
         }
     }
-
-    /// `[(name, length), ...]` for `Dsp::buffer_descriptors`. Order is stable
-    /// (compile-time literal); the worklet caches it once per `configured`.
-    pub fn descriptors(&self) -> Vec<(&'static str, usize)> {
-        vec![
-            ("waveform", self.waveform.len()),
-            ("spectrum", self.spectrum.len()),
-            ("bufferAcf", self.bufferAcf.len()),
-            ("rms", self.rms.len()),
-            ("rmsLow", self.rmsLow.len()),
-            ("rmsMid", self.rmsMid.len()),
-            ("rmsHigh", self.rmsHigh.len()),
-            ("onset", self.onset.len()),
-            ("onsetAcf", self.onsetAcf.len()),
-            ("onsetAcfEnhanced", self.onsetAcfEnhanced.len()),
-            ("tea", self.tea.len()),
-            ("candidates", self.candidates.len()),
-            ("beatGrid", self.beatGrid.len()),
-            ("beatPulses", self.beatPulses.len()),
-            ("beatState", self.beatState.len()),
-        ]
-    }
 }
 
 #[cfg(test)]
@@ -105,20 +103,36 @@ mod tests {
     use super::*;
 
     #[test]
-    fn descriptors_lists_15_named_buffers() {
-        let b = Buffers::new(2048, 512);
-        let d = b.descriptors();
-        assert_eq!(d.len(), 15);
-        assert_eq!(d[0], ("waveform", 2048));
-        assert_eq!(d[1], ("spectrum", 1024));
-        assert!(d.iter().any(|&(n, _)| n == "beatPulses"));
-    }
-
-    #[test]
     fn get_returns_some_for_known_keys_none_for_unknown() {
         let b = Buffers::new(2048, 512);
         assert!(b.get("waveform").is_some());
         assert!(b.get("rmsHigh").is_some());
         assert!(b.get("notARealKey").is_none());
+    }
+
+    #[test]
+    fn descriptors_are_in_get_order() {
+        let b = Buffers::new(2048, 512);
+        let names: Vec<&str> = b.descriptors().into_iter().map(|(name, _)| name).collect();
+        assert_eq!(
+            names,
+            vec![
+                "waveform",
+                "spectrum",
+                "bufferAcf",
+                "rms",
+                "rmsLow",
+                "rmsMid",
+                "rmsHigh",
+                "onset",
+                "onsetAcf",
+                "onsetAcfEnhanced",
+                "tea",
+                "candidates",
+                "beatGrid",
+                "beatPulses",
+                "beatState",
+            ]
+        );
     }
 }

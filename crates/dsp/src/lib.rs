@@ -1,9 +1,9 @@
 use wasm_bindgen::prelude::*;
 
-mod buffers;
-mod spectrum;
 mod acf;
 mod beat;
+mod buffers;
+mod spectrum;
 
 use crate::acf::AcfState;
 use crate::beat::BeatState;
@@ -52,11 +52,9 @@ impl Dsp {
 
         push_history(&mut self.buffers.rms, rms);
 
-        let (low_rms, mid_rms, high_rms, flux) = self.spectrum.process(
-            input,
-            &mut self.buffers.spectrum,
-            self.db_floor,
-        );
+        let (low_rms, mid_rms, high_rms, flux) =
+            self.spectrum
+                .process(input, &mut self.buffers.spectrum, self.db_floor);
         push_history(&mut self.buffers.rmsLow, low_rms);
         push_history(&mut self.buffers.rmsMid, mid_rms);
         push_history(&mut self.buffers.rmsHigh, high_rms);
@@ -86,29 +84,36 @@ impl Dsp {
     /// current contents, or an empty Vec if the name is unknown. Callers
     /// should rely on `buffer_names()` for the authoritative list.
     pub fn get_buffer(&self, name: &str) -> Vec<f32> {
-        self.buffers.get(name).map(|s| s.to_vec()).unwrap_or_default()
+        self.buffers
+            .get(name)
+            .map(|s| s.to_vec())
+            .unwrap_or_default()
     }
 
     /// All public buffer names in stable order. Worklet caches this once at
     /// boot; the names are static across reconfigurations.
     pub fn buffer_names(&self) -> Vec<String> {
-        self.buffers.descriptors()
+        self.buffers
+            .descriptors()
             .into_iter()
             .map(|(name, _)| name.to_string())
             .collect()
     }
 
     /// Set a tunable param. Unknown keys are silently ignored.
-    /// Recognized keys: "smoothingTauSecs", "teaTauSecs", "dbFloor".
+    /// Recognized keys: "smoothingTauSecs", "onsetSmoothingTauSecs",
+    /// "teaTauSecs", "teaSigma", "acfSmoothingSigma", "dbFloor".
     pub fn set_param(&mut self, key: &str, value: f32) {
         match key {
             "smoothingTauSecs" => self.spectrum.set_smoothing_tau(value, self.dt),
+            "onsetSmoothingTauSecs" => self.spectrum.set_onset_release_tau(value, self.dt),
             "teaTauSecs" => self.beat.set_tea_tau(value, self.dt),
+            "teaSigma" => self.beat.set_tea_sigma(value),
+            "acfSmoothingSigma" => self.acf.set_smoothing_sigma(value),
             "dbFloor" => self.db_floor = value.clamp(-200.0, 0.0),
             _ => {}
         }
     }
-
 }
 
 /// Shift a history buffer left by one slot (oldest at index 0 falls off)
@@ -438,8 +443,8 @@ mod tests {
     fn set_db_floor_clamps() {
         let mut dsp = Dsp::new(2048, 48000.0, 1024, 512);
         dsp.set_param("dbFloor", -1000.0); // should clamp to -200.0
-                                   // Silent input → spectrum should saturate to the (clamped) floor's normalized value.
-                                   // Since silent audio yields mag=0 → db=floor → normalized=0, spectrum stays zero.
+                                           // Silent input → spectrum should saturate to the (clamped) floor's normalized value.
+                                           // Since silent audio yields mag=0 → db=floor → normalized=0, spectrum stays zero.
         let silent = vec![0.0_f32; 2048];
         for _ in 0..5 {
             dsp.process(&silent);
@@ -672,6 +677,7 @@ mod tests {
         //   process(loud):   identical input → identical FFT → flux = 0
         //   process(quiet):  every bin decreased → flux = 0 (clamped)
         let mut dsp = Dsp::new(2048, 48000.0, 1024, 512);
+        dsp.set_param("onsetSmoothingTauSecs", 0.0);
         let sr = 48000.0_f32;
         let make_sine = |amp: f32| -> Vec<f32> {
             (0..2048)

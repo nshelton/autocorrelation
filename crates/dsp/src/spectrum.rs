@@ -7,6 +7,8 @@ use std::sync::Arc;
 
 /// Spectrum smoothing time constant in seconds (default).
 const SMOOTHING_TAU_SECS_DEFAULT: f32 = 0.0956;
+/// Scalar onset envelope release time constant in seconds (default).
+const ONSET_SMOOTHING_TAU_SECS_DEFAULT: f32 = 0.05;
 const LOW_BAND_HZ_MAX: f32 = 150.0;
 const MID_BAND_HZ_MAX: f32 = 1500.0;
 
@@ -21,6 +23,9 @@ pub struct SpectrumState {
     prev_mag: Vec<f32>,
     /// EMA coefficient: `1 - exp(-dt / tau)`. Recomputed by `set_smoothing_tau`.
     smoothing_alpha: f32,
+    /// Per-hop retention for the scalar onset envelope's falling edge.
+    onset_release_retention: f32,
+    onset_envelope: f32,
     low_band_bin_end: usize,
     mid_band_bin_end: usize,
     /// Parseval scale: 2 / (N · Σ hann²). Maps Σ|X[k]|² over a band → band RMS².
@@ -41,6 +46,7 @@ impl SpectrumState {
             .collect();
         let mag_scale = 2.0 / hann.iter().sum::<f32>();
         let smoothing_alpha = 1.0 - (-dt / SMOOTHING_TAU_SECS_DEFAULT).exp();
+        let onset_release_retention = (-dt / ONSET_SMOOTHING_TAU_SECS_DEFAULT).exp();
         let low_band_bin_end = bin_for_hz(LOW_BAND_HZ_MAX, sample_rate, window_size);
         let mid_band_bin_end = bin_for_hz(MID_BAND_HZ_MAX, sample_rate, window_size);
         let hann_energy: f32 = hann.iter().map(|h| h * h).sum();
@@ -53,6 +59,8 @@ impl SpectrumState {
             mag_scale,
             prev_mag: vec![0.0; spectrum_len],
             smoothing_alpha,
+            onset_release_retention,
+            onset_envelope: 0.0,
             low_band_bin_end,
             mid_band_bin_end,
             parseval_band_scale,
@@ -64,10 +72,19 @@ impl SpectrumState {
         self.smoothing_alpha = 1.0 - (-dt / tau).exp();
     }
 
+    pub fn set_onset_release_tau(&mut self, tau_secs: f32, dt: f32) {
+        if tau_secs <= 0.0 {
+            self.onset_release_retention = 0.0;
+            return;
+        }
+        let tau = tau_secs.clamp(0.001, 10.0);
+        self.onset_release_retention = (-dt / tau).exp();
+    }
+
     /// Run one FFT hop. Writes the smoothed normalized [0,1] `spectrum`.
-    /// Returns `(low_rms, mid_rms, high_rms, flux)` — three Parseval-correct
+    /// Returns `(low_rms, mid_rms, high_rms, onset)` — three Parseval-correct
     /// band-RMS scalars (caller pushes into history buffers via push_history)
-    /// and the spectral-flux onset value (Σ max(0, |X[k]| - prev_mag[k])).
+    /// and the instant-attack / exponential-release spectral-flux onset envelope.
     pub fn process(
         &mut self,
         input: &[f32],
@@ -84,7 +101,9 @@ impl SpectrumState {
             self.fft_buffer[i] = 0.0;
         }
 
-        let _ = self.fft.process(&mut self.fft_buffer, &mut self.freq_buffer);
+        let _ = self
+            .fft
+            .process(&mut self.fft_buffer, &mut self.freq_buffer);
 
         // Spectral flux + spectrum smoothing in one pass over bins 1..=N/2.
         let mut flux = 0.0f32;
@@ -125,7 +144,18 @@ impl SpectrumState {
         let mid_rms = (mid_e * self.parseval_band_scale).sqrt();
         let high_rms = (high_e * self.parseval_band_scale).sqrt();
 
-        (low_rms, mid_rms, high_rms, flux)
+        self.onset_envelope =
+            follow_onset_envelope(self.onset_envelope, flux, self.onset_release_retention);
+
+        (low_rms, mid_rms, high_rms, self.onset_envelope)
+    }
+}
+
+fn follow_onset_envelope(previous: f32, input: f32, release_retention: f32) -> f32 {
+    if input >= previous {
+        input
+    } else {
+        (previous * release_retention).max(input)
     }
 }
 
@@ -145,6 +175,35 @@ mod tests {
             state.smoothing_alpha,
             expected
         );
+    }
+
+    #[test]
+    fn onset_release_retention_matches_time_constant_formula() {
+        let dt = 1024.0_f32 / 48000.0;
+        let state = SpectrumState::new(2048, 48000.0, dt);
+        let expected = (-dt / ONSET_SMOOTHING_TAU_SECS_DEFAULT).exp();
+        assert!(
+            (state.onset_release_retention - expected).abs() < 1e-6,
+            "retention {} != expected {}",
+            state.onset_release_retention,
+            expected
+        );
+    }
+
+    #[test]
+    fn onset_smoothing_can_be_disabled() {
+        let dt = 1024.0_f32 / 48000.0;
+        let mut state = SpectrumState::new(2048, 48000.0, dt);
+        state.set_onset_release_tau(0.0, dt);
+        assert_eq!(state.onset_release_retention, 0.0);
+    }
+
+    #[test]
+    fn onset_envelope_has_instant_attack_and_exponential_release() {
+        let retention = 0.8;
+        assert_eq!(follow_onset_envelope(0.2, 1.0, retention), 1.0);
+        assert_eq!(follow_onset_envelope(1.0, 0.0, retention), 0.8);
+        assert_eq!(follow_onset_envelope(1.0, 0.9, retention), 0.9);
     }
 
     #[test]

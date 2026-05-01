@@ -6,7 +6,6 @@ import {
   Group,
   Line,
   LineBasicMaterial,
-  Vector3,
 } from "three";
 import {
   TimeSeriesRenderer,
@@ -66,11 +65,11 @@ export class TimeSeriesLineRenderer extends TimeSeriesRenderer {
     this.object3d.add(this.line);
   }
 
-  protected writeOne(i: number, _n: number, v: Vector3): void {
+  protected writeOne(i: number, _n: number, x: number, y: number): void {
     const p = this.positions!;
-    p[i * 3] = v.x;
-    p[i * 3 + 1] = v.y;
-    p[i * 3 + 2] = v.z;
+    p[i * 3] = x;
+    p[i * 3 + 1] = y;
+    p[i * 3 + 2] = 0;
   }
 
   protected commit(): void {

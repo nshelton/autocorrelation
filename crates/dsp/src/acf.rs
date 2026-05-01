@@ -93,11 +93,24 @@ pub fn bin_for_hz(hz: f32, sample_rate: f32, n: usize) -> usize {
     bin.clamp(1, n / 2 - 1)
 }
 
+/// Default Gaussian σ (in lag bins) for lag-axis smoothing of the
+/// harmonic-enhanced ACF. Broadens narrow peaks within each frame so the
+/// peak picker locks on the broad average rather than a single spike.
+/// Tunable live via `dsp.set_param("acfSmoothingSigma", ...)`. σ = 0
+/// disables smoothing.
+const ACF_SMOOTHING_SIGMA_DEFAULT: f32 = 2.0;
+
 pub struct AcfState {
     fft_forward: Arc<dyn RealToComplex<f32>>,
     fft_inverse: Arc<dyn ComplexToReal<f32>>,
     time_buf: Vec<f32>,
     freq_buf: Vec<Complex<f32>>,
+    /// Holds the unsmoothed gen-ACF output. Convolved into `onset_acf` to
+    /// produce the smoothed raw ACF, which is then harmonic-enhanced.
+    raw_scratch: Vec<f32>,
+    /// Pre-normalized half Gaussian kernel (kernel[0] = center weight,
+    /// kernel[k] = symmetric weight at offset ±k). Empty when σ ≤ 0.
+    kernel: Vec<f32>,
 }
 
 impl AcfState {
@@ -106,16 +119,45 @@ impl AcfState {
         let mut planner = realfft::RealFftPlanner::<f32>::new();
         let fft_forward = planner.plan_fft_forward(2 * n);
         let fft_inverse = planner.plan_fft_inverse(2 * n);
-        Self {
+        let onset_acf_len = n / 2;
+        let mut state = Self {
             fft_forward,
             fft_inverse,
             time_buf: vec![0.0; 2 * n],
             freq_buf: vec![Complex::new(0.0, 0.0); n + 1],
+            raw_scratch: vec![0.0; onset_acf_len],
+            kernel: Vec::new(),
+        };
+        state.set_smoothing_sigma(ACF_SMOOTHING_SIGMA_DEFAULT);
+        state
+    }
+
+    pub fn set_smoothing_sigma(&mut self, sigma: f32) {
+        let s = sigma.clamp(0.0, 100.0);
+        self.kernel.clear();
+        if s <= 0.0 {
+            return;
+        }
+        let half = (3.0 * s).ceil() as usize;
+        let inv_2sig2 = 1.0 / (2.0 * s * s);
+        let mut wsum = 0.0f32;
+        for k in 0..=half {
+            let kf = k as f32;
+            let w = (-kf * kf * inv_2sig2).exp();
+            self.kernel.push(w);
+            wsum += if k == 0 { w } else { 2.0 * w };
+        }
+        let inv_wsum = 1.0 / wsum;
+        for w in self.kernel.iter_mut() {
+            *w *= inv_wsum;
         }
     }
 
-    /// Run gen-ACF on `onset` → write `onset_acf`, then harmonic-enhance →
-    /// write `onset_acf_enhanced`.
+    /// Run gen-ACF on `onset` → unsmoothed scratch. Convolve along the lag
+    /// axis with a Gaussian kernel → `onset_acf` (the smoothed raw ACF).
+    /// Harmonic-enhance `onset_acf` → `onset_acf_enhanced`, which inherits
+    /// the smoothing because harmonic enhancement is a sum over input
+    /// samples. Edge handling: clamp (replicate edge values).
     pub fn process(
         &mut self,
         onset: &[f32],
@@ -124,12 +166,27 @@ impl AcfState {
     ) {
         compute_gen_acf(
             onset,
-            onset_acf,
+            &mut self.raw_scratch,
             &self.fft_forward,
             &self.fft_inverse,
             &mut self.time_buf,
             &mut self.freq_buf,
         );
+        if self.kernel.is_empty() {
+            onset_acf.copy_from_slice(&self.raw_scratch);
+        } else {
+            let n = onset_acf.len();
+            let half = self.kernel.len() - 1;
+            for tau in 0..n {
+                let mut acc = self.raw_scratch[tau] * self.kernel[0];
+                for k in 1..=half {
+                    let lo = if tau >= k { tau - k } else { 0 };
+                    let hi = if tau + k < n { tau + k } else { n - 1 };
+                    acc += (self.raw_scratch[lo] + self.raw_scratch[hi]) * self.kernel[k];
+                }
+                onset_acf[tau] = acc;
+            }
+        }
         compute_harmonic_enhanced(onset_acf, onset_acf_enhanced);
     }
 }
