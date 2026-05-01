@@ -1084,6 +1084,15 @@ mod tests {
             distractor.is_some(),
             "distractor phi=13 expected somewhere in top-K, got {:?}", cands,
         );
+        assert_eq!(cands[1].0, 13, "distractor expected at slot 1 (second-best), got {:?}", cands);
+        assert!(cands[0].1 > cands[1].1, "slot 0 must outrank slot 1");
+        // phi=9 sits on the descending side of the kick peak — corr(9)=0 in this
+        // synthetic input but more importantly NOT a local maximum, so it must
+        // not appear anywhere in top-K. Catches a broken local-max filter.
+        assert!(
+            !cands.iter().any(|(p, c)| *c > 0.0 && *p == 9),
+            "non-local-max phi=9 should not appear in top-K, got {:?}", cands,
+        );
     }
 
     #[test]

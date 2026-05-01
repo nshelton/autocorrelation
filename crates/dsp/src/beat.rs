@@ -8,6 +8,12 @@ pub const PULSE_N: usize = 4;
 /// stack-allocated array keeps the hot path allocation-free.
 pub const PHI_CANDIDATE_COUNT: usize = 5;
 
+/// Upper bound on `phi_max` (= ceil(tau)). At BEAT_TRACKER_MIN_BPM=40 and
+/// dt=1024/48000, tau_max ≈ 70 hops, so 80 leaves headroom. Used to size
+/// the per-φ correlation scratch buffer as a stack array — keeps
+/// `score_phase_for_tau` allocation-free.
+const PHI_MAX_CAP: usize = 80;
+
 /// Score one tempo lag `tau` against the OSS by sweeping integer phases
 /// `phi ∈ [0, ceil(tau))`. Returns the top-`PHI_CANDIDATE_COUNT` local maxima
 /// of the per-phase correlation (sorted descending by `corr`; empty slots
@@ -25,12 +31,12 @@ pub fn score_phase_for_tau(
         return (top, 0.0, 0.0, 0);
     }
     let last = (n - 1) as i32;
-    let phi_max = (tau.ceil() as usize).max(1);
+    let phi_max = (tau.ceil() as usize).max(1).min(PHI_MAX_CAP);
 
-    // Compute per-phi correlations into a scratch vec so we can scan for
-    // local maxima after the fact. phi_max is bounded by tau_max ≈ 70 hops
-    // so the allocation is small and short-lived.
-    let mut corr = vec![0.0f32; phi_max];
+    // Stack-allocated per-φ correlation scratch. Sized by PHI_MAX_CAP which
+    // exceeds the project's BPM-bound tau_max with headroom; phi_max above
+    // is clamped to PHI_MAX_CAP as a defensive bound on out-of-spec callers.
+    let mut corr = [0.0f32; PHI_MAX_CAP];
     let mut sum = 0.0f32;
     let mut sum_sq = 0.0f32;
 
