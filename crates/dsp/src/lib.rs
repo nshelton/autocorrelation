@@ -90,8 +90,6 @@ impl Dsp {
         self.beat.process(
             &self.buffers.onset,
             &self.buffers.onsetAcfEnhanced,
-            &mut self.buffers.candidates,
-            &mut self.buffers.tea,
             &mut self.buffers.beatGrid,
             &mut self.buffers.beatState,
             &mut self.buffers.beatPulses,
@@ -132,7 +130,6 @@ impl Dsp {
             "smoothingTauSecs" => self.spectrum.set_smoothing_tau(value, self.dt),
             "onsetSmoothingTauSecs" => self.spectrum.set_onset_release_tau(value, self.dt),
             "teaTauSecs" => self.beat.set_tea_tau(value, self.dt),
-            "teaSigma" => self.beat.set_tea_sigma(value),
             "acfSmoothingSigma" => self.acf.set_smoothing_sigma(value),
             "acfDecay" => self.acf.set_decay(value),
             "dbFloor" => self.db_floor = value.clamp(-200.0, 0.0),
