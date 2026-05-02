@@ -17,7 +17,6 @@ class DSPProcessor extends AudioWorkletProcessor {
   private smoothingTauSecs = 0.0956;
   private onsetSmoothingTauSecs = 0.05;
   private teaTauSecs = 4.0;
-  private teaSigma = 5.0;
   private acfSmoothingSigma = 2.0;
   private acfDecay = 0.99;
   private dbFloor = -100;
@@ -77,7 +76,6 @@ class DSPProcessor extends AudioWorkletProcessor {
       else if (msg.key === "onsetSmoothingTauSecs")
         this.onsetSmoothingTauSecs = msg.value;
       else if (msg.key === "teaTauSecs") this.teaTauSecs = msg.value;
-      else if (msg.key === "teaSigma") this.teaSigma = msg.value;
       else if (msg.key === "acfSmoothingSigma")
         this.acfSmoothingSigma = msg.value;
       else if (msg.key === "acfDecay") this.acfDecay = msg.value;
@@ -112,7 +110,6 @@ class DSPProcessor extends AudioWorkletProcessor {
     this.dsp.set_param("smoothingTauSecs", this.smoothingTauSecs);
     this.dsp.set_param("onsetSmoothingTauSecs", this.onsetSmoothingTauSecs);
     this.dsp.set_param("teaTauSecs", this.teaTauSecs);
-    this.dsp.set_param("teaSigma", this.teaSigma);
     this.dsp.set_param("acfSmoothingSigma", this.acfSmoothingSigma);
     this.dsp.set_param("acfDecay", this.acfDecay);
     this.dsp.set_param("dbFloor", this.dbFloor);

@@ -46,7 +46,7 @@ const LINE_COLORS: readonly LineSpec[] = [
   { key: "rmsHigh", color: 0x0000aa, type: "bar", colorByValue: true },
   { key: "rms", color: 0xffffff, colorByValue: true },
   { key: "onset", type: "bar", color: 0xbbbbbb, colorByValue: true },
-  { key: "onsetAcf", color: 0x666666 },
+  { key: "onsetAcf", color: 0xaaaaff },
   { key: "onsetAcfEnhanced", color: 0x00ffff },
 ];
 
@@ -85,7 +85,7 @@ export class DebugView {
 
     this.staticBeatGridMarkers.update(
       this.deps.store.get("beatGrid"),
-      this.deps.store.get("tea").length,
+      this.deps.store.get("onsetAcfEnhanced").length,
     );
 
     this.labels.update();

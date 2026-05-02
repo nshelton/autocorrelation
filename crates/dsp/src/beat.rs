@@ -28,7 +28,6 @@ pub struct BeatState {
     tau_min: usize,
     tau_max: usize,
     tau_scores: Vec<f32>,
-    score_inst: f32,
     confidence_smoothed: f32,
     tea_alpha: f32,
     phase_correction_alpha: f32,
@@ -52,7 +51,6 @@ impl BeatState {
             tau_min,
             tau_max,
             tau_scores: vec![0.0_f32; onset_acf_len],
-            score_inst: 0.0,
             confidence_smoothed: 0.0,
             tea_alpha,
             phase_correction_alpha,
@@ -183,7 +181,6 @@ impl BeatState {
         // 2. std deviation of ACF
 
         self.confidence_smoothed = 1.0_f32;
-        self.score_inst = 1.0_f32;
 
         self.write_beat_outputs(beat_grid, beat_state, dt);
         self.update_beat_pulses(beat_pulses);
@@ -193,30 +190,30 @@ impl BeatState {
         let p = self.tau_smoothed;
         let phi = self.phase_smoothed;
         let confidence = self.confidence_smoothed.clamp(0.0, 1.0);
-        if p.is_nan() || phi.is_nan() || self.score_inst <= 0.0 {
-            beat_grid[0] = f32::NAN;
-            beat_grid[1] = f32::NAN;
-            beat_grid[2] = 0.0;
-            beat_state[0] = f32::NAN;
-            beat_state[1] = 0.0;
-            beat_state[2] = f32::NAN;
-            beat_state[3] = f32::NAN;
-        } else {
-            beat_grid[0] = p;
-            beat_grid[1] = phi;
-            beat_grid[2] = confidence;
-            beat_state[0] = if p > 0.0 { 60.0 / (p * dt) } else { f32::NAN };
-            beat_state[1] = confidence;
-            beat_state[2] = f32::NAN;
-            beat_state[3] = f32::NAN;
-        }
+        // if p.is_nan() || phi.is_nan() || confidence <= 0.0 {
+        //     beat_grid[0] = 0.0;
+        //     beat_grid[1] = 0.0;
+        //     beat_grid[2] = 0.0;
+        //     beat_state[0] = 0.0;
+        //     beat_state[1] = 0.0;
+        //     beat_state[2] = 0.0;
+        //     beat_state[3] = 0.0;
+        // } else {
+        beat_grid[0] = p;
+        beat_grid[1] = phi;
+        beat_grid[2] = confidence;
+        beat_state[0] = if p > 0.0 { 60.0 / (p * dt) } else { 0.0 };
+        beat_state[1] = confidence;
+        beat_state[2] = 0.0;
+        beat_state[3] = 0.0;
+        // }
     }
 
     fn update_beat_pulses(&mut self, beat_pulses: &mut [f32]) {
         let period = self.tau_smoothed;
         let phase = self.phase_smoothed;
-        let score = self.score_inst;
-        if period.is_nan() || period <= 0.0 || score <= 0.0 || phase.is_nan() {
+        let confidence = self.confidence_smoothed.clamp(0.0, 1.0);
+        if period <= 0.0 || confidence <= 0.0 {
             for slot in beat_pulses.iter_mut() {
                 *slot = f32::NAN;
             }

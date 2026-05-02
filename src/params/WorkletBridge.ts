@@ -6,7 +6,6 @@ const HOT_KEYS = [
   "onsetSmoothingTauSecs",
   "dbFloor",
   "teaTauSecs",
-  "teaSigma",
   "acfSmoothingSigma",
   "acfDecay",
   "phaseLock",

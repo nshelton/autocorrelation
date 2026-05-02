@@ -39,9 +39,9 @@ export class StaticBeatGridMarkers {
     this.createLines(32);
   }
 
-  update(beatGrid: Float32Array, teaSize: number): void {
+  update(beatGrid: Float32Array, acfSize: number): void {
     // console.log(beatGrid);
-    const scale = (4 * beatGrid[0]) / teaSize;
+    const scale = (4 * beatGrid[0]) / acfSize;
     this.object3d.scale.set(scale, 1, 1);
   }
 
