@@ -63,7 +63,7 @@ export class DebugView {
     this.deps.scene.add(this.beatPulseSquares.object3d);
 
     this.scrollingBeatGridMarkers = new BeatGridMarkers({
-      baseColor: 0xbbbbbb,
+      baseColor: 0x00ff00,
     });
     this.staticBeatGridMarkers = new StaticBeatGridMarkers({
       baseColor: 0x888888,

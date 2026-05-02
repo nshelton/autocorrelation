@@ -115,6 +115,7 @@ impl BeatState {
             }
         }
 
+        // todo : revisit this im not sure it's working correctly
         let bi = best_tau as usize;
         if bi > self.tau_min && bi + 1 < self.tau_max {
             best_tau += parabolic_refine(
@@ -172,9 +173,14 @@ impl BeatState {
             delta += tau;
         }
 
-        self.phase_smoothed = (phase_pred + self.phase_correction_alpha * delta);
+        self.phase_smoothed = phase_pred + self.phase_correction_alpha * delta;
 
         self.phase_updated_at = self.frame_index;
+
+        // TODO: get confidence of beat here
+        // ideas:
+        // 1. peak ratio?
+        // 2. std deviation of ACF
 
         self.confidence_smoothed = 1.0_f32;
         self.score_inst = 1.0_f32;
