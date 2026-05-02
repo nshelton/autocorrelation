@@ -6,8 +6,8 @@ import { DebugLabels } from "./DebugLabels";
 import { TimeSeriesRenderer, type TimeSeriesScale } from "./TimeSeriesRenderer";
 import { TimeSeriesBarRenderer } from "./TimeSeriesBarRenderer";
 import { TimeSeriesLineRenderer } from "./TimeSeriesLineRenderer";
-import type { FeatureStore } from "../store/FeatureStore";
-import type { ParamStore } from "../params/ParamStore";
+import type { FeatureStore } from "../../store/FeatureStore";
+import type { ParamStore } from "../../params/ParamStore";
 import { BeatPulseSquares } from "./BeatPulseSquares";
 
 export interface DebugViewDeps {

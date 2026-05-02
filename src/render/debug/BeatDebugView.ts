@@ -1,5 +1,5 @@
 import { Scene } from "three";
-import type { FeatureStore } from "../store/FeatureStore";
+import type { FeatureStore } from "../../store/FeatureStore";
 
 /**
  * Stub. The pre-Phase-2 version composed three beat-debug renderers (static

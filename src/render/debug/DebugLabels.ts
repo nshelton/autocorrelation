@@ -4,8 +4,8 @@ import {
   type TextLabelAnchorX,
   TextLabelAnchorY,
 } from "./TextLabel";
-import type { FeatureStore } from "../store/FeatureStore";
-import type { ParamStore } from "../params/ParamStore";
+import type { FeatureStore } from "../../store/FeatureStore";
+import type { ParamStore } from "../../params/ParamStore";
 
 export interface DebugLabelsOptions {
   store: FeatureStore;

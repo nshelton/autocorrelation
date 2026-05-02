@@ -190,15 +190,7 @@ impl BeatState {
         let p = self.tau_smoothed;
         let phi = self.phase_smoothed;
         let confidence = self.confidence_smoothed.clamp(0.0, 1.0);
-        // if p.is_nan() || phi.is_nan() || confidence <= 0.0 {
-        //     beat_grid[0] = 0.0;
-        //     beat_grid[1] = 0.0;
-        //     beat_grid[2] = 0.0;
-        //     beat_state[0] = 0.0;
-        //     beat_state[1] = 0.0;
-        //     beat_state[2] = 0.0;
-        //     beat_state[3] = 0.0;
-        // } else {
+
         beat_grid[0] = p;
         beat_grid[1] = phi;
         beat_grid[2] = confidence;
