@@ -114,7 +114,13 @@ async function buildPageDeps(
       "Hz",
   );
 
-  return { canvas, renderer, audioContext: context, workletNode, paramStore: store };
+  return {
+    canvas,
+    renderer,
+    audioContext: context,
+    workletNode,
+    paramStore: store,
+  };
 }
 
 function buildAppLayer(deps: AppDeps): void {
@@ -175,25 +181,14 @@ startTab.addEventListener("click", async () => {
   const { createTabSource } = await import("./audio/AudioSource");
   await onStart(createTabSource);
 });
-if (startTest) {
-  startTest.addEventListener("click", async () => {
-    const { createTestSource } = await import("./audio/AudioSource");
-    await onStart(() => createTestSource(440));
-  });
-}
 
 // Keyboard shortcuts before start: T → test signal (440 Hz), any other key → mic.
 window.addEventListener(
   "keydown",
   async (e) => {
     if (started) return;
-    if (e.key === "t" || e.key === "T") {
-      const { createTestSource } = await import("./audio/AudioSource");
-      await onStart(() => createTestSource(440));
-    } else {
-      const { createMicSource } = await import("./audio/AudioSource");
-      await onStart(createMicSource);
-    }
+    const { createMicSource } = await import("./audio/AudioSource");
+    await onStart(createMicSource);
   },
   { once: true },
 );

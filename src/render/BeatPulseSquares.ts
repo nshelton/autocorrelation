@@ -15,10 +15,10 @@ export class BeatPulseSquares {
       const x = i - 1.5;
       const y = 0;
 
-      const geom = new PlaneGeometry(1, 1);
+      const geom = new PlaneGeometry(1, 0.1);
       const mat = new MeshBasicMaterial({ color: 0x0ff000 });
       const mesh = new Mesh(geom, mat);
-      mesh.position.set(x, y - 1.5, 0);
+      mesh.position.set(x, y - 1.1, 0);
       this.geometries.push(geom);
       this.materials.push(mat);
       this.meshObjects.push(mesh);
@@ -32,7 +32,7 @@ export class BeatPulseSquares {
       const v = Number.isNaN(raw) ? 0 : Math.max(0, Math.min(1, raw));
       const e = Math.pow(v, 0.5);
       this.materials[i].color.setRGB(e, e, e);
-      this.meshObjects[i].scale.set(e, e, e);
+      this.meshObjects[i].scale.set(e, 1, e);
     }
   }
 

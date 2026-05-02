@@ -29,10 +29,9 @@ export class DebugLabels {
     this.addStaticLabel("waveform", 0x66ffcc, -1, 2);
     this.addStaticLabel("bufferAcf", 0xcc99ff, 0, 2);
     this.addStaticLabel("spectrum", 0xffaa66, 2, 2);
-    this.addStaticLabel("rms", 0xffffff, 0, 1);
-    this.addStaticLabel("onset", 0xff9966, 0, 0.5);
-    this.addStaticLabel("onsetAcf", 0x6666bb, -1, -0.1);
-    this.addStaticLabel("tempo", 0xffff66, -1, 0);
+    this.addStaticLabel("rms", 0x888888, -2, 1, "left");
+    this.addStaticLabel("onset", 0x888888, -2, 0.5, "left");
+    this.addStaticLabel("onsetAcf", 0x00ffff, -2, -0, "left");
 
     this.beatSummary = this.createLabel("beat: --", 0x66ccff, 2, 0);
     this.configSummary = this.createLabel("cfg: --", 0x888888, -0, 2.1);
@@ -96,8 +95,10 @@ export class DebugLabels {
     color: number,
     x: number,
     y: number,
+    anchorX: TextLabelAnchorX = "right",
+    anchorY: TextLabelAnchorY = "top",
   ): TextLabel {
-    return this.createLabel(text, color, x, y);
+    return this.createLabel(text, color, x, y, anchorX, anchorY);
   }
 
   private createLabel(

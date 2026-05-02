@@ -54,22 +54,3 @@ export async function createTabSource(): Promise<AudioSourceBundle> {
 
   return { context, source, stream };
 }
-
-/**
- * Synthesize a known signal inside a fresh AudioContext for fast
- * debug iteration. No browser dialogs, no permissions, no picker.
- * Returns a pure tone at the given frequency.
- */
-export async function createTestSource(
-  frequency: number = 440,
-): Promise<AudioSourceBundle> {
-  const context = new AudioContext();
-  if (context.state === "suspended") await context.resume();
-
-  const oscillator = context.createOscillator();
-  oscillator.frequency.value = frequency;
-  oscillator.type = "sine";
-  oscillator.start();
-
-  return { context, source: oscillator };
-}

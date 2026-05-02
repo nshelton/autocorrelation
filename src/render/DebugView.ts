@@ -3,7 +3,6 @@ import { DebugGrid } from "./DebugGrid";
 import { BeatGridMarkers } from "./BeatGridMarkers";
 import { StaticBeatGridMarkers } from "./StaticBeatGridMarkers";
 import { DebugLabels } from "./DebugLabels";
-import { PeakMarkers } from "./PeakMarkers";
 import { TimeSeriesRenderer, type TimeSeriesScale } from "./TimeSeriesRenderer";
 import { TimeSeriesBarRenderer } from "./TimeSeriesBarRenderer";
 import { TimeSeriesLineRenderer } from "./TimeSeriesLineRenderer";
@@ -28,8 +27,7 @@ type LineStoreKey =
   | "rms"
   | "onset"
   | "onsetAcf"
-  | "onsetAcfEnhanced"
-  | "tea";
+  | "onsetAcfEnhanced";
 
 interface LineSpec {
   key: LineStoreKey;
@@ -40,30 +38,27 @@ interface LineSpec {
 }
 
 const LINE_COLORS: readonly LineSpec[] = [
-  { key: "waveform", color: 0x66ffcc },
-  { key: "bufferAcf", color: 0xcc99ff },
-  { key: "spectrum", color: 0xffaa66, type: "bar", scale: "logx" },
+  { key: "waveform", color: 0x00ffff },
+  { key: "bufferAcf", color: 0xff00ff },
+  { key: "spectrum", color: 0xffff00, type: "bar", scale: "logx" },
   { key: "rmsLow", color: 0xaa0000, type: "bar", colorByValue: true },
   { key: "rmsMid", color: 0x00aa00, type: "bar", colorByValue: true },
   { key: "rmsHigh", color: 0x0000aa, type: "bar", colorByValue: true },
   { key: "rms", color: 0xffffff, colorByValue: true },
-  { key: "onset", type: "bar", color: 0xff9966, colorByValue: true },
-  { key: "onsetAcf", color: 0x6666bb },
-  { key: "onsetAcfEnhanced", color: 0xff99cc },
-  { key: "tea", color: 0xffff66 },
+  { key: "onset", type: "bar", color: 0xbbbbbb, colorByValue: true },
+  { key: "onsetAcf", color: 0x666666 },
+  { key: "onsetAcfEnhanced", color: 0x00ffff },
 ];
 
 export class DebugView {
   private lines = new Map<LineStoreKey, TimeSeriesRenderer>();
   private backgroundGrid = new DebugGrid();
-  private peakMarkers: PeakMarkers;
   private scrollingBeatGridMarkers: BeatGridMarkers;
   private staticBeatGridMarkers: StaticBeatGridMarkers;
   private beatPulseSquares: BeatPulseSquares;
   private labels: DebugLabels;
 
   constructor(private deps: DebugViewDeps) {
-    this.peakMarkers = new PeakMarkers({ baseColor: 0xffff66 });
     this.beatPulseSquares = new BeatPulseSquares();
     this.deps.scene.add(this.beatPulseSquares.object3d);
 
@@ -77,18 +72,12 @@ export class DebugView {
     this.deps.scene.add(this.staticBeatGridMarkers.object3d);
     this.labels = new DebugLabels(deps);
     this.deps.scene.add(this.backgroundGrid.object3d);
-    this.deps.scene.add(this.peakMarkers.object3d);
     this.deps.scene.add(this.labels.object3d);
     this.createLines();
   }
 
   update(): void {
     for (const line of this.lines.values()) line.update();
-    this.peakMarkers.update(
-      this.deps.store.get("candidates"),
-      this.deps.store.get("onsetAcf").length,
-    );
-
     this.scrollingBeatGridMarkers.update(
       this.deps.store.get("beatGrid"),
       this.deps.store.get("rms").length,
@@ -106,7 +95,6 @@ export class DebugView {
   dispose(): void {
     for (const line of this.lines.values()) line.dispose();
     this.lines.clear();
-    this.peakMarkers.dispose();
     this.scrollingBeatGridMarkers.dispose();
     this.staticBeatGridMarkers.dispose();
     this.labels.dispose();
@@ -172,10 +160,5 @@ export class DebugView {
 
     this.lines.get("onsetAcfEnhanced")!.object3d.position.set(-2, -1, 0);
     this.lines.get("onsetAcfEnhanced")!.object3d.scale.set(4, 5, 1);
-    // this.peakMarkers.object3d.position.set(-2, -1, 0);
-    // this.peakMarkers.object3d.scale.set(4, 1, 1);
-
-    // this.lines.get("tea")!.object3d.position.set(-2, -1, 0);
-    // this.lines.get("tea")!.object3d.scale.set(4, 2, 1);
   }
 }

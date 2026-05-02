@@ -1,22 +1,69 @@
 <!doctype html>
 <html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>autocorrelation</title>
-    <style>
-      html, body { margin: 0; padding: 0; height: 100%; background: #0a0a0a; color: #ddd; font-family: ui-sans-serif, system-ui; }
-      #app { width: 100vw; height: 100vh; display: block; }
-    </style>
-  </head>
-  <body>
-    <canvas id="app"></canvas>
-    <div id="start-buttons" style="position: fixed; top: 1rem; left: 1rem; display: flex; gap: 0.5rem; align-items: center;">
-      <button id="start-mic" style="padding: 0.5rem 1rem; background: #222; color: #ddd; border: 1px solid #444; cursor: pointer;">Mic</button>
-      <button id="start-tab" style="padding: 0.5rem 1rem; background: #222; color: #ddd; border: 1px solid #444; cursor: pointer;">Tab Audio</button>
-      <button id="start-test" style="padding: 0.5rem 1rem; background: #222; color: #ddd; border: 1px solid #444; cursor: pointer;">Test 440Hz</button>
-      <span style="opacity: 0.5; font-size: 0.85rem;">(press T)</span>
-    </div>
-    <script type="module" src="/src/main.ts"></script>
-  </body>
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>autocorrelation</title>
+        <style>
+            html,
+            body {
+                margin: 0;
+                padding: 0;
+                height: 100%;
+                background: #0a0a0a;
+                color: #ddd;
+                font-family: ui-sans-serif, system-ui;
+            }
+            #app {
+                width: 100vw;
+                height: 100vh;
+                display: block;
+            }
+        </style>
+    </head>
+    <body>
+        <canvas id="app"></canvas>
+        <div
+            id="start-buttons"
+            style="
+                position: fixed;
+                top: 1rem;
+                left: 1rem;
+                display: flex;
+                width: 100%;
+                gap: 0.5rem;
+                align-items: center;
+            "
+        >
+            <button
+                id="start-mic"
+                style="
+                    padding: 0.5rem 1rem;
+                    background: #222;
+                    color: #ddd;
+                    border: 1px solid #444;
+                    cursor: pointer;
+                    width: 20%;
+                    height: 200px;
+                "
+            >
+                Mic
+            </button>
+            <button
+                id="start-tab"
+                style="
+                    padding: 0.5rem 1rem;
+                    background: #222;
+                    color: #ddd;
+                    border: 1px solid #444;
+                    cursor: pointer;
+                    width: 20%;
+                    height: 200px;
+                "
+            >
+                System Audio
+            </button>
+        </div>
+        <script type="module" src="/src/main.ts"></script>
+    </body>
 </html>
