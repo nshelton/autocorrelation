@@ -31,6 +31,7 @@ export class App {
   private keydownHandler: (e: KeyboardEvent) => void = () => {};
   private resizeHandler: () => void = () => {};
   private debugView!: DebugView;
+  private boxView!: BoxView;
 
   constructor(private deps: AppDeps) {}
 
@@ -122,6 +123,7 @@ export class App {
       this.last = now;
       this.rig.update(dt);
       this.debugView.update();
+      this.boxView.update();
       renderer.render(scene, camera);
       this.fps.end();
       this.rafHandle = requestAnimationFrame(loop);
@@ -137,6 +139,7 @@ export class App {
     window.removeEventListener("keydown", this.keydownHandler);
     window.removeEventListener("resize", this.resizeHandler);
     this.debugView?.dispose();
+    this.boxView?.dispose();
     this.fps.unmount();
     this.deps.workletNode.port.onmessage = null;
   }
