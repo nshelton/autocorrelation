@@ -208,6 +208,7 @@ impl Dsp {
             &self.buffers.onset,
             &mut self.buffers.onsetAcf,
             &mut self.buffers.onsetAcfEnhanced,
+            self.dt,
         );
         self.beat.process(
             &self.buffers.onset,

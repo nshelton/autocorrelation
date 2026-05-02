@@ -36,7 +36,7 @@ export class StaticBeatGridMarkers {
     this.baseR = base.r;
     this.baseG = base.g;
     this.baseB = base.b;
-    this.createLines(16);
+    this.createLines(32);
   }
 
   update(beatGrid: Float32Array, teaSize: number): void {

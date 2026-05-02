@@ -118,7 +118,7 @@ impl AcfState {
     }
 
     pub fn set_decay(&mut self, decay: f32) {
-        self.decay = decay.clamp(0.0, 1.0);
+        self.decay = decay;
     }
 
     pub fn set_smoothing_sigma(&mut self, sigma: f32) {
@@ -142,11 +142,11 @@ impl AcfState {
         }
     }
 
-    /// Run gen-ACF on `onset` → unsmoothed scratch. Convolve along the lag
-    /// axis with a Gaussian kernel → `onset_acf` (the smoothed raw ACF).
-    /// Harmonic-enhance `onset_acf` → `onset_acf_enhanced`, which inherits
-    /// the smoothing because harmonic enhancement is a sum over input
-    /// samples. Edge handling: clamp (replicate edge values).
+    /// Run gen-ACF on `onset` → `onset_acf`. EMA-accumulate into `raw_scratch`
+    /// (the persistent state, never blurred). Gaussian-smooth `raw_scratch`
+    /// along the lag axis into `onset_acf_enhanced` as a cosmetic output —
+    /// the kernel never folds back into state, so old peaks don't widen
+    /// frame-over-frame. Edge handling: clamp (replicate edge values).
     pub fn process(
         &mut self,
         onset: &[f32],
@@ -156,34 +156,31 @@ impl AcfState {
     ) {
         compute_gen_acf(
             onset,
-            &mut self.raw_scratch,
+            onset_acf,
             &self.fft_forward,
             &self.fft_inverse,
             &mut self.time_buf,
             &mut self.freq_buf,
         );
 
-        // onset_acf.copy_from_slice(&self.raw_scratch);
-
         let decay_alpha = 1.0 - (-dt / self.decay).exp();
 
         let n = self.raw_scratch.len();
         for tau in 0..n {
-            onset_acf[tau] =
-                onset_acf[tau] * (1.0 - decay_alpha) + decay_alpha * self.raw_scratch[tau];
+            self.raw_scratch[tau] =
+                self.raw_scratch[tau] * (1.0 - decay_alpha) + decay_alpha * onset_acf[tau];
         }
 
         if self.kernel.is_empty() {
-            onset_acf_enhanced.copy_from_slice(onset_acf);
+            onset_acf_enhanced.copy_from_slice(&self.raw_scratch);
         } else {
-            let n = onset_acf.len();
             let half = self.kernel.len() - 1;
             for tau in 0..n {
-                let mut acc = onset_acf[tau] * self.kernel[0];
+                let mut acc = self.raw_scratch[tau] * self.kernel[0];
                 for k in 1..=half {
                     let lo = if tau >= k { tau - k } else { 0 };
                     let hi = if tau + k < n { tau + k } else { n - 1 };
-                    acc += (onset_acf[lo] + onset_acf[hi]) * self.kernel[k];
+                    acc += (self.raw_scratch[lo] + self.raw_scratch[hi]) * self.kernel[k];
                 }
                 onset_acf_enhanced[tau] = acc;
             }

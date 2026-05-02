@@ -131,6 +131,40 @@ const CONFIDENCE_RELEASE_ALPHA: f32 = 0.03;
 // runtime via `set_phase_lock_tau` (param key "phaseLock").
 const PHASE_LOCK_DEFAULT_SECS: f32 = 1.0;
 
+/// Fit a parabola through `(−1, ym), (0, y0), (+1, yp)` and return the
+/// vertex's signed offset from the center sample, in `[-0.5, +0.5]`. Returns
+/// 0.0 if the triple isn't a strict local maximum (vertex would land outside
+/// the bracket — bogus refinement).
+fn parabolic_refine(ym: f32, y0: f32, yp: f32) -> f32 {
+    let denom = ym - 2.0 * y0 + yp;
+    if denom.abs() < 1e-9 {
+        return 0.0;
+    }
+    let delta = 0.5 * (ym - yp) / denom;
+    if delta.abs() <= 1.0 {
+        delta
+    } else {
+        0.0
+    }
+}
+
+/// Fold `tau` by powers of 2 into `[lo, hi)`. Every period has a unique fold
+/// because `hi = 2 * lo` makes the range exactly one octave wide. Returns NaN
+/// for non-positive or non-finite `tau` (would otherwise spin forever).
+fn fold_to_canonical(tau: f32, lo: f32, hi: f32) -> f32 {
+    if !tau.is_finite() || tau <= 0.0 || lo <= 0.0 || hi <= lo {
+        return f32::NAN;
+    }
+    let mut t = tau;
+    while t < lo {
+        t *= 2.0;
+    }
+    while t >= hi {
+        t *= 0.5;
+    }
+    t
+}
+
 fn wrap_phase(phase: f32, period: f32) -> f32 {
     if period > 0.0 && period.is_finite() {
         phase.rem_euclid(period)
@@ -244,14 +278,11 @@ pub struct BeatState {
     tau_max: usize,
     beat_tau_min: usize,
     beat_tau_max: usize,
+    tau_scores: Vec<f32>,
+    phase_scores: Vec<f32>,
     cand_scratch: Vec<(usize, f32)>,
     beat_scratch: Vec<(f32, f32, f32)>,
-    /// Tapered copy of onset history used only for the phase-extraction call
-    /// in `update_tea`. Linear weight `1 - d/(PULSE_N·τ)` clamped to [0,1],
-    /// where `d` is hops since `last`. Mutes a beat's contribution gradually
-    /// as it ages out of the comb's reach so the argmax doesn't step every τ
-    /// hops. NOT applied in `score_beat_hypotheses`'s per-hypothesis loop —
-    /// that scoring needs the raw comb response to disambiguate octaves.
+
     onset_windowed: Vec<f32>,
     beat_lag: [f32; MAX_PEAKS],
     beat_comb_score: [f32; MAX_PEAKS],
@@ -275,6 +306,10 @@ pub struct BeatState {
     phase_correction_alpha: f32,
     tau_smoothed: f32,
     phase_smoothed: f32,
+    canonical_lo: usize,
+    canonical_hi: usize,
+    tau_score: Vec<f32>,
+    phase_score_inst: Vec<f32>,
     frame_index: u64,
     phase_updated_at: u64,
     beat_position: f32,
@@ -283,19 +318,24 @@ pub struct BeatState {
 impl BeatState {
     pub fn new(rms_history_len: usize, dt: f32) -> Self {
         let onset_acf_len = rms_history_len / 2;
-        let tau_min = ((60.0 / BEAT_TRACKER_MAX_BPM) / dt).floor().max(1.0) as usize;
-        let tau_max_unbounded = ((60.0 / PEAK_SCAN_MIN_BPM) / dt).ceil() as usize;
-        let tau_max = tau_max_unbounded.min(onset_acf_len.saturating_sub(2));
+        let tau_min = 30_usize;
+        let tau_max = 100_usize;
         let beat_tau_min = tau_min;
         let beat_tau_max_unbounded = ((60.0 / BEAT_HYPOTHESIS_MIN_BPM) / dt).ceil() as usize;
         let beat_tau_max = beat_tau_max_unbounded.min(onset_acf_len.saturating_sub(2));
         let tea_alpha = 1.0 - (-dt / TEA_TAU_DEFAULT_SECS).exp();
         let phase_correction_alpha = 1.0 - (-dt / PHASE_LOCK_DEFAULT_SECS).exp();
+        let canonical_lo = tau_min;
+        let canonical_hi = 2 * tau_min;
+        let tau_score = vec![0.0_f32; canonical_hi - canonical_lo];
+        let phase_score_inst = vec![0.0_f32; tau_max];
         Self {
             tau_min,
             tau_max,
             beat_tau_min,
             beat_tau_max,
+            tau_scores: vec![0.0_f32; onset_acf_len],
+            phase_scores: vec![0.0_f32; onset_acf_len],
             cand_scratch: Vec::with_capacity(onset_acf_len / 2 + 1),
             beat_scratch: Vec::with_capacity(MAX_PEAKS * COMB_MAX_DIVISOR),
             onset_windowed: vec![0.0; rms_history_len],
@@ -319,8 +359,12 @@ impl BeatState {
             tea_alpha,
             tea_sigma: TEA_GAUSSIAN_SIGMA_DEFAULT,
             phase_correction_alpha,
-            tau_smoothed: f32::NAN,
-            phase_smoothed: f32::NAN,
+            tau_smoothed: 0.0_f32,
+            phase_smoothed: 0.0_f32,
+            canonical_lo,
+            canonical_hi,
+            tau_score,
+            phase_score_inst,
             frame_index: 0,
             phase_updated_at: 0,
             beat_position: 0.0,
@@ -356,12 +400,97 @@ impl BeatState {
         dt: f32,
     ) {
         self.frame_index = self.frame_index.wrapping_add(1);
-        self.pick_candidates(onset_acf_enhanced, candidates);
-        // Public candidates remain raw long-range ACF peaks for debugging;
-        // TEA uses derived beat-grid hypotheses so bar-level peaks can anchor
-        // their faster beat-level divisors instead of dragging tempo down.
-        self.score_beat_hypotheses(onset, candidates);
-        self.update_tea(onset, tea);
+
+        // estimate tau scores
+        let mut best_tau = 0.0_f32;
+        let mut best_score = 0.0_f32;
+        for candidate_tau in self.tau_min..self.tau_max {
+            self.tau_scores[candidate_tau] = 0.0_f32;
+
+            let mut idx = candidate_tau;
+            let mut taps = 0.0_f32;
+
+            while idx < onset_acf_enhanced.len() {
+                self.tau_scores[candidate_tau] += onset_acf_enhanced[idx];
+
+                idx += candidate_tau;
+                taps += 1.0_f32;
+            }
+
+            if taps > 0.0_f32 {
+                self.tau_scores[candidate_tau] /= taps.sqrt();
+            }
+
+            if self.tau_scores[candidate_tau] > best_score {
+                best_score = self.tau_scores[candidate_tau];
+                best_tau = candidate_tau as f32;
+            }
+        }
+
+        let bi = best_tau as usize;
+        if bi > self.tau_min && bi + 1 < self.tau_max {
+            best_tau += parabolic_refine(
+                self.tau_scores[bi - 1],
+                self.tau_scores[bi],
+                self.tau_scores[bi + 1],
+            );
+        }
+
+        self.tau_smoothed = best_tau * self.tea_alpha + self.tau_smoothed * (1.0 - self.tea_alpha);
+        let tau = self.tau_smoothed;
+
+        // estimate phase
+
+        let mut phase_measured: f32 = 0.0;
+        let mut best_phase_score = -1.0_f32;
+
+        for phase in 0..tau.round() as usize {
+            let mut s = 0.0_f32;
+            let last = onset.len() as isize - 1;
+            let mut k = 0_isize;
+
+            loop {
+                let pos = last - phase as isize - (k as f32 * tau).round() as isize;
+                if pos < 1 {
+                    break;
+                }
+                s += onset[pos as usize] - onset[pos as usize - 1];
+                k += 1;
+            }
+
+            if phase < self.phase_score_inst.len() {
+                self.phase_score_inst[phase] = s;
+            }
+            if s > best_phase_score {
+                best_phase_score = s;
+                phase_measured = phase as f32;
+            }
+        }
+
+        let mut phase_pred =
+            self.phase_smoothed + (self.frame_index - self.phase_updated_at) as f32;
+
+        if phase_pred > tau {
+            phase_pred -= tau;
+        }
+
+        // Shortest signed arc on the circle so lerping doesn't swim backwards
+        // through the full cycle when phase wraps at 0/tau.
+        let mut delta = phase_measured - phase_pred;
+        if delta > 0.5 * tau {
+            delta -= tau;
+        }
+        if delta < -0.5 * tau {
+            delta += tau;
+        }
+
+        self.phase_smoothed = (phase_pred + self.phase_correction_alpha * delta);
+
+        self.phase_updated_at = self.frame_index;
+
+        self.confidence_smoothed = 1.0_f32;
+        self.score_inst = 1.0_f32;
+
         self.write_beat_outputs(beat_grid, beat_state, dt);
         self.update_beat_pulses(beat_pulses);
     }

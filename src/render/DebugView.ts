@@ -172,10 +172,10 @@ export class DebugView {
 
     this.lines.get("onsetAcfEnhanced")!.object3d.position.set(-2, -1, 0);
     this.lines.get("onsetAcfEnhanced")!.object3d.scale.set(4, 5, 1);
-    this.peakMarkers.object3d.position.set(-2, -1, 0);
-    this.peakMarkers.object3d.scale.set(4, 1, 1);
+    // this.peakMarkers.object3d.position.set(-2, -1, 0);
+    // this.peakMarkers.object3d.scale.set(4, 1, 1);
 
-    this.lines.get("tea")!.object3d.position.set(-2, -1, 0);
-    this.lines.get("tea")!.object3d.scale.set(4, 2, 1);
+    // this.lines.get("tea")!.object3d.position.set(-2, -1, 0);
+    // this.lines.get("tea")!.object3d.scale.set(4, 2, 1);
   }
 }
