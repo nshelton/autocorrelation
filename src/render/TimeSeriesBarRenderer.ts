@@ -1,5 +1,6 @@
 import {
   AdditiveBlending,
+  Color,
   Group,
   InstancedMesh,
   Matrix4,
@@ -31,6 +32,7 @@ export class TimeSeriesBarRenderer extends TimeSeriesRenderer {
   private pos = new Vector3();
   private scl = new Vector3();
   private quat = new Quaternion();
+  private instanceColor = new Color();
 
   constructor(opts: TimeSeriesRendererOptions) {
     super(opts);
@@ -38,7 +40,6 @@ export class TimeSeriesBarRenderer extends TimeSeriesRenderer {
       color: this.color,
       transparent: true,
       depthWrite: false,
-      opacity: 1,
       blending: AdditiveBlending,
     });
     this.update();
@@ -69,9 +70,14 @@ export class TimeSeriesBarRenderer extends TimeSeriesRenderer {
     this.scl.set(w, y, 1);
     this.mat.compose(this.pos, this.quat, this.scl);
     this.mesh.setMatrixAt(i, this.mat);
+
+    const brightness = this.brightnessForValue(y);
+    this.instanceColor.setRGB(brightness, brightness, brightness);
+    this.mesh.setColorAt(i, this.instanceColor);
   }
 
   protected commit(): void {
     this.mesh.instanceMatrix.needsUpdate = true;
+    if (this.mesh.instanceColor) this.mesh.instanceColor.needsUpdate = true;
   }
 }

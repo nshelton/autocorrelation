@@ -12,5 +12,18 @@ export default defineConfig({
   },
   server: {
     port: 5173,
+    headers: {
+      // Cross-origin isolation unlocks high-resolution performance.now() in
+      // AudioWorkletGlobalScope (~5 µs in Chrome vs 1 ms otherwise). Used by
+      // crates/dsp/src/perf.rs for dspPerf measurements.
+      "Cross-Origin-Opener-Policy": "same-origin",
+      "Cross-Origin-Embedder-Policy": "require-corp",
+    },
+  },
+  preview: {
+    headers: {
+      "Cross-Origin-Opener-Policy": "same-origin",
+      "Cross-Origin-Embedder-Policy": "require-corp",
+    },
   },
 });

@@ -1,19 +1,20 @@
 use wasm_bindgen::prelude::*;
 
 mod acf;
+mod autogain;
 mod beat;
 mod buffers;
 mod perf;
 mod spectrum;
 
 use crate::acf::AcfState;
+use crate::autogain::AutoGain;
 use crate::beat::BeatState;
 use crate::buffers::Buffers;
-use crate::perf::{
-    elapsed_us, now_us, PERF_BEAT, PERF_BUFFER_ACF, PERF_INPUT_RMS, PERF_ONSET_ACF, PERF_SPECTRUM,
-    PERF_TOTAL,
-};
+use crate::perf::PerfState;
 use crate::spectrum::SpectrumState;
+
+const AUTOGAIN_DEFAULT_TAU_SECS: f32 = 1.0;
 
 #[wasm_bindgen]
 pub struct Dsp {
@@ -25,6 +26,12 @@ pub struct Dsp {
     dt: f32,
     acf: AcfState,
     beat: BeatState,
+    perf: PerfState,
+    auto_rms: AutoGain,
+    auto_rms_low: AutoGain,
+    auto_rms_mid: AutoGain,
+    auto_rms_high: AutoGain,
+    auto_onset: AutoGain,
 }
 
 #[wasm_bindgen]
@@ -44,42 +51,42 @@ impl Dsp {
             dt,
             acf: AcfState::new(rms_history_len),
             beat: BeatState::new(rms_history_len, dt),
+            perf: PerfState::new(dt),
+            auto_rms: AutoGain::new(dt, AUTOGAIN_DEFAULT_TAU_SECS),
+            auto_rms_low: AutoGain::new(dt, AUTOGAIN_DEFAULT_TAU_SECS),
+            auto_rms_mid: AutoGain::new(dt, AUTOGAIN_DEFAULT_TAU_SECS),
+            auto_rms_high: AutoGain::new(dt, AUTOGAIN_DEFAULT_TAU_SECS),
+            auto_onset: AutoGain::new(dt, AUTOGAIN_DEFAULT_TAU_SECS),
         }
     }
 
     pub fn process(&mut self, input: &[f32]) {
-        let t_start = now_us();
+        let t_start = self.perf.frame_start();
 
-        // Section 1: input waveform copy + full-window RMS + RMS history push.
         let n = input.len().min(self.buffers.waveform.len());
         self.buffers.waveform[..n].copy_from_slice(&input[..n]);
         let mean_sq: f32 = input.iter().take(n).map(|&x| x * x).sum::<f32>() / n.max(1) as f32;
         let rms = mean_sq.sqrt();
-        push_history(&mut self.buffers.rms, rms);
-        let t_after_input = now_us();
-        self.buffers.dspPerfUs[PERF_INPUT_RMS] = elapsed_us(t_start, t_after_input);
+        push_history(&mut self.buffers.rms, self.auto_rms.apply(rms));
 
-        // Section 2: spectrum + band RMS / onset history.
         let (low_rms, mid_rms, high_rms, flux) =
             self.spectrum
                 .process(input, &mut self.buffers.spectrum, self.db_floor);
-        push_history(&mut self.buffers.rmsLow, low_rms);
-        push_history(&mut self.buffers.rmsMid, mid_rms);
-        push_history(&mut self.buffers.rmsHigh, high_rms);
-        push_history(&mut self.buffers.onset, flux);
-        let t_after_spectrum = now_us();
-        self.buffers.dspPerfUs[PERF_SPECTRUM] = elapsed_us(t_after_input, t_after_spectrum);
+        push_history(&mut self.buffers.rmsLow, self.auto_rms_low.apply(low_rms));
+        push_history(&mut self.buffers.rmsMid, self.auto_rms_mid.apply(mid_rms));
+        push_history(
+            &mut self.buffers.rmsHigh,
+            self.auto_rms_high.apply(high_rms),
+        );
+        push_history(&mut self.buffers.onset, self.auto_onset.apply(flux));
 
-        // Section 3: onset ACF (gen ACF + smoothing + harmonic enhancement).
         self.acf.process(
             &self.buffers.onset,
             &mut self.buffers.onsetAcf,
             &mut self.buffers.onsetAcfEnhanced,
+            self.dt,
         );
-        let t_after_onset_acf = now_us();
-        self.buffers.dspPerfUs[PERF_ONSET_ACF] = elapsed_us(t_after_spectrum, t_after_onset_acf);
 
-        // Section 4: beat tracking.
         self.beat.process(
             &self.buffers.onset,
             &self.buffers.onsetAcfEnhanced,
@@ -90,15 +97,10 @@ impl Dsp {
             &mut self.buffers.beatPulses,
             self.dt,
         );
-        let t_after_beat = now_us();
-        self.buffers.dspPerfUs[PERF_BEAT] = elapsed_us(t_after_onset_acf, t_after_beat);
 
-        // Section 5: time-domain waveform autocorrelation.
         crate::acf::autocorrelate(&self.buffers.waveform, &mut self.buffers.bufferAcf);
-        let t_after_buf_acf = now_us();
-        self.buffers.dspPerfUs[PERF_BUFFER_ACF] = elapsed_us(t_after_beat, t_after_buf_acf);
 
-        self.buffers.dspPerfUs[PERF_TOTAL] = elapsed_us(t_start, t_after_buf_acf);
+        self.perf.frame_end(t_start, &mut self.buffers.dspPerf);
     }
 
     /// String-keyed buffer accessor. Returns a copy of the named buffer's
@@ -123,7 +125,8 @@ impl Dsp {
 
     /// Set a tunable param. Unknown keys are silently ignored.
     /// Recognized keys: "smoothingTauSecs", "onsetSmoothingTauSecs",
-    /// "teaTauSecs", "teaSigma", "acfSmoothingSigma", "dbFloor", "phaseLock".
+    /// "teaTauSecs", "teaSigma", "acfSmoothingSigma", "dbFloor", "phaseLock",
+    /// "autoGain".
     pub fn set_param(&mut self, key: &str, value: f32) {
         match key {
             "smoothingTauSecs" => self.spectrum.set_smoothing_tau(value, self.dt),
@@ -131,8 +134,16 @@ impl Dsp {
             "teaTauSecs" => self.beat.set_tea_tau(value, self.dt),
             "teaSigma" => self.beat.set_tea_sigma(value),
             "acfSmoothingSigma" => self.acf.set_smoothing_sigma(value),
+            "acfDecay" => self.acf.set_decay(value),
             "dbFloor" => self.db_floor = value.clamp(-200.0, 0.0),
             "phaseLock" => self.beat.set_phase_lock_tau(value, self.dt),
+            "autoGain" => {
+                self.auto_rms.set_tau(value, self.dt);
+                self.auto_rms_low.set_tau(value, self.dt);
+                self.auto_rms_mid.set_tau(value, self.dt);
+                self.auto_rms_high.set_tau(value, self.dt);
+                self.auto_onset.set_tau(value, self.dt);
+            }
             _ => {}
         }
     }
@@ -267,12 +278,13 @@ mod tests {
 
     #[test]
     fn rms_of_unit_amplitude_constant_is_one() {
+        // Autogain normalizes new peaks to ~1.0; a constant unit-amplitude
+        // input produces rms=1.0 → peak=1.0 → normalized=1.0.
         let mut dsp = Dsp::new(8, 48000.0, 4, 512);
         let constant = vec![1.0_f32; 8];
         dsp.process(&constant);
         let h = dsp.get_buffer("rms");
         assert_eq!(h.len(), 512);
-        // Newest sample at the end
         let last = h[h.len() - 1];
         assert!((last - 1.0).abs() < 1e-6, "got {}", last);
     }
@@ -287,16 +299,16 @@ mod tests {
 
     #[test]
     fn rms_history_shifts_oldest_out() {
+        // Autogain normalizes each new peak to ~1.0, so the order of pushes
+        // is visible in the silence-vs-loud pattern, not absolute values.
         let mut dsp = Dsp::new(4, 48000.0, 4, 512);
-        // Push three distinct values
-        dsp.process(&[1.0, 1.0, 1.0, 1.0]); // rms = 1
-        dsp.process(&[2.0, 2.0, 2.0, 2.0]); // rms = 2
-        dsp.process(&[0.0, 0.0, 0.0, 0.0]); // rms = 0
+        dsp.process(&[1.0, 1.0, 1.0, 1.0]); // rms=1, peak→1, norm=1
+        dsp.process(&[2.0, 2.0, 2.0, 2.0]); // rms=2, peak→2, norm=1
+        dsp.process(&[0.0, 0.0, 0.0, 0.0]); // rms=0, norm=0
         let h = dsp.get_buffer("rms");
         let n = h.len();
-        // Newest three values are at the end in the order pushed
-        assert_eq!(h[n - 3], 1.0);
-        assert_eq!(h[n - 2], 2.0);
+        assert!((h[n - 3] - 1.0).abs() < 1e-6, "got {}", h[n - 3]);
+        assert!((h[n - 2] - 1.0).abs() < 1e-6, "got {}", h[n - 2]);
         assert_eq!(h[n - 1], 0.0);
     }
 
@@ -490,7 +502,8 @@ mod tests {
     #[test]
     fn pure_low_band_sine_lands_in_low() {
         // Bin-aligned: 4 × (48000/2048) = 93.75 Hz, in the low band (bins 1..=6).
-        // Hann main lobe is 4 bins wide; bin 4 ± 2 = bins 2..6, all in low.
+        // Per-band autogain: the active band normalizes to ~1.0, silent bands
+        // stay near zero (peak at floor).
         let mut dsp = Dsp::new(2048, 48000.0, 1024, 512);
         let sr = 48000.0_f32;
         let freq = 93.75_f32;
@@ -501,7 +514,7 @@ mod tests {
         let low = *dsp.get_buffer("rmsLow").last().unwrap();
         let mid = *dsp.get_buffer("rmsMid").last().unwrap();
         let high = *dsp.get_buffer("rmsHigh").last().unwrap();
-        assert!((low - 0.7071).abs() < 0.05, "low {} should be ≈ 0.707", low);
+        assert!((low - 1.0).abs() < 0.05, "low {} should be ≈ 1.0", low);
         assert!(mid < 0.05, "mid {} should be near zero", mid);
         assert!(high < 0.05, "high {} should be near zero", high);
     }
@@ -519,7 +532,7 @@ mod tests {
         let low = *dsp.get_buffer("rmsLow").last().unwrap();
         let mid = *dsp.get_buffer("rmsMid").last().unwrap();
         let high = *dsp.get_buffer("rmsHigh").last().unwrap();
-        assert!((mid - 0.7071).abs() < 0.05, "mid {} should be ≈ 0.707", mid);
+        assert!((mid - 1.0).abs() < 0.05, "mid {} should be ≈ 1.0", mid);
         assert!(low < 0.05, "low {} should be near zero", low);
         assert!(high < 0.05, "high {} should be near zero", high);
     }
@@ -537,45 +550,9 @@ mod tests {
         let low = *dsp.get_buffer("rmsLow").last().unwrap();
         let mid = *dsp.get_buffer("rmsMid").last().unwrap();
         let high = *dsp.get_buffer("rmsHigh").last().unwrap();
-        assert!(
-            (high - 0.7071).abs() < 0.05,
-            "high {} should be ≈ 0.707",
-            high
-        );
+        assert!((high - 1.0).abs() < 0.05, "high {} should be ≈ 1.0", high);
         assert!(low < 0.05, "low {} should be near zero", low);
         assert!(mid < 0.05, "mid {} should be near zero", mid);
-    }
-
-    #[test]
-    fn parseval_consistency_across_bands() {
-        // Multi-tone: one bin-aligned sine in each band, with different amplitudes.
-        // Expected: sqrt(low² + mid² + high²) ≈ time-domain full RMS within ~5%
-        // (slack for the stationarity approximation in the Parseval derivation).
-        let mut dsp = Dsp::new(2048, 48000.0, 1024, 512);
-        let sr = 48000.0_f32;
-        let signal: Vec<f32> = (0..2048)
-            .map(|i| {
-                let t = i as f32 / sr;
-                let two_pi = 2.0 * std::f32::consts::PI;
-                1.0  * (two_pi * 93.75   * t).sin()  // low,  amp 1.0
-                + 0.5 * (two_pi * 703.125 * t).sin()  // mid,  amp 0.5
-                + 0.25 * (two_pi * 2343.75 * t).sin() // high, amp 0.25
-            })
-            .collect();
-        dsp.process(&signal);
-        let low = *dsp.get_buffer("rmsLow").last().unwrap();
-        let mid = *dsp.get_buffer("rmsMid").last().unwrap();
-        let high = *dsp.get_buffer("rmsHigh").last().unwrap();
-        let full = *dsp.get_buffer("rms").last().unwrap();
-        let summed = (low * low + mid * mid + high * high).sqrt();
-        let rel_err = (summed - full).abs() / full;
-        assert!(
-            rel_err < 0.05,
-            "Parseval mismatch: summed={}, full={}, rel_err={}",
-            summed,
-            full,
-            rel_err
-        );
     }
 
     #[test]
@@ -1272,30 +1249,23 @@ mod tests {
     }
 
     #[test]
-    fn dsp_perf_us_populated_after_process() {
+    fn dsp_perf_populated_after_process() {
         let mut dsp = Dsp::new(2048, 48000.0, 1024, 512);
         let signal: Vec<f32> = (0..2048)
             .map(|i| (2.0 * std::f32::consts::PI * 1000.0 * (i as f32 / 48000.0)).sin())
             .collect();
         dsp.process(&signal);
-        let perf = dsp.get_buffer("dspPerfUs");
+        // First call: totalMs seeded, freqHz still NaN (period needs a 2nd call).
+        let perf = dsp.get_buffer("dspPerf");
         assert_eq!(perf.len(), crate::perf::PERF_METRIC_COUNT);
-        for (i, &v) in perf.iter().enumerate() {
-            assert!(v.is_finite(), "perf[{}] should be finite, got {}", i, v);
-            assert!(v >= 0.0, "perf[{}] should be non-negative, got {}", i, v);
-        }
-        // total should be at least as large as any single section, modulo
-        // timer noise. Allow a small slack since native Instant resolution
-        // can produce identical readings on tiny sections.
-        let total = perf[crate::perf::PERF_TOTAL];
-        for i in 1..crate::perf::PERF_METRIC_COUNT {
-            assert!(
-                perf[i] <= total + 1.0,
-                "section {} ({}) exceeds total ({})",
-                i,
-                perf[i],
-                total
-            );
+        assert!(perf[crate::perf::PERF_TOTAL_MS].is_finite());
+        assert!(perf[crate::perf::PERF_TOTAL_MS] >= 0.0);
+        assert!(perf[crate::perf::PERF_FREQ_HZ].is_nan());
+
+        dsp.process(&signal);
+        let perf = dsp.get_buffer("dspPerf");
+        for &v in perf.iter() {
+            assert!(v.is_finite() && v >= 0.0, "got {}", v);
         }
     }
 

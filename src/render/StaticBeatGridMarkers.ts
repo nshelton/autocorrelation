@@ -42,7 +42,7 @@ export class StaticBeatGridMarkers {
   update(beatGrid: Float32Array, teaSize: number): void {
     // console.log(beatGrid);
     const scale = (4 * beatGrid[0]) / teaSize;
-    this.object3d.scale.set(scale, 0.2, 1);
+    this.object3d.scale.set(scale, 1, 1);
   }
 
   dispose(): void {

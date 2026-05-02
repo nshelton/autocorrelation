@@ -44,24 +44,6 @@ pub fn compute_gen_acf(
     }
 }
 
-/// Per Percival & Tzanetakis 2014 §II-B.3: boost peaks corresponding to
-/// integer multiples of the underlying tempo by adding time-stretched
-/// versions of the ACF.
-pub fn compute_harmonic_enhanced(acf: &[f32], enhanced: &mut [f32]) {
-    const HARMONIC_MULTIPLES: [usize; 2] = [2, 4];
-    let n = acf.len();
-    for tau in 0..n {
-        let mut sum = acf[tau];
-        for &mult in &HARMONIC_MULTIPLES {
-            let idx = tau * mult;
-            if idx < n {
-                sum += acf[idx];
-            }
-        }
-        enhanced[tau] = sum;
-    }
-}
-
 /// Direct time-domain autocorrelation, normalized so output[0] == 1.0
 /// for any nonzero input. For all-zero input the output is filled with
 /// zeros. Caller chooses how many lags to compute via `output.len()`.
@@ -111,6 +93,8 @@ pub struct AcfState {
     /// Pre-normalized half Gaussian kernel (kernel[0] = center weight,
     /// kernel[k] = symmetric weight at offset ±k). Empty when σ ≤ 0.
     kernel: Vec<f32>,
+    // weight for new acf data to be integrated into the enhanced version.
+    decay: f32,
 }
 
 impl AcfState {
@@ -127,9 +111,14 @@ impl AcfState {
             freq_buf: vec![Complex::new(0.0, 0.0); n + 1],
             raw_scratch: vec![0.0; onset_acf_len],
             kernel: Vec::new(),
+            decay: 1.0,
         };
         state.set_smoothing_sigma(ACF_SMOOTHING_SIGMA_DEFAULT);
         state
+    }
+
+    pub fn set_decay(&mut self, decay: f32) {
+        self.decay = decay.clamp(0.0, 1.0);
     }
 
     pub fn set_smoothing_sigma(&mut self, sigma: f32) {
@@ -163,6 +152,7 @@ impl AcfState {
         onset: &[f32],
         onset_acf: &mut [f32],
         onset_acf_enhanced: &mut [f32],
+        dt: f32,
     ) {
         compute_gen_acf(
             onset,
@@ -172,21 +162,31 @@ impl AcfState {
             &mut self.time_buf,
             &mut self.freq_buf,
         );
+
+        // onset_acf.copy_from_slice(&self.raw_scratch);
+
+        let decay_alpha = 1.0 - (-dt / self.decay).exp();
+
+        let n = self.raw_scratch.len();
+        for tau in 0..n {
+            onset_acf[tau] =
+                onset_acf[tau] * (1.0 - decay_alpha) + decay_alpha * self.raw_scratch[tau];
+        }
+
         if self.kernel.is_empty() {
-            onset_acf.copy_from_slice(&self.raw_scratch);
+            onset_acf_enhanced.copy_from_slice(onset_acf);
         } else {
             let n = onset_acf.len();
             let half = self.kernel.len() - 1;
             for tau in 0..n {
-                let mut acc = self.raw_scratch[tau] * self.kernel[0];
+                let mut acc = onset_acf[tau] * self.kernel[0];
                 for k in 1..=half {
                     let lo = if tau >= k { tau - k } else { 0 };
                     let hi = if tau + k < n { tau + k } else { n - 1 };
-                    acc += (self.raw_scratch[lo] + self.raw_scratch[hi]) * self.kernel[k];
+                    acc += (onset_acf[lo] + onset_acf[hi]) * self.kernel[k];
                 }
-                onset_acf[tau] = acc;
+                onset_acf_enhanced[tau] = acc;
             }
         }
-        compute_harmonic_enhanced(onset_acf, onset_acf_enhanced);
     }
 }

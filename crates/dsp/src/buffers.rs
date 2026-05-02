@@ -30,7 +30,7 @@ pub struct Buffers {
     pub beatGrid: Vec<f32>,
     pub beatPulses: Vec<f32>,
     pub beatState: Vec<f32>,
-    pub dspPerfUs: Vec<f32>,
+    pub dspPerf: Vec<f32>,
 }
 
 impl Buffers {
@@ -52,7 +52,7 @@ impl Buffers {
             beatGrid: vec![f32::NAN; BEAT_GRID_LEN],
             beatPulses: vec![f32::NAN; BEAT_PULSES_LEN],
             beatState: vec![f32::NAN; BEAT_STATE_LEN],
-            dspPerfUs: vec![f32::NAN; PERF_METRIC_COUNT],
+            dspPerf: vec![f32::NAN; PERF_METRIC_COUNT],
         }
     }
 
@@ -73,7 +73,7 @@ impl Buffers {
             ("beatGrid", self.beatGrid.len()),
             ("beatPulses", self.beatPulses.len()),
             ("beatState", self.beatState.len()),
-            ("dspPerfUs", self.dspPerfUs.len()),
+            ("dspPerf", self.dspPerf.len()),
         ]
     }
 
@@ -97,7 +97,7 @@ impl Buffers {
             "beatGrid" => Some(&self.beatGrid),
             "beatPulses" => Some(&self.beatPulses),
             "beatState" => Some(&self.beatState),
-            "dspPerfUs" => Some(&self.dspPerfUs),
+            "dspPerf" => Some(&self.dspPerf),
             _ => None,
         }
     }
@@ -137,15 +137,15 @@ mod tests {
                 "beatGrid",
                 "beatPulses",
                 "beatState",
-                "dspPerfUs",
+                "dspPerf",
             ]
         );
     }
 
     #[test]
-    fn dsp_perf_us_is_nan_at_init_and_correct_length() {
+    fn dsp_perf_is_nan_at_init_and_correct_length() {
         let b = Buffers::new(2048, 512);
-        let v = b.get("dspPerfUs").unwrap();
+        let v = b.get("dspPerf").unwrap();
         assert_eq!(v.len(), PERF_METRIC_COUNT);
         for &x in v {
             assert!(x.is_nan());

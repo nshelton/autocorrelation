@@ -1,5 +1,9 @@
 import { Group, Object3D } from "three";
-import { TextLabel } from "./TextLabel";
+import {
+  TextLabel,
+  type TextLabelAnchorX,
+  TextLabelAnchorY,
+} from "./TextLabel";
 import type { FeatureStore } from "../store/FeatureStore";
 import type { ParamStore } from "../params/ParamStore";
 
@@ -9,15 +13,9 @@ export interface DebugLabelsOptions {
   audioContext: AudioContext;
 }
 
-// Mirror of crates/dsp/src/perf.rs PERF_METRIC_NAMES — same index order.
-const PERF_METRIC_NAMES = [
-  "total",
-  "inputRms",
-  "spectrum",
-  "onsetAcf",
-  "beat",
-  "bufferAcf",
-] as const;
+// Mirror of crates/dsp/src/perf.rs PERF_METRIC_NAMES indexes.
+const PERF_TOTAL_MS = 0;
+const PERF_FREQ_HZ = 1;
 
 export class DebugLabels {
   readonly object3d: Object3D = new Group();
@@ -25,22 +23,19 @@ export class DebugLabels {
   private labels: TextLabel[] = [];
   private beatSummary: TextLabel;
   private configSummary: TextLabel;
-  private perfSummary: TextLabel;
   private nextDynamicUpdateMs = 0;
 
   constructor(private opts: DebugLabelsOptions) {
-    this.addStaticLabel("waveform", 0x66ffcc, -0.5, 1);
-    this.addStaticLabel("bufferAcf", 0xcc99ff, -0, 1);
-    this.addStaticLabel("spectrum", 0xffaa66, 1.5, 1);
-    this.addStaticLabel("rms + beatGrid", 0xffffff, -1.74, 0.58);
-    this.addStaticLabel("onset", 0xff9966, -1, 0);
-    this.addStaticLabel("onsetAcf", 0x6666bb, -1, -1.8);
-    this.addStaticLabel("onsetAcfEnhanced", 0xff99cc, -1, -1.1);
-    this.addStaticLabel("tea", 0xffff66, -1, -1);
+    this.addStaticLabel("waveform", 0x66ffcc, -1, 2);
+    this.addStaticLabel("bufferAcf", 0xcc99ff, 0, 2);
+    this.addStaticLabel("spectrum", 0xffaa66, 2, 2);
+    this.addStaticLabel("rms", 0xffffff, 0, 1);
+    this.addStaticLabel("onset", 0xff9966, 0, 0.5);
+    this.addStaticLabel("onsetAcf", 0x6666bb, -1, -0.1);
+    this.addStaticLabel("tempo", 0xffff66, -1, 0);
 
-    this.beatSummary = this.createLabel("beat: --", 0x66ccff, 0, -0.7);
-    this.configSummary = this.createLabel("cfg: --", 0xffffff, 0, 2);
-    this.perfSummary = this.createLabel("dsp: --", 0xaaffaa, 0, 1.7);
+    this.beatSummary = this.createLabel("beat: --", 0x66ccff, 2, 0);
+    this.configSummary = this.createLabel("cfg: --", 0x888888, -0, 2.1);
   }
 
   update(): void {
@@ -57,35 +52,37 @@ export class DebugLabels {
     const gridScore = beatGrid[2];
 
     this.beatSummary.setText(
-      `beat: bpm=${this.formatNumber(bpm, 1)} period=${this.formatNumber(
+      `beat: bpm=${this.formatNumber(bpm, 1, 5)} period=${this.formatNumber(
         period,
         1,
-      )} phase=${this.formatNumber(phase, 1)} score=${this.formatNumber(
+        4,
+      )} phase=${this.formatNumber(phase, 1, 4)} score=${this.formatNumber(
         Number.isNaN(beatScore) ? gridScore : beatScore,
         2,
+        4,
       )}`,
     );
 
     this.configSummary.setText(
-      `cfg: rms=${this.opts.store.get("rms").length} hop=${this.opts.paramStore.get(
+      `rms=${this.opts.store.get("rms").length} hop=${this.opts.paramStore.get(
         "dsp.hopSize",
-      )} sr=${Math.round(this.opts.audioContext.sampleRate)}`,
+      )} sr=${Math.round(this.opts.audioContext.sampleRate)}` +
+        this.formatPerfLabel(),
     );
-
-    this.perfSummary.setText(this.formatPerfLabel());
   }
 
   private formatPerfLabel(): string {
-    const perf = this.opts.store.get("dspPerfUs");
-    if (perf.length < PERF_METRIC_NAMES.length) return "dsp: --";
-    const parts: string[] = [];
-    for (let i = 0; i < PERF_METRIC_NAMES.length; i++) {
-      const v = perf[i];
-      const formatted =
-        Number.isFinite(v) && v >= 0 ? `${Math.round(v)}µs` : "--";
-      parts.push(`${PERF_METRIC_NAMES[i]}=${formatted}`);
-    }
-    return `dsp: ${parts.join(" ")}`;
+    const perf = this.opts.store.get("dspPerf");
+    if (perf.length < 2) return "dsp: --";
+    const totalMs = perf[PERF_TOTAL_MS];
+    const freqHz = perf[PERF_FREQ_HZ];
+    const totalStr = Number.isFinite(totalMs)
+      ? `${totalMs.toFixed(2).padStart(5)}ms`
+      : "   --ms";
+    const freqStr = Number.isFinite(freqHz)
+      ? `${freqHz.toFixed(1).padStart(5)}Hz`
+      : "   --Hz";
+    return ` ${totalStr} ${freqStr}`;
   }
 
   dispose(): void {
@@ -108,23 +105,27 @@ export class DebugLabels {
     color: number,
     x: number,
     y: number,
+    anchorX: TextLabelAnchorX = "right",
+    anchorY: TextLabelAnchorY = "top",
   ): TextLabel {
     const label = new TextLabel({
       text,
       color,
-      background: "rgba(0, 0, 0, 0)",
-      height: 0.2,
-      textureWidth: 1536,
+      background: "rgba(0,0,0,0)",
+      height: 0.15,
       textureHeight: 128,
+      anchorX,
+      anchorY,
     });
-    label.object3d.position.set(x, y, 0.1);
+    label.object3d.position.set(x, y, 0);
     this.object3d.add(label.object3d);
     this.labels.push(label);
     return label;
   }
 
-  private formatNumber(value: number, digits: number): string {
-    if (value === undefined || Number.isNaN(value)) return "--";
-    return value.toFixed(digits);
+  private formatNumber(value: number, digits: number, width: number): string {
+    const s =
+      value === undefined || Number.isNaN(value) ? "--" : value.toFixed(digits);
+    return s.padStart(width);
   }
 }

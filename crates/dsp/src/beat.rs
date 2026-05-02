@@ -109,12 +109,12 @@ pub(crate) const MAX_PEAKS: usize = 50;
 const MIN_PEAK_SPACING: usize = 3;
 const MIN_BEAT_HYPOTHESIS_SPACING: f32 = 1.0;
 const PEAK_SCAN_MIN_BPM: f32 = 1.0;
-const BEAT_HYPOTHESIS_MIN_BPM: f32 = 40.0;
+const BEAT_HYPOTHESIS_MIN_BPM: f32 = 1.0;
 const BEAT_TRACKER_MAX_BPM: f32 = 220.0;
 const BEAT_PULSE_CYCLES: [f32; 4] = [1.0, 2.0, 4.0, 8.0];
 const TEA_GAUSSIAN_SIGMA_DEFAULT: f32 = 5.0;
 const TEA_TAU_DEFAULT_SECS: f32 = 4.0;
-const TEA_CANDIDATE_VOTE_COUNT: usize = 5;
+const TEA_CANDIDATE_VOTE_COUNT: usize = 50;
 const COMB_MAX_DIVISOR: usize = 8;
 const COMB_MAX_MULTIPLE: usize = 16;
 const COMB_ALIGNMENT_TOLERANCE: f32 = 2.0;
@@ -246,6 +246,13 @@ pub struct BeatState {
     beat_tau_max: usize,
     cand_scratch: Vec<(usize, f32)>,
     beat_scratch: Vec<(f32, f32, f32)>,
+    /// Tapered copy of onset history used only for the phase-extraction call
+    /// in `update_tea`. Linear weight `1 - d/(PULSE_N·τ)` clamped to [0,1],
+    /// where `d` is hops since `last`. Mutes a beat's contribution gradually
+    /// as it ages out of the comb's reach so the argmax doesn't step every τ
+    /// hops. NOT applied in `score_beat_hypotheses`'s per-hypothesis loop —
+    /// that scoring needs the raw comb response to disambiguate octaves.
+    onset_windowed: Vec<f32>,
     beat_lag: [f32; MAX_PEAKS],
     beat_comb_score: [f32; MAX_PEAKS],
     beat_comb_conf: [f32; MAX_PEAKS],
@@ -291,6 +298,7 @@ impl BeatState {
             beat_tau_max,
             cand_scratch: Vec::with_capacity(onset_acf_len / 2 + 1),
             beat_scratch: Vec::with_capacity(MAX_PEAKS * COMB_MAX_DIVISOR),
+            onset_windowed: vec![0.0; rms_history_len],
             beat_lag: [f32::NAN; MAX_PEAKS],
             beat_comb_score: [0.0; MAX_PEAKS],
             beat_comb_conf: [0.0; MAX_PEAKS],
@@ -747,7 +755,21 @@ impl BeatState {
             }
         }
         self.tau_smoothed = tau;
-        let (phi_cands, _, _, _) = score_phase_for_tau(onset, tau);
+        // Apply a linear taper to onset before phase extraction: weight
+        // `1 - d/(PULSE_N·τ)` clamped to [0,1] where `d = last - i`. Newest
+        // sample at full weight, oldest pulse-reach (k = PULSE_N - 1, i.e.
+        // d = (PULSE_N - 1)·τ) at weight 1/PULSE_N, anything beyond at zero.
+        // Without this, when a real beat ages past the deepest pulse `corr[phi]`
+        // steps and (with high PLL gain) the phase argmax flips visibly.
+        let n_onset = onset.len();
+        let reach = (PULSE_N as f32 * tau).max(1.0);
+        let inv_reach = 1.0 / reach;
+        for i in 0..n_onset {
+            let d = (n_onset - 1 - i) as f32;
+            let w = (1.0 - d * inv_reach).max(0.0);
+            self.onset_windowed[i] = w * onset[i];
+        }
+        let (phi_cands, _, _, _) = score_phase_for_tau(&self.onset_windowed, tau);
         // On non-drum content the per-φ correlation curve has multiple
         // near-equal local maxima; the global argmax flips frame-to-frame
         // and yanks the grid. Snap to the candidate nearest the PLL

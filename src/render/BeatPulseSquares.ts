@@ -5,6 +5,7 @@ export class BeatPulseSquares {
   private count: number;
   private materials: MeshBasicMaterial[] = [];
   private geometries: PlaneGeometry[] = [];
+  private meshObjects: Mesh[] = [];
 
   constructor() {
     this.count = 4;
@@ -14,12 +15,13 @@ export class BeatPulseSquares {
       const x = i - 1.5;
       const y = 0;
 
-      const geom = new PlaneGeometry(1, 0.2);
+      const geom = new PlaneGeometry(1, 1);
       const mat = new MeshBasicMaterial({ color: 0x0ff000 });
       const mesh = new Mesh(geom, mat);
-      mesh.position.set(x, y - 1.1, 0);
+      mesh.position.set(x, y - 1.5, 0);
       this.geometries.push(geom);
       this.materials.push(mat);
+      this.meshObjects.push(mesh);
       this.object3d.add(mesh);
     }
   }
@@ -28,8 +30,9 @@ export class BeatPulseSquares {
     for (let i = 0; i < this.count; i++) {
       const raw = beatData[i];
       const v = Number.isNaN(raw) ? 0 : Math.max(0, Math.min(1, raw));
-      this.materials[i].color.setRGB(v, v, v);
-      // this.object3d.scale.set(v,v,v);
+      const e = Math.pow(v, 0.5);
+      this.materials[i].color.setRGB(e, e, e);
+      this.meshObjects[i].scale.set(e, e, e);
     }
   }
 

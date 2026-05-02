@@ -28,7 +28,7 @@ describe("WorkletBridge", () => {
     localStorage.clear();
   });
 
-  it("bootstrap posts one configure + five param messages with current store values", () => {
+  it("bootstrap posts one configure + one param message per hot key with current store values", () => {
     const store = makeStore();
     const port = makePort();
     const bridge = new WorkletBridge(store, port);
@@ -66,7 +66,14 @@ describe("WorkletBridge", () => {
       key: "teaTauSecs",
       value: 4.0,
     });
-    expect(calls.length).toBe(6);
+    expect(calls).toContainEqual({
+      type: "param",
+      key: "autoGain",
+      value: 1.0,
+    });
+    // 1 configure + 9 hot keys (hopSize, smoothingTauSecs, onsetSmoothingTauSecs,
+    // dbFloor, teaTauSecs, teaSigma, acfSmoothingSigma, phaseLock, autoGain).
+    expect(calls.length).toBe(10);
   });
 
   it("windowSize change posts a configure message with both reconfig params", () => {

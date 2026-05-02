@@ -86,6 +86,16 @@ export const analysisSchemas: ParamSchema[] = [
     reconfig: false,
   },
   {
+    key: "dsp.acfDecay",
+    label: "ACF decay (s)",
+    kind: "continuous",
+    min: 0.0,
+    max: 20.0,
+    step: 0.001,
+    default: 2.0,
+    reconfig: false,
+  },
+  {
     key: "dsp.autoGain",
     label: "AutoGain τ (s)",
     kind: "continuous",

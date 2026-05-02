@@ -34,20 +34,20 @@ type LineStoreKey =
 interface LineSpec {
   key: LineStoreKey;
   color: number;
-  autoGain?: boolean;
   type?: "line" | "bar";
   scale?: TimeSeriesScale;
+  colorByValue?: boolean;
 }
 
 const LINE_COLORS: readonly LineSpec[] = [
   { key: "waveform", color: 0x66ffcc },
   { key: "bufferAcf", color: 0xcc99ff },
   { key: "spectrum", color: 0xffaa66, type: "bar", scale: "logx" },
-  { key: "rmsLow", color: 0xaa0000, type: "bar", autoGain: true },
-  { key: "rmsMid", color: 0x00aa00, type: "bar", autoGain: true },
-  { key: "rmsHigh", color: 0x0000aa, type: "bar", autoGain: true },
-  { key: "rms", color: 0xffffff, autoGain: true },
-  { key: "onset", type: "bar", color: 0xff9966, autoGain: true },
+  { key: "rmsLow", color: 0xaa0000, type: "bar", colorByValue: true },
+  { key: "rmsMid", color: 0x00aa00, type: "bar", colorByValue: true },
+  { key: "rmsHigh", color: 0x0000aa, type: "bar", colorByValue: true },
+  { key: "rms", color: 0xffffff, colorByValue: true },
+  { key: "onset", type: "bar", color: 0xff9966, colorByValue: true },
   { key: "onsetAcf", color: 0x6666bb },
   { key: "onsetAcfEnhanced", color: 0xff99cc },
   { key: "tea", color: 0xffff66 },
@@ -68,10 +68,10 @@ export class DebugView {
     this.deps.scene.add(this.beatPulseSquares.object3d);
 
     this.scrollingBeatGridMarkers = new BeatGridMarkers({
-      baseColor: 0x66ccff,
+      baseColor: 0xbbbbbb,
     });
     this.staticBeatGridMarkers = new StaticBeatGridMarkers({
-      baseColor: 0xffbb77,
+      baseColor: 0x888888,
     });
     this.deps.scene.add(this.scrollingBeatGridMarkers.object3d);
     this.deps.scene.add(this.staticBeatGridMarkers.object3d);
@@ -114,20 +114,14 @@ export class DebugView {
   }
 
   private createLines(): void {
-    const { store, scene, paramStore, audioContext } = this.deps;
+    const { store, scene } = this.deps;
 
     for (const spec of LINE_COLORS) {
       const options = {
         source: () => store.get(spec.key),
         color: spec.color,
         scale: spec.scale,
-        autoGain: spec.autoGain
-          ? {
-              tauSecs: () => paramStore.get("dsp.autoGain"),
-              dtSecs: () =>
-                paramStore.get("dsp.hopSize") / audioContext.sampleRate,
-            }
-          : undefined,
+        colorByValue: spec.colorByValue,
       };
       const line =
         spec.type === "bar"
@@ -168,8 +162,7 @@ export class DebugView {
     this.scrollingBeatGridMarkers.object3d.position.set(-2, 0, 0);
     this.scrollingBeatGridMarkers.object3d.scale.set(4, 1, 1);
 
-    this.staticBeatGridMarkers.object3d.position.set(-2, -1.5, 0);
-    this.staticBeatGridMarkers.object3d.scale.set(4, 1, 1);
+    this.staticBeatGridMarkers.object3d.position.set(-2, -1, 0);
 
     this.lines.get("onset")!.object3d.position.set(-2, 0, 0);
     this.lines.get("onset")!.object3d.scale.set(4, 0.5, 1);
@@ -177,12 +170,12 @@ export class DebugView {
     this.lines.get("onsetAcf")!.object3d.position.set(-2, -1, 0);
     this.lines.get("onsetAcf")!.object3d.scale.set(4, 5, 1);
 
-    this.lines.get("onsetAcfEnhanced")!.object3d.position.set(-2, -2, 0);
-    this.lines.get("onsetAcfEnhanced")!.object3d.scale.set(4, 2, 1);
-    this.peakMarkers.object3d.position.set(-2, -2, 0);
+    this.lines.get("onsetAcfEnhanced")!.object3d.position.set(-2, -1, 0);
+    this.lines.get("onsetAcfEnhanced")!.object3d.scale.set(4, 5, 1);
+    this.peakMarkers.object3d.position.set(-2, -1, 0);
     this.peakMarkers.object3d.scale.set(4, 1, 1);
 
-    this.lines.get("tea")!.object3d.position.set(-2, -2, 0);
+    this.lines.get("tea")!.object3d.position.set(-2, -1, 0);
     this.lines.get("tea")!.object3d.scale.set(4, 2, 1);
   }
 }

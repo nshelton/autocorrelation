@@ -2,6 +2,7 @@ import {
   AdditiveBlending,
   BufferAttribute,
   BufferGeometry,
+  Color,
   DynamicDrawUsage,
   Group,
   Line,
@@ -22,10 +23,14 @@ export class TimeSeriesLineRenderer extends TimeSeriesRenderer {
   private geometry?: BufferGeometry;
   private material?: LineBasicMaterial;
   private positions?: Float32Array;
+  private colors?: Float32Array;
   private positionAttribute?: BufferAttribute;
+  private colorAttribute?: BufferAttribute;
+  private readonly baseColor = new Color();
 
   constructor(opts: TimeSeriesRendererOptions) {
     super(opts);
+    this.baseColor.set(this.color);
     this.update();
   }
 
@@ -49,12 +54,16 @@ export class TimeSeriesLineRenderer extends TimeSeriesRenderer {
       this.object3d.remove(this.line);
     }
     this.positions = new Float32Array(n * 3);
+    this.colors = new Float32Array(n * 3);
     this.positionAttribute = new BufferAttribute(this.positions, 3);
     this.positionAttribute.setUsage(DynamicDrawUsage);
+    this.colorAttribute = new BufferAttribute(this.colors, 3);
+    this.colorAttribute.setUsage(DynamicDrawUsage);
     this.geometry = new BufferGeometry();
     this.geometry.setAttribute("position", this.positionAttribute);
+    this.geometry.setAttribute("color", this.colorAttribute);
     this.material = new LineBasicMaterial({
-      color: this.color,
+      vertexColors: true,
       blending: AdditiveBlending,
       transparent: true,
       opacity: 1,
@@ -67,12 +76,20 @@ export class TimeSeriesLineRenderer extends TimeSeriesRenderer {
 
   protected writeOne(i: number, _n: number, x: number, y: number): void {
     const p = this.positions!;
-    p[i * 3] = x;
-    p[i * 3 + 1] = y;
-    p[i * 3 + 2] = 0;
+    const off = i * 3;
+    p[off] = x;
+    p[off + 1] = y;
+    p[off + 2] = 0;
+
+    const brightness = this.brightnessForValue(y);
+    const c = this.colors!;
+    c[off] = this.baseColor.r * brightness;
+    c[off + 1] = this.baseColor.g * brightness;
+    c[off + 2] = this.baseColor.b * brightness;
   }
 
   protected commit(): void {
     if (this.positionAttribute) this.positionAttribute.needsUpdate = true;
+    if (this.colorAttribute) this.colorAttribute.needsUpdate = true;
   }
 }

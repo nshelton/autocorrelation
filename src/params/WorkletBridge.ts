@@ -8,7 +8,9 @@ const HOT_KEYS = [
   "teaTauSecs",
   "teaSigma",
   "acfSmoothingSigma",
+  "acfDecay",
   "phaseLock",
+  "autoGain",
 ] as const;
 
 export class WorkletBridge {
