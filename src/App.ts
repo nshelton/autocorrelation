@@ -1,4 +1,7 @@
 import { Vector3 } from "three";
+import { PostProcessing } from "three/webgpu";
+import { pass, mrt, output, transformedNormalView } from "three/tsl";
+import { ao } from "./render/GTAONode.js";
 import { createSceneAndCamera } from "./render/Scene";
 import { CameraRig } from "./render/CameraRig";
 import { DebugView } from "./render/debug/DebugView";
@@ -32,6 +35,7 @@ export class App {
   private resizeHandler: () => void = () => {};
   private debugView!: DebugView;
   private boxView!: BoxView;
+  private post!: PostProcessing;
 
   constructor(private deps: AppDeps) {}
 
@@ -51,6 +55,21 @@ export class App {
       store: this.store,
       paramStore,
     });
+
+    // Post-processing: scene pass with MRT (color + view-space normal) → GTAO → multiply.
+    const scenePass = pass(scene, camera);
+    scenePass.setMRT(
+      mrt({
+        output,
+        normal: transformedNormalView,
+      }),
+    );
+    const sceneColor = scenePass.getTextureNode("output");
+    const sceneNormal = scenePass.getTextureNode("normal");
+    const sceneDepth = scenePass.getTextureNode("depth");
+    const aoNode = ao(sceneDepth, sceneNormal, camera);
+    this.post = new PostProcessing(renderer);
+    this.post.outputNode = sceneColor.mul(aoNode);
 
     this.rig = new CameraRig(camera);
     this.rig.addPreset("front", {
@@ -124,7 +143,7 @@ export class App {
       this.rig.update(dt);
       this.debugView.update();
       this.boxView.update();
-      renderer.render(scene, camera);
+      void this.post.renderAsync();
       this.fps.end();
       this.rafHandle = requestAnimationFrame(loop);
     };

@@ -1,11 +1,21 @@
 import {
   Scene,
   InstancedMesh,
+  InstancedBufferAttribute,
   BoxGeometry,
-  MeshBasicMaterial,
   Object3D,
   Color,
 } from "three";
+import { MeshBasicNodeMaterial } from "three/webgpu";
+import {
+  vec3,
+  vec4,
+  float,
+  dot,
+  max,
+  normalWorld,
+  instancedBufferAttribute,
+} from "three/tsl";
 import RAPIER from "@dimforge/rapier3d-compat";
 import type { FeatureStore } from "../store/FeatureStore";
 import type { ParamStore } from "../params/ParamStore";
@@ -16,13 +26,13 @@ export interface BoxViewDeps {
   paramStore: ParamStore;
 }
 
-const BOX_COUNT = 100;
+const BOX_COUNT = 1024;
 const CONTAINER_HALF = 1.5;
 const BASE_SIZE = 0.12;
-// Rest line: boxes spaced along X, centered at origin. Spacing chosen so 100 boxes fit inside the container.
-const REST_SPACING = 0.025;
-// Per-frame velocity nudge toward rest position (units of 1/frame). Tune for snappier vs. softer pull.
-const PULL = 0.01;
+// Rest line: boxes spaced along X, centered at origin.
+const REST_SPACING = 0.0025;
+// Per-frame velocity nudge toward rest position.
+const PULL = 0.5;
 
 export class BoxView {
   private scene: Scene;
@@ -44,15 +54,32 @@ export class BoxView {
     await RAPIER.init();
     if (this.disposed) return;
 
-    // Zero gravity: boxes float and only collide with each other / walls.
     const world = new RAPIER.World({ x: 0, y: 0, z: 0 });
+    world.timestep = 1 / 60;
 
     const c = CONTAINER_HALF;
 
+    // Per-instance HSL colors. Owned by us (not via setColorAt) so the auto-instance-color
+    // path in NodeMaterial doesn't kick in and clobber our custom colorNode.
+    const colorArr = new Float32Array(BOX_COUNT * 3);
+    const tmpColor = new Color();
+    for (let i = 0; i < BOX_COUNT; i++) {
+      tmpColor.setHSL(i / BOX_COUNT, 0.7, 0.6);
+      tmpColor.toArray(colorArr, i * 3);
+    }
+    const colorAttr = new InstancedBufferAttribute(colorArr, 3);
+
+    const mat = new MeshBasicNodeMaterial();
+    const instColor = vec3(instancedBufferAttribute(colorAttr, "vec3", 3, 0));
+    // Hardcoded normalized world-space light direction (≈ from upper-right-front).
+    const lightDir = vec3(0.408, 0.866, 0.306);
+    const ndotl = max(dot(normalWorld, lightDir), float(0.0));
+    // 0.3 ambient + 0.7 lambert. Multiplied by per-instance albedo.
+    const lit = ndotl.mul(0.7).add(0.3);
+    mat.colorNode = vec4(instColor.mul(lit), 1.0);
+
     const geom = new BoxGeometry(BASE_SIZE, BASE_SIZE, BASE_SIZE);
-    const mat = new MeshBasicMaterial({ color: 0xffffff });
     const mesh = new InstancedMesh(geom, mat, BOX_COUNT);
-    const color = new Color();
 
     const half = BASE_SIZE / 2;
     for (let i = 0; i < BOX_COUNT; i++) {
@@ -72,8 +99,8 @@ export class BoxView {
             y: (Math.random() - 0.5) * 2,
             z: (Math.random() - 0.5) * 2,
           })
-          .setLinearDamping(0.01)
-          .setAngularDamping(0.01),
+          .setLinearDamping(0.5)
+          .setAngularDamping(0.5),
       );
       const collider = world.createCollider(
         RAPIER.ColliderDesc.cuboid(half, half, half).setRestitution(0.9),
@@ -81,9 +108,6 @@ export class BoxView {
       );
       this.bodies.push(body);
       this.colliders.push(collider);
-
-      color.setHSL(i / BOX_COUNT, 0.7, 0.6);
-      mesh.setColorAt(i, color);
     }
 
     this.world = world;
@@ -105,8 +129,6 @@ export class BoxView {
       const t = b.translation();
       const r = b.rotation();
 
-      // Soft pull toward rest position (i, 0, 0) along X line. Adds to velocity each frame;
-      // existing linearDamping eventually settles it. Collisions still nudge boxes off-line.
       const restX = (i - halfCount) * REST_SPACING;
       const vel = b.linvel();
       b.setLinvel(
@@ -124,10 +146,9 @@ export class BoxView {
           specLen - 1,
           Math.floor((i / BOX_COUNT) * specLen * 0.25),
         );
-        s = 0.4 + spec[bin] * 6.0;
+        s = 0.1 + spec[bin] * 3.0;
       }
 
-      // Sync collider half-extents to the visual scale so physics matches what's drawn.
       const h = baseHalf * s;
       this.colliders[i].setHalfExtents({ x: h, y: h, z: h });
 
@@ -145,7 +166,7 @@ export class BoxView {
     if (this.mesh) {
       this.scene.remove(this.mesh);
       this.mesh.geometry.dispose();
-      (this.mesh.material as MeshBasicMaterial).dispose();
+      (this.mesh.material as MeshBasicNodeMaterial).dispose();
       this.mesh.dispose();
       this.mesh = null;
     }
