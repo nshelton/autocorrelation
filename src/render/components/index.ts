@@ -6,6 +6,6 @@ import type { ComponentClass } from "./Component";
 // order of folders in the tweakpane panel. Add a new component: import it
 // here and append to this array.
 export const COMPONENTS: readonly ComponentClass[] = [
-  DebugView,
-  BoxView,
+  DebugView as unknown as ComponentClass,
+  BoxView as unknown as ComponentClass,
 ];

@@ -49,10 +49,10 @@ export class BoxView implements Component {
   private dummy = new Object3D();
   private disposed = false;
 
-  constructor(deps: ComponentDeps, params?: Record<string, number>) {
+  constructor(deps: ComponentDeps, params: Record<string, number>) {
     this.scene = deps.scene;
     this.store = deps.store;
-    this.params = params || {};
+    this.params = params;
     void this.init();
   }
 
