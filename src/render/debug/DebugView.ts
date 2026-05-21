@@ -1,4 +1,4 @@
-import { Scene, Object3D } from "three";
+import { Object3D } from "three";
 import { DebugGrid } from "./DebugGrid";
 import { BeatGridMarkers } from "./BeatGridMarkers";
 import { StaticBeatGridMarkers } from "./StaticBeatGridMarkers";
@@ -6,16 +6,8 @@ import { DebugLabels } from "./DebugLabels";
 import { TimeSeriesRenderer, type TimeSeriesScale } from "./TimeSeriesRenderer";
 import { TimeSeriesBarRenderer } from "./TimeSeriesBarRenderer";
 import { TimeSeriesLineRenderer } from "./TimeSeriesLineRenderer";
-import type { FeatureStore } from "../../store/FeatureStore";
-import type { ParamStore } from "../../params/ParamStore";
 import { BeatPulseSquares } from "./BeatPulseSquares";
-
-export interface DebugViewDeps {
-  scene: Scene;
-  store: FeatureStore;
-  paramStore: ParamStore;
-  audioContext: AudioContext;
-}
+import type { Component, ComponentDeps } from "../components/Component";
 
 type LineStoreKey =
   | "waveform"
@@ -50,7 +42,7 @@ const LINE_COLORS: readonly LineSpec[] = [
   { key: "onsetAcfEnhanced", color: 0x00ffff },
 ];
 
-export class DebugView {
+export class DebugView implements Component {
   static id = "debugView";
   static label = "Debug View";
 
@@ -61,7 +53,7 @@ export class DebugView {
   private beatPulseSquares: BeatPulseSquares;
   private labels: DebugLabels;
 
-  constructor(private deps: DebugViewDeps) {
+  constructor(private deps: ComponentDeps) {
     this.beatPulseSquares = new BeatPulseSquares();
     this.deps.scene.add(this.beatPulseSquares.object3d);
 
