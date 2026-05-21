@@ -52,6 +52,7 @@ export class WorkletBridge {
   }
 
   private handleChange(key: string): void {
+    if (typeof this.store.get(key) !== "number") return;
     if (key === "dsp.windowSize" || key === "dsp.rmsHistoryLen") {
       this.port.postMessage({
         type: "configure",

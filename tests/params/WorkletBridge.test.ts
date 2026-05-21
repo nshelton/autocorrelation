@@ -155,4 +155,20 @@ describe("WorkletBridge", () => {
     store.set("dsp.smoothingTauSecs", 0.05);
     expect(port.posted).toHaveLength(0);
   });
+
+  it("ignores component toggle keys (they never produce worklet messages)", () => {
+    const store = makeStore();
+    store.register({
+      key: "components.boxView.enabled",
+      label: "Box View enabled",
+      kind: "boolean",
+      default: true,
+      reconfig: false,
+    });
+    const port = makePort();
+    new WorkletBridge(store, port);
+    (port.postMessage as ReturnType<typeof vi.fn>).mockClear();
+    store.set("components.boxView.enabled", false);
+    expect(port.postMessage).not.toHaveBeenCalled();
+  });
 });
