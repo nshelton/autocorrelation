@@ -32,21 +32,21 @@ export class ParamPanel {
   }
 
   private addWidget(folder: ReturnType<Pane["addFolder"]>, schema: ParamSchema) {
+    if (schema.kind === "boolean") {
+      // tweakpane infers a checkbox from the boolean field type.
+      return folder.addBinding(this.bindings, schema.key, { label: schema.label });
+    }
     if (schema.kind === "discrete") {
       return folder.addBinding(this.bindings, schema.key, {
         label: schema.label,
         options: Object.fromEntries(schema.options.map((v) => [String(v), v])),
       });
     }
-    if (schema.kind === "continuous") {
-      return folder.addBinding(this.bindings, schema.key, {
-        label: schema.label,
-        min: schema.min,
-        max: schema.max,
-        step: schema.step,
-      });
-    }
-    // boolean kind — Task 3 will replace this with a proper checkbox widget.
-    return folder.addBinding(this.bindings, schema.key, { label: schema.label });
+    return folder.addBinding(this.bindings, schema.key, {
+      label: schema.label,
+      min: schema.min,
+      max: schema.max,
+      step: schema.step,
+    });
   }
 }
