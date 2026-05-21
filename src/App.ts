@@ -5,10 +5,10 @@ import { pass, mrt, output, transformedNormalView } from "three/tsl";
 import { ao } from "./render/GTAONode.js";
 import { createSceneAndCamera } from "./render/Scene";
 import { CameraRig } from "./render/CameraRig";
-import { DebugView } from "./render/debug/DebugView";
 import { FeatureStore } from "./store/FeatureStore";
 import { FpsOverlay } from "./ui/Stats";
-import { BoxView } from "./render/components/BoxView";
+import { ComponentManager } from "./render/components/ComponentManager";
+import { COMPONENTS } from "./render/components";
 
 import type { ParamStore } from "./params/ParamStore";
 import type { WebGPURenderer } from "three/webgpu";
@@ -26,14 +26,6 @@ type WorkletMsg = {
   buffers: Record<string, Float32Array>;
 };
 
-// Convention for views that want auto-bound, persisted UI params.
-// Expose live values, tweakpane metadata, and a namespace prefix.
-export interface ViewWithParams {
-  params: Record<string, number>;
-  paramOpts: Record<string, { min: number; max: number; step?: number }>;
-  paramPrefix: string;
-}
-
 export class App {
   private rig!: CameraRig;
   private store = new FeatureStore();
@@ -42,10 +34,8 @@ export class App {
   private rafHandle: number | null = null;
   private keydownHandler: (e: KeyboardEvent) => void = () => {};
   private resizeHandler: () => void = () => {};
-  private debugView!: DebugView;
-  private boxView!: BoxView;
+  private components!: ComponentManager;
   private post!: PostProcessing;
-  private uiUnsubs: Array<() => void> = [];
 
   constructor(private deps: AppDeps) {}
 
@@ -53,18 +43,17 @@ export class App {
     const { renderer, workletNode, paramStore, audioContext } = this.deps;
 
     const { scene, camera } = createSceneAndCamera();
-    this.debugView = new DebugView({
-      scene,
-      store: this.store,
-      paramStore,
-      audioContext,
-    });
 
-    this.boxView = new BoxView({
-      scene,
-      store: this.store,
-      paramStore,
-    });
+    this.components = new ComponentManager(
+      {
+        scene,
+        store: this.store,
+        paramStore,
+        audioContext,
+      },
+      COMPONENTS,
+    );
+    this.components.start();
 
     // Post-processing: scene pass with MRT (color + view-space normal) → GTAO → multiply.
     const scenePass = pass(scene, camera);
@@ -151,8 +140,7 @@ export class App {
       const dt = this.last === 0 ? 0 : (now - this.last) / 1000;
       this.last = now;
       this.rig.update(dt);
-      this.debugView.update();
-      this.boxView.update();
+      this.components.update();
       void this.post.renderAsync();
       this.fps.end();
       this.rafHandle = requestAnimationFrame(loop);
@@ -161,51 +149,7 @@ export class App {
   }
 
   bindUI(pane: import("tweakpane").Pane): void {
-    // Add new persistent views here — convention does the rest.
-    this.bindViewParams(this.boxView, pane);
-  }
-
-  // Wires a view's params/paramOpts/paramPrefix into ParamStore + tweakpane.
-  // Side effects: registers schemas, restores persisted values into view.params,
-  // adds a folder under the prefix, and propagates external store updates back
-  // to view.params so the reset button & cross-source writes work.
-  private bindViewParams(
-    view: ViewWithParams,
-    pane: import("tweakpane").Pane,
-  ): void {
-    const store = this.deps.paramStore;
-    const folder = pane.addFolder({ title: view.paramPrefix });
-
-    for (const [k, opts] of Object.entries(view.paramOpts)) {
-      const key = `${view.paramPrefix}.${k}`;
-      store.register({
-        key,
-        label: k,
-        kind: "continuous",
-        reconfig: false,
-        default: view.params[k],
-        min: opts.min,
-        max: opts.max,
-        step: opts.step ?? (opts.max - opts.min) / 100,
-      });
-      // Pull back the (possibly persisted) value the store now holds.
-      view.params[k] = store.get(key) as number;
-      folder
-        .addBinding(view.params, k, opts)
-        .on("change", (e: { value: number }) => store.set(key, e.value));
-    }
-
-    this.uiUnsubs.push(
-      store.subscribe((key, value) => {
-        const prefix = view.paramPrefix + ".";
-        if (!key.startsWith(prefix)) return;
-        const local = key.slice(prefix.length);
-        if (local in view.params) {
-          view.params[local] = value as number;
-          pane.refresh();
-        }
-      }),
-    );
+    this.components.bindUI(pane);
   }
 
   dispose(): void {
@@ -215,10 +159,7 @@ export class App {
     }
     window.removeEventListener("keydown", this.keydownHandler);
     window.removeEventListener("resize", this.resizeHandler);
-    this.uiUnsubs.forEach((u) => u());
-    this.uiUnsubs = [];
-    this.debugView?.dispose();
-    this.boxView?.dispose();
+    this.components?.dispose();
     this.fps.unmount();
     this.deps.workletNode.port.onmessage = null;
   }
