@@ -65,6 +65,7 @@ export class ParticleView implements Component {
 
   private params: Record<string, number>;
   private scene: ComponentDeps["scene"];
+  private paramStore: ComponentDeps["paramStore"];
   private numParticles: number;
   private mesh: InstancedMesh | null = null;
   private world: RAPIER.World | null = null;
@@ -79,10 +80,12 @@ export class ParticleView implements Component {
   private curlNoise!: (x: number, y: number, z: number, out: Float32Array) => void;
   private lastNoiseScale = NaN;
   private lastDamping = NaN;
+  private storeUnsub: (() => void) | null = null;
   private disposed = false;
 
   constructor(deps: ComponentDeps, params: Record<string, number>) {
     this.scene = deps.scene;
+    this.paramStore = deps.paramStore;
     this.params = params;
     this.numParticles = Math.round(params.numParticles);
     void this.init();
@@ -122,6 +125,22 @@ export class ParticleView implements Component {
     mesh.count = this.numParticles;
     this.mesh = mesh;
     this.scene.add(mesh);
+
+    // Listen for reconfig param changes. Hot params (lifetime, noiseScale,
+    // noiseStrength, restitution, attractorStrength, attractorMinRadius,
+    // damping) are read from this.params each frame via the bag — no
+    // subscription needed. Reconfig params require structural rebuilds.
+    this.storeUnsub = this.paramStore.subscribe((key, value) => {
+      if (this.disposed) return;
+      if (key === "particleView.numParticles" && typeof value === "number") {
+        const n = Math.round(value);
+        if (n !== this.numParticles) {
+          this.rebuildBodies(n);
+        }
+      } else if (key === "particleView.containerSize" && typeof value === "number") {
+        this.rebuildWalls(value);
+      }
+    });
   }
 
   private addWalls(half: number): void {
@@ -198,6 +217,31 @@ export class ParticleView implements Component {
     this.colliders[i].setRadius(BASE_RADIUS * newScale * COLLISION_RATIO);
   }
 
+  private rebuildBodies(n: number): void {
+    if (!this.world || !this.mesh) return;
+    // Free the entire world (drops all bodies + colliders), recreate it,
+    // re-add walls, spawn the new body pool. The InstancedMesh and SoA
+    // arrays persist — we just change mesh.count and reuse the storage.
+    this.world.free();
+    this.bodies = [];
+    this.colliders = [];
+    this.wallColliders = [];
+    this.world = new RAPIER.World({ x: 0, y: 0, z: 0 });
+    this.addWalls(this.params.containerSize);
+    this.spawnBodies(n);
+    this.numParticles = n;
+    this.mesh.count = n;
+    // Force lastDamping reset so the next frame re-applies it to the new bodies.
+    this.lastDamping = NaN;
+  }
+
+  private rebuildWalls(half: number): void {
+    if (!this.world) return;
+    for (const c of this.wallColliders) this.world.removeCollider(c, false);
+    this.wallColliders = [];
+    this.addWalls(half);
+  }
+
   update(): void {
     if (!this.world || !this.mesh) return;
     const noiseStrength = this.params.noiseStrength;
@@ -272,6 +316,8 @@ export class ParticleView implements Component {
 
   dispose(): void {
     this.disposed = true;
+    this.storeUnsub?.();
+    this.storeUnsub = null;
     if (this.mesh) {
       this.scene.remove(this.mesh);
       this.mesh.geometry.dispose();
