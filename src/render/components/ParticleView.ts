@@ -23,7 +23,6 @@ import type { Component, ComponentDeps } from "./Component";
 const MAX_PARTICLES = 10000;
 const BASE_RADIUS = 0.04;
 const COLLISION_RATIO = 0.5;
-const SPAWN_POINT = { x: 0, y: 0, z: 0 };
 const ATTRACTOR_POSITION = { x: 0.5, y: 0, z: 0 };
 // Scale factor random range. Visual radius = BASE_RADIUS * scale.
 const SCALE_MIN = 0.5;
@@ -41,23 +40,25 @@ export class ParticleView implements Component {
     lifetime: { min: 1, max: 10, step: 0.1 },
     noiseScale: { min: 0.1, max: 5.0, step: 0.05 },
     noiseStrength: { min: 0, max: 20, step: 0.1 },
-    containerSize: { min: 0.5, max: 4, step: 0.05 },
     restitution: { min: 0, max: 1, step: 0.01 },
     damping: { min: 0, max: 2, step: 0.01 },
     attractorStrength: { min: 0, max: 50, step: 0.1 },
     attractorRadius: { min: 0.05, max: 1.0, step: 0.01 },
+    spawnRadius: { min: 0.1, max: 3.0, step: 0.05 },
+    swirlStrength: { min: 0, max: 20, step: 0.1 },
   };
   static paramDefaults = {
     numParticles: 2000,
     timescale: 1.0,
     lifetime: 3,
     noiseScale: 1.5,
-    noiseStrength: 5,
-    containerSize: 1.5,
+    noiseStrength: 2,
     restitution: 0.6,
     damping: 0.2,
     attractorStrength: 5,
     attractorRadius: 0.25,
+    spawnRadius: 1.0,
+    swirlStrength: 3,
   };
   static paramKinds = {
     numParticles: "discrete" as const,
@@ -74,7 +75,6 @@ export class ParticleView implements Component {
   private world: RAPIER.World | null = null;
   private bodies: RAPIER.RigidBody[] = [];
   private colliders: RAPIER.Collider[] = [];
-  private wallColliders: RAPIER.Collider[] = [];
   private attractorCollider: RAPIER.Collider | null = null;
   private attractorMesh: Mesh | null = null;
   private lifetimes!: Float32Array;
@@ -82,6 +82,9 @@ export class ParticleView implements Component {
   private scales!: Float32Array;
   private dummy = new Object3D();
   private curlOut = new Float32Array(3);
+  // Scratch buffer for orbital initial conditions: [px, py, pz, vx, vy, vz].
+  // Reused across every spawn/respawn call to avoid per-particle allocation.
+  private spawnState = new Float32Array(6);
   private curlNoise!: (x: number, y: number, z: number, out: Float32Array) => void;
   private lastNoiseScale = NaN;
   private lastDamping = NaN;
@@ -111,7 +114,6 @@ export class ParticleView implements Component {
     this.curlNoise = createCurlNoise({ scale: this.params.noiseScale });
 
     this.world = new RAPIER.World({ x: 0, y: 0, z: 0 });
-    this.addWalls(this.params.containerSize);
     this.addAttractor(this.params.attractorRadius);
     this.spawnBodies(this.numParticles);
 
@@ -138,9 +140,9 @@ export class ParticleView implements Component {
     this.lastNoiseScale = this.params.noiseScale;
 
     // Listen for reconfig param changes. Hot params (lifetime, noiseScale,
-    // noiseStrength, restitution, attractorStrength, attractorMinRadius,
-    // damping) are read from this.params each frame via the bag — no
-    // subscription needed. Reconfig params require structural rebuilds.
+    // noiseStrength, restitution, attractorStrength, attractorRadius,
+    // spawnRadius, swirlStrength, timescale, damping) are read from
+    // this.params each frame via the bag — no subscription needed.
     this.storeUnsub = this.paramStore.subscribe((key, value) => {
       if (this.disposed) return;
       if (key === "particleView.numParticles" && typeof value === "number") {
@@ -148,37 +150,8 @@ export class ParticleView implements Component {
         if (n !== this.numParticles) {
           this.rebuildBodies(n);
         }
-      } else if (key === "particleView.containerSize" && typeof value === "number") {
-        this.rebuildWalls(value);
       }
     });
-  }
-
-  private addWalls(half: number): void {
-    if (!this.world) return;
-    // Six thin static box colliders forming a closed cube of half-extent
-    // `half`. Thin so they don't visibly occupy the scene; restitution from
-    // the body side dominates the bounce.
-    const t = 0.05; // wall thickness
-    const make = (
-      hx: number,
-      hy: number,
-      hz: number,
-      x: number,
-      y: number,
-      z: number,
-    ) => {
-      const desc = RAPIER.ColliderDesc.cuboid(hx, hy, hz)
-        .setTranslation(x, y, z)
-        .setRestitution(this.params.restitution);
-      this.wallColliders.push(this.world!.createCollider(desc));
-    };
-    make(t, half + t, half + t, half + t, 0, 0); // +x
-    make(t, half + t, half + t, -(half + t), 0, 0); // -x
-    make(half + t, t, half + t, 0, half + t, 0); // +y
-    make(half + t, t, half + t, 0, -(half + t), 0); // -y
-    make(half + t, half + t, t, 0, 0, half + t); // +z
-    make(half + t, half + t, t, 0, 0, -(half + t)); // -z
   }
 
   // Allocate the InstancedMesh to *exactly* `n` instances, not MAX_PARTICLES.
@@ -230,25 +203,52 @@ export class ParticleView implements Component {
     );
   }
 
+  // Write orbital initial conditions for a single particle into spawnState:
+  // position = random point on a sphere of radius spawnRadius around the
+  // attractor; velocity = tangential, magnitude = sqrt(attractorStrength).
+  // For our 1/r force law, v = sqrt(strength) is the circular-orbit speed
+  // (independent of radius), so freshly spawned particles immediately settle
+  // into roughly circular orbits. 0.8..1.2 jitter so they aren't synced.
+  private orbitalInit(): void {
+    const r = this.params.spawnRadius;
+    // Uniformly random unit vector on the unit sphere.
+    const theta = Math.random() * Math.PI * 2;
+    const phi = Math.acos(2 * Math.random() - 1);
+    const sinPhi = Math.sin(phi);
+    const dx = sinPhi * Math.cos(theta);
+    const dy = sinPhi * Math.sin(theta);
+    const dz = Math.cos(phi);
+    // Tangential direction = normalize(cross(d, up)). Use Y as the up axis;
+    // fall back to X when d is near-parallel to Y so the cross isn't degenerate.
+    let ax = 0, ay = 1, az = 0;
+    if (Math.abs(dy) > 0.95) { ax = 1; ay = 0; az = 0; }
+    let tx = dy * az - dz * ay;
+    let ty = dz * ax - dx * az;
+    let tz = dx * ay - dy * ax;
+    const tmag = Math.sqrt(tx * tx + ty * ty + tz * tz);
+    tx /= tmag; ty /= tmag; tz /= tmag;
+    const speed = Math.sqrt(this.params.attractorStrength) * (0.8 + Math.random() * 0.4);
+    this.spawnState[0] = ATTRACTOR_POSITION.x + dx * r;
+    this.spawnState[1] = ATTRACTOR_POSITION.y + dy * r;
+    this.spawnState[2] = ATTRACTOR_POSITION.z + dz * r;
+    this.spawnState[3] = tx * speed;
+    this.spawnState[4] = ty * speed;
+    this.spawnState[5] = tz * speed;
+  }
+
   private spawnBodies(n: number): void {
     if (!this.world) return;
-    const c = this.params.containerSize;
+    const s = this.spawnState;
     for (let i = 0; i < n; i++) {
-      const x = (Math.random() - 0.5) * 2 * c * 0.7;
-      const y = (Math.random() - 0.5) * 2 * c * 0.7;
-      const z = (Math.random() - 0.5) * 2 * c * 0.7;
+      this.orbitalInit();
       const scale = SCALE_MIN + Math.random() * (SCALE_MAX - SCALE_MIN);
       this.scales[i] = scale;
       this.maxLifetimes[i] = this.params.lifetime + Math.random() * LIFETIME_JITTER_SECS;
       this.lifetimes[i] = Math.random() * this.maxLifetimes[i]; // stagger initial expirations
       const body = this.world.createRigidBody(
         RAPIER.RigidBodyDesc.dynamic()
-          .setTranslation(x, y, z)
-          .setLinvel(
-            (Math.random() - 0.5),
-            (Math.random() - 0.5),
-            (Math.random() - 0.5),
-          )
+          .setTranslation(s[0], s[1], s[2])
+          .setLinvel(s[3], s[4], s[5])
           .setLinearDamping(this.params.damping)
           .setAngularDamping(this.params.damping),
       );
@@ -268,11 +268,10 @@ export class ParticleView implements Component {
     this.scales[i] = newScale;
     this.maxLifetimes[i] = this.params.lifetime + Math.random() * LIFETIME_JITTER_SECS;
     this.lifetimes[i] = this.maxLifetimes[i];
-    body.setTranslation(SPAWN_POINT, true);
-    body.setLinvel(
-      { x: (Math.random() - 0.5), y: (Math.random() - 0.5), z: (Math.random() - 0.5) },
-      true,
-    );
+    this.orbitalInit();
+    const s = this.spawnState;
+    body.setTranslation({ x: s[0], y: s[1], z: s[2] }, true);
+    body.setLinvel({ x: s[3], y: s[4], z: s[5] }, true);
     body.setAngvel({ x: 0, y: 0, z: 0 }, true);
     this.colliders[i].setRadius(BASE_RADIUS * newScale * COLLISION_RATIO);
   }
@@ -286,9 +285,7 @@ export class ParticleView implements Component {
     this.world.free();
     this.bodies = [];
     this.colliders = [];
-    this.wallColliders = [];
     this.world = new RAPIER.World({ x: 0, y: 0, z: 0 });
-    this.addWalls(this.params.containerSize);
     this.addAttractor(this.params.attractorRadius);
     this.spawnBodies(n);
     this.disposeInstancedMesh();
@@ -302,19 +299,12 @@ export class ParticleView implements Component {
     this.lastTimescale = NaN;
   }
 
-  private rebuildWalls(half: number): void {
-    if (!this.world) return;
-    for (const c of this.wallColliders) this.world.removeCollider(c, false);
-    this.wallColliders = [];
-    this.addWalls(half);
-    this.lastRestitution = NaN;
-  }
-
   update(): void {
     if (!this.world || !this.mesh) return;
     const noiseStrength = this.params.noiseStrength;
     const attractorStrength = this.params.attractorStrength;
     const attractorRadius = this.params.attractorRadius;
+    const swirlStrength = this.params.swirlStrength;
     // noiseScale is a hot param — re-create the noise function only when
     // the slider value changes. createCurlNoise's `scale` is closed over
     // at construction, so there's no per-call way to vary it.
@@ -336,7 +326,6 @@ export class ParticleView implements Component {
     if (this.params.restitution !== this.lastRestitution) {
       const r = this.params.restitution;
       for (const c of this.colliders) c.setRestitution(r);
-      for (const c of this.wallColliders) c.setRestitution(r);
       if (this.attractorCollider) this.attractorCollider.setRestitution(r);
       this.lastRestitution = r;
     }
@@ -399,11 +388,20 @@ export class ParticleView implements Component {
         az = dz * k;
       }
 
+      // Swirl: rigid-rotation field around the Y axis through the attractor.
+      // cross((0, 1, 0), (p - attractor)) = (pz - Az, 0, -(px - Ax)).
+      // Magnitude scales with distance from the axis, so every particle has
+      // the same angular velocity — clean orbital look.
+      const swDx = t.x - ATTRACTOR_POSITION.x;
+      const swDz = t.z - ATTRACTOR_POSITION.z;
+      const sx = swDz * swirlStrength;
+      const sz = -swDx * swirlStrength;
+
       body.setLinvel(
         {
-          x: v.x + this.curlOut[0] * noiseStrength * dt + ax * dt,
+          x: v.x + this.curlOut[0] * noiseStrength * dt + ax * dt + sx * dt,
           y: v.y + this.curlOut[1] * noiseStrength * dt + ay * dt,
-          z: v.z + this.curlOut[2] * noiseStrength * dt + az * dt,
+          z: v.z + this.curlOut[2] * noiseStrength * dt + az * dt + sz * dt,
         },
         true,
       );
@@ -437,7 +435,6 @@ export class ParticleView implements Component {
     }
     this.bodies = [];
     this.colliders = [];
-    this.wallColliders = [];
     this.attractorCollider = null;
   }
 }
