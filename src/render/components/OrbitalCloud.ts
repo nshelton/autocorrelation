@@ -9,6 +9,21 @@ import { evalShTsl } from "../orbital/sh-basis";
 import { evalRadialTsl } from "../orbital/radial";
 import type { Component, ComponentDeps } from "./Component";
 
+const PSI_EPS = 1e-4;
+
+// TSL Fn that returns ψ(pos). Used both for sign read-out and finite-difference
+// gradient inside the compute kernel.
+const evalPsi = Fn(([pos, shCoefs, n, radialScale]: [any, any, any, any]) => {
+  const rLen = pos.length().max(1e-6);
+  const rScaled = rLen.div(radialScale);
+  const xh = pos.x.div(rLen);
+  const yh = pos.y.div(rLen);
+  const zh = pos.z.div(rLen);
+  const R = evalRadialTsl(rScaled, n);
+  const Y = evalShTsl(shCoefs, xh, yh, zh);
+  return R.mul(Y);
+});
+
 // ---- coefficient layout (must match sh-basis.ts) ----
 const SH_LABELS = [
   "c_0_0",
@@ -142,10 +157,12 @@ export class OrbitalCloud implements Component {
       frame:       uniform(0),
       n:           uniform(this.params.n),
       radialScale: uniform(this.params.radialScale),
+      driftGain:   uniform(this.params.driftGain),
       shCoefs,
     };
 
-    // Compute kernel: pos += diffusion * randn(3) * sqrt(dt).
+    // Compute kernel: drift up ∇log|ψ|² + diffusion * randn(3) * sqrt(dt).
+    // Drift uses central finite differences (6 extra ψ evals per particle).
     // randn produced via hash() of (instanceIndex, frame) per axis,
     // Box-Muller-approximated: uniform [0,1) → [-0.5, 0.5) × √12 gives
     // variance 1. Visually indistinguishable from gaussian at these magnitudes.
@@ -153,6 +170,10 @@ export class OrbitalCloud implements Component {
     const dtU = this.uniforms.dt;
     const diffU = this.uniforms.diffusion;
     const frameU = this.uniforms.frame;
+    const shCoefsU = this.uniforms.shCoefs;
+    const nU = this.uniforms.n;
+    const rsU = this.uniforms.radialScale;
+    const driftU = this.uniforms.driftGain;
 
     // Cast the callback to `any` — Fn's TS overloads require a Node return, but
     // compute kernels are side-effecting and return void at the JS level.
@@ -160,27 +181,43 @@ export class OrbitalCloud implements Component {
     this.updateKernel = (Fn as any)(() => {
       const p = positions.element(instanceIndex);
 
-      // --- Diffusion (unchanged from Task 5) ---
+      // --- Evaluate ψ(p) and gradient via central differences ---
+      // 6 offset evaluations for ∇log|ψ|² via central differences.
+      const eps = float(PSI_EPS);
+      const psiXp = evalPsi(p.add(vec3(eps, 0, 0)), shCoefsU, nU, rsU);
+      const psiXm = evalPsi(p.add(vec3(eps.negate(), 0, 0)), shCoefsU, nU, rsU);
+      const psiYp = evalPsi(p.add(vec3(0, eps, 0)), shCoefsU, nU, rsU);
+      const psiYm = evalPsi(p.add(vec3(0, eps.negate(), 0)), shCoefsU, nU, rsU);
+      const psiZp = evalPsi(p.add(vec3(0, 0, eps)), shCoefsU, nU, rsU);
+      const psiZm = evalPsi(p.add(vec3(0, 0, eps.negate())), shCoefsU, nU, rsU);
+
+      // log|ψ|² with floor on |ψ|² to avoid log(0).
+      const psiFloor = float(1e-6);
+      const logSq = (v: any) => v.mul(v).max(psiFloor).log();
+      const dx = logSq(psiXp).sub(logSq(psiXm)).div(eps.mul(2));
+      const dy = logSq(psiYp).sub(logSq(psiYm)).div(eps.mul(2));
+      const dz = logSq(psiZp).sub(logSq(psiZm)).div(eps.mul(2));
+      const gradLog = vec3(dx, dy, dz);
+
+      // --- Compose velocity ---
+      const drift = gradLog.mul(driftU);
+
+      // --- Diffusion (unchanged) ---
       const seed = float(instanceIndex).add(frameU.mul(0x9E3779B1));
-      const rx = hash(seed.add(0)).sub(0.5).mul(Math.sqrt(12));
-      const ry = hash(seed.add(1)).sub(0.5).mul(Math.sqrt(12));
-      const rz = hash(seed.add(2)).sub(0.5).mul(Math.sqrt(12));
+      const rxn = hash(seed.add(0)).sub(0.5).mul(Math.sqrt(12));
+      const ryn = hash(seed.add(1)).sub(0.5).mul(Math.sqrt(12));
+      const rzn = hash(seed.add(2)).sub(0.5).mul(Math.sqrt(12));
       const sigma = diffU.mul(dtU.sqrt());
-      const dp = vec3(rx, ry, rz).mul(sigma);
-      const pNew = p.add(dp);
+      const noiseStep = vec3(rxn, ryn, rzn).mul(sigma);
+
+      // --- Update position ---
+      const pNew = p.add(drift.mul(dtU)).add(noiseStep);
       p.assign(pNew);
 
-      // --- Evaluate ψ(pNew) for sign(ψ) coloring ---
-      // r in spherical coords, direction = pNew/r.
-      const rLen = pNew.length().max(1e-6);
-      const rScaled = rLen.div(this.uniforms.radialScale);
-      const xh = pNew.x.div(rLen);
-      const yh = pNew.y.div(rLen);
-      const zh = pNew.z.div(rLen);
-      const R = evalRadialTsl(rScaled, this.uniforms.n);
-      const Y = evalShTsl(this.uniforms.shCoefs, xh, yh, zh);
-      const psi = R.mul(Y);
-      this.signsStorage.element(instanceIndex).assign(sign(psi));
+      // --- Write sign(ψ) for coloring (re-evaluate at new position so color
+      //     tracks the lobe the particle just stepped into). ---
+      const psiNew = evalPsi(pNew, shCoefsU, nU, rsU);
+      this.signsStorage.element(instanceIndex).assign(sign(psiNew));
     })().compute(this.numParticles);
 
     // Build the points geometry. The position attribute is bound from the
@@ -232,6 +269,7 @@ export class OrbitalCloud implements Component {
     }
     this.uniforms.n.value = this.params.n;
     this.uniforms.radialScale.value = this.params.radialScale;
+    this.uniforms.driftGain.value = this.params.driftGain;
     void this.renderer.computeAsync(this.updateKernel);
   }
 
