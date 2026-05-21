@@ -163,6 +163,7 @@ export class OrbitalCloud implements Component {
       By:             uniform(this.params.By),
       Bz:             uniform(this.params.Bz),
       shCoefs,
+      boundaryRadius: uniform(this.params.boundaryRadius),
     };
 
     // Compute kernel: drift up ∇log|ψ|² + diffusion * randn(3) * sqrt(dt).
@@ -218,11 +219,30 @@ export class OrbitalCloud implements Component {
 
       // --- Update position ---
       const pNew = p.add(drift.add(precess).mul(dtU)).add(noiseStep);
-      p.assign(pNew);
+
+      // Respawn if outside the boundary. Uniform in a ball of radius
+      // boundaryRadius / 2 to keep respawned particles away from the wall.
+      const bR = this.uniforms.boundaryRadius;
+      const outsideMask = pNew.length().greaterThan(bR);
+      const rSeed = float(instanceIndex).add(frameU.mul(0x85EBCA6B));
+      const u1 = hash(rSeed.add(10));
+      const u2 = hash(rSeed.add(11));
+      const u3 = hash(rSeed.add(12));
+      const newR = bR.mul(0.5).mul(u1.pow(float(1 / 3)));
+      const theta = u2.mul(Math.PI * 2);
+      const cosPhi = u3.mul(2).sub(1);
+      const sinPhi = float(1).sub(cosPhi.mul(cosPhi)).sqrt();
+      const reseeded = vec3(
+        newR.mul(sinPhi).mul(theta.cos()),
+        newR.mul(sinPhi).mul(theta.sin()),
+        newR.mul(cosPhi),
+      );
+      const pFinal = outsideMask.select(reseeded, pNew);
+      p.assign(pFinal);
 
       // --- Write sign(ψ) for coloring (re-evaluate at new position so color
       //     tracks the lobe the particle just stepped into). ---
-      const psiNew = evalPsi(pNew, shCoefsU, nU, rsU);
+      const psiNew = evalPsi(pFinal, shCoefsU, nU, rsU);
       this.signsStorage.element(instanceIndex).assign(sign(psiNew));
     })().compute(this.numParticles);
 
@@ -280,6 +300,7 @@ export class OrbitalCloud implements Component {
     this.uniforms.Bx.value = this.params.Bx;
     this.uniforms.By.value = this.params.By;
     this.uniforms.Bz.value = this.params.Bz;
+    this.uniforms.boundaryRadius.value = this.params.boundaryRadius;
     void this.renderer.computeAsync(this.updateKernel);
   }
 
