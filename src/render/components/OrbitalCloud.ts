@@ -3,7 +3,7 @@ import {
   BufferAttribute,
   Points,
 } from "three";
-import { PointsNodeMaterial, StorageBufferAttribute } from "three/webgpu";
+import { SpriteNodeMaterial, StorageBufferAttribute } from "three/webgpu";
 import { Fn, instanceIndex, hash, vec3, float, storage, uniform, uniformArray, mix, sign } from "three/tsl";
 import { evalShTsl } from "../orbital/sh-basis";
 import { evalRadialTsl } from "../orbital/radial";
@@ -51,6 +51,7 @@ function buildParamOpts(): Record<string, { min: number; max: number; step?: num
   opts.numParticles   = { min: 0, max: 0, step: 0 };  // discrete; ignored
   opts.pointSize      = { min: 0.5, max: 8, step: 0.1 };
   opts.boundaryRadius = { min: 1, max: 20, step: 0.1 };
+  opts.lifetime       = { min: 0.5, max: 30, step: 0.1 };
   return opts;
 }
 
@@ -70,6 +71,7 @@ function buildParamDefaults(): Record<string, number> {
   d.numParticles   = 100000;
   d.pointSize      = 2.0;
   d.boundaryRadius = 8.0;
+  d.lifetime       = 5.0;
   return d;
 }
 
@@ -96,10 +98,11 @@ export class OrbitalCloud implements Component {
 
   private numParticles: number;
   private points: Points | null = null;
-  private material: PointsNodeMaterial | null = null;
+  private material: SpriteNodeMaterial | null = null;
   // Storage handles (initialized in init()). Filled in across Tasks 4-6.
   private positionsStorage: any = null;
   private signsStorage: any = null;
+  private lifetimesStorage: any = null;
   private uniforms: any = null;
   private updateKernel: any = null;
   private frameCounter = 0;
@@ -143,6 +146,14 @@ export class OrbitalCloud implements Component {
     const signAttr = new StorageBufferAttribute(signCpu, 1);
     this.signsStorage = storage(signAttr, "float", N);
 
+    // Per-particle lifetime counter (seconds). Staggered so respawns spread
+    // across time rather than all firing on the same frame.
+    const maxLt = this.params.lifetime;
+    const lifetimesCpu = new Float32Array(N);
+    for (let i = 0; i < N; i++) lifetimesCpu[i] = Math.random() * maxLt;
+    const lifetimesAttr = new StorageBufferAttribute(lifetimesCpu, 1);
+    this.lifetimesStorage = storage(lifetimesAttr, "float", N);
+
     // 16-element SH coefficient array, n (as float for the shader), radialScale.
     // Updated each frame from the params bag.
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -165,6 +176,7 @@ export class OrbitalCloud implements Component {
       Bz:             uniform(this.params.Bz),
       shCoefs,
       boundaryRadius: uniform(this.params.boundaryRadius),
+      lifetime:       uniform(this.params.lifetime),
     };
 
     // Compute kernel: drift up ∇log|ψ|² + diffusion * randn(3) * sqrt(dt).
@@ -173,6 +185,7 @@ export class OrbitalCloud implements Component {
     // Box-Muller-approximated: uniform [0,1) → [-0.5, 0.5) × √12 gives
     // variance 1. Visually indistinguishable from gaussian at these magnitudes.
     const positions = this.positionsStorage;
+    const lifetimes = this.lifetimesStorage;
     const dtU = this.uniforms.dt;
     const diffU = this.uniforms.diffusion;
     const frameU = this.uniforms.frame;
@@ -180,6 +193,7 @@ export class OrbitalCloud implements Component {
     const nU = this.uniforms.n;
     const rsU = this.uniforms.radialScale;
     const driftU = this.uniforms.driftGain;
+    const lifetimeU = this.uniforms.lifetime;
 
     // Cast the callback to `any` — Fn's TS overloads require a Node return, but
     // compute kernels are side-effecting and return void at the JS level.
@@ -210,7 +224,7 @@ export class OrbitalCloud implements Component {
       const B = vec3(this.uniforms.Bx, this.uniforms.By, this.uniforms.Bz);
       const precess = B.cross(p).mul(this.uniforms.precessionGain);
 
-      // --- Diffusion (unchanged) ---
+      // --- Diffusion ---
       const seed = float(instanceIndex).add(frameU.mul(0x9E3779B1));
       const rxn = hash(seed.add(0)).sub(0.5).mul(Math.sqrt(12));
       const ryn = hash(seed.add(1)).sub(0.5).mul(Math.sqrt(12));
@@ -221,10 +235,10 @@ export class OrbitalCloud implements Component {
       // --- Update position ---
       const pNew = p.add(drift.add(precess).mul(dtU)).add(noiseStep);
 
-      // Respawn if outside the boundary. Uniform in a ball of radius
-      // boundaryRadius / 2 to keep respawned particles away from the wall.
+      // --- Shared respawn position (used for both boundary and lifetime respawn).
+      // Uniform in a ball of radius boundaryRadius / 2 to keep respawned
+      // particles away from the wall.
       const bR = this.uniforms.boundaryRadius;
-      const outsideMask = pNew.length().greaterThan(bR);
       const rSeed = float(instanceIndex).add(frameU.mul(0x85EBCA6B));
       const u1 = hash(rSeed.add(10));
       const u2 = hash(rSeed.add(11));
@@ -238,8 +252,24 @@ export class OrbitalCloud implements Component {
         newR.mul(sinPhi).mul(theta.sin()),
         newR.mul(cosPhi),
       );
-      const pFinal = outsideMask.select(reseeded, pNew);
+
+      // --- Lifetime tick ---
+      const lt = lifetimes.element(instanceIndex);
+      const ltNew = lt.sub(dtU);
+      const expired = ltNew.lessThan(0);
+      // Fresh lifetime: lifetime * (0.5..1.0) jitter, decorrelated from position seeds.
+      const ltSeed = hash(seed.add(100));
+      const freshLifetime = lifetimeU.mul(ltSeed.mul(0.5).add(0.5));
+
+      // --- Compose final position and lifetime ---
+      const outsideMask = pNew.length().greaterThan(bR);
+      // TSL bool OR: add the two 0/1 values and check > 0.
+      const shouldRespawn = outsideMask.add(expired).greaterThan(0);
+      const pFinal = shouldRespawn.select(reseeded, pNew);
+      const ltFinal = shouldRespawn.select(freshLifetime, ltNew);
+
       p.assign(pFinal);
+      lifetimes.element(instanceIndex).assign(ltFinal);
 
       // --- Write sign(ψ) for coloring (re-evaluate at new position so color
       //     tracks the lobe the particle just stepped into). ---
@@ -262,7 +292,10 @@ export class OrbitalCloud implements Component {
     const POS_COLOR = vec3(0.95, 0.35, 0.25);
     const NEG_COLOR = vec3(0.25, 0.55, 0.95);
 
-    const mat = new PointsNodeMaterial();
+    // SpriteNodeMaterial renders each particle as a billboarded quad so
+    // scaleNode controls the actual rendered size — PointsNodeMaterial's
+    // sizeNode was clamped to 1px by WebGPU on most GPUs.
+    const mat = new SpriteNodeMaterial();
     // toAttribute() is method-chained at runtime via addMethodChaining;
     // positionsStorage is typed `any` to avoid the missing TS declaration.
     mat.positionNode = this.positionsStorage.toAttribute();
@@ -270,8 +303,8 @@ export class OrbitalCloud implements Component {
     const signAttrNode = this.signsStorage.toAttribute();
     const t = signAttrNode.mul(0.5).add(0.5);
     mat.colorNode = mix(NEG_COLOR, POS_COLOR, t) as unknown as any;
-    // sizeNode exists at runtime but @types/three omits it from PointsNodeMaterial.
-    (mat as any).sizeNode = uniform(this.params.pointSize);
+    // scaleNode controls billboard quad size on SpriteNodeMaterial.
+    (mat as any).scaleNode = uniform(this.params.pointSize);
     mat.transparent = false;
 
     const pts = new Points(geom, mat);
@@ -289,8 +322,8 @@ export class OrbitalCloud implements Component {
         }
       }
       if (key === "orbitalCloud.pointSize" && typeof value === "number") {
-        // pointSize uniform was set via uniform(); update it.
-        if (this.material) (this.material as any).sizeNode = uniform(value);
+        // scaleNode controls billboard quad size on SpriteNodeMaterial.
+        if (this.material) (this.material as any).scaleNode = uniform(value);
       }
     });
   }
@@ -316,6 +349,7 @@ export class OrbitalCloud implements Component {
     this.uniforms.By.value = this.params.By;
     this.uniforms.Bz.value = this.params.Bz;
     this.uniforms.boundaryRadius.value = this.params.boundaryRadius;
+    this.uniforms.lifetime.value = this.params.lifetime;
     void this.renderer.computeAsync(this.updateKernel);
   }
 
@@ -333,6 +367,7 @@ export class OrbitalCloud implements Component {
     this.updateKernel = null;
     this.positionsStorage = null;
     this.signsStorage = null;
+    this.lifetimesStorage = null;
 
     this.numParticles = n;
     this.init();
