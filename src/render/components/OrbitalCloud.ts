@@ -225,7 +225,14 @@ export class OrbitalCloud implements Component {
       const precess = B.cross(p).mul(this.uniforms.precessionGain);
 
       // --- Diffusion ---
-      const seed = float(instanceIndex).add(frameU.mul(0x9E3779B1));
+      // Seed mixing: instanceIndex (up to ~1e6) + frame * small prime kept in
+      // float32 precision range. Large prime multipliers (0x9E3779B1 etc.)
+      // produce >1e9 magnitudes per frame; float32 mantissa loses the
+      // instanceIndex contribution and every particle gets the same hash
+      // input. We wrap frame at 65536 and multiply by a small prime so the
+      // combined seed stays under ~1e7.
+      const fWrap = frameU.mod(65536);
+      const seed = float(instanceIndex).add(fWrap.mul(13.37));
       const rxn = hash(seed.add(0)).sub(0.5).mul(Math.sqrt(12));
       const ryn = hash(seed.add(1)).sub(0.5).mul(Math.sqrt(12));
       const rzn = hash(seed.add(2)).sub(0.5).mul(Math.sqrt(12));
@@ -239,7 +246,10 @@ export class OrbitalCloud implements Component {
       // Uniform in a ball of radius boundaryRadius / 2 to keep respawned
       // particles away from the wall.
       const bR = this.uniforms.boundaryRadius;
-      const rSeed = float(instanceIndex).add(frameU.mul(0x85EBCA6B));
+      // Decorrelate from the diffusion seed by using a different small prime
+      // and a different frame-wrap modulus. Same precision rationale as above.
+      const fWrapR = frameU.mod(32768);
+      const rSeed = float(instanceIndex).mul(1.013).add(fWrapR.mul(7.919));
       const u1 = hash(rSeed.add(10));
       const u2 = hash(rSeed.add(11));
       const u3 = hash(rSeed.add(12));
