@@ -295,29 +295,41 @@ export class ParticleView implements Component {
       // its spring force. Additive on linvel; cheap and stable.
       this.curlNoise(t.x, t.y, t.z, this.curlOut);
       const v = body.linvel();
-      body.setLinvel(
-        {
-          x: v.x + this.curlOut[0] * noiseStrength * dt,
-          y: v.y + this.curlOut[1] * noiseStrength * dt,
-          z: v.z + this.curlOut[2] * noiseStrength * dt,
-        },
-        true,
-      );
 
-      // Newtonian attractor: F = strength * (A - p) / |A - p|^3.
-      // Clamp |A - p| at attractorMinRadius to avoid singularity at r=0.
+      // Attractor as a velocity impulse (NOT addForce). Two reasons:
+      // (1) addForce divides by rapier's auto-computed mass — a 4cm
+      // sphere is ~3e-5 kg, so any force produces enormous acceleration
+      // and the system explodes at default slider values.
+      // (2) An inverse-cube law (the textbook Newtonian F/m = GM/r²) is
+      // numerically harsh: it goes from gentle at r=1 to brutal at
+      // r=0.1. We use a 1/r falloff instead — acceleration drops with
+      // distance but never by the same orders of magnitude. Clamped at
+      // attractorMinRadius to avoid the singularity at r=0.
+      let ax = 0, ay = 0, az = 0;
       if (attractorStrength > 0) {
         const dx = ATTRACTOR_POSITION.x - t.x;
         const dy = ATTRACTOR_POSITION.y - t.y;
         const dz = ATTRACTOR_POSITION.z - t.z;
-        const r2 = dx * dx + dy * dy + dz * dz;
-        const r = Math.sqrt(r2);
-        if (r >= attractorMinRadius) {
-          const invR3 = 1 / (r * r2);
-          const k = attractorStrength * invR3;
-          body.addForce({ x: dx * k, y: dy * k, z: dz * k }, true);
-        }
+        const distSq = dx * dx + dy * dy + dz * dz;
+        const dist = Math.sqrt(distSq);
+        const clamped = Math.max(dist, attractorMinRadius);
+        // accelMag ∝ 1/r (linear falloff in 1/distance, not 1/distance²).
+        // Direction = unit vector toward attractor = (dx, dy, dz) / dist.
+        // So per-axis: dx/dist * (strength / clamped) = dx * strength / (dist * clamped).
+        const k = attractorStrength / (dist * clamped);
+        ax = dx * k;
+        ay = dy * k;
+        az = dz * k;
       }
+
+      body.setLinvel(
+        {
+          x: v.x + this.curlOut[0] * noiseStrength * dt + ax * dt,
+          y: v.y + this.curlOut[1] * noiseStrength * dt + ay * dt,
+          z: v.z + this.curlOut[2] * noiseStrength * dt + az * dt,
+        },
+        true,
+      );
 
       const r = body.rotation();
       const s = this.scales[i];
