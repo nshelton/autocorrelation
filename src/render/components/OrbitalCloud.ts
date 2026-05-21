@@ -307,8 +307,11 @@ export class OrbitalCloud implements Component {
     // world-space basis vectors scaled by the per-vertex local position
     // (PlaneGeometry vertices live in [-0.5, 0.5]²).
     const mat = new MeshBasicNodeMaterial();
-    // Per-instance center, fetched from the storage buffer via instanceIndex.
-    const center = this.positionsStorage.element(instanceIndex);
+    // Per-instance center. `.toAttribute()` exposes the storage buffer as a
+    // READ-ONLY instanced attribute — necessary because WebGPU forbids
+    // read_write storage bindings in the vertex stage. The compute kernel
+    // still has read_write access via the same buffer object.
+    const center = this.positionsStorage.toAttribute();
     // Hold scaleUniform on the instance so the slider can update it live.
     this.scaleUniform = uniform(this.params.pointSize * 0.01);
     const offsetCamSpace = vec4(
@@ -329,8 +332,8 @@ export class OrbitalCloud implements Component {
     mat.transparent = false;
 
     // InstancedMesh of a unit quad — three's documented instancing path.
-    // `instanceIndex` (used above) dispatches per-instance for the storage
-    // buffer lookups.
+    // `positionsStorage.toAttribute()` above is an instanced attribute, so
+    // each instance gets its own world-space center.
     const quadGeom = new PlaneGeometry(1, 1);
     const pts = new InstancedMesh(quadGeom, mat, N);
     pts.frustumCulled = false; // particles roam past the initial bounds
