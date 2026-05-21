@@ -1,4 +1,4 @@
-import { Sprite } from "three";
+import { InstancedMesh, PlaneGeometry } from "three";
 import { SpriteNodeMaterial, StorageBufferAttribute } from "three/webgpu";
 import { Fn, instanceIndex, hash, vec3, float, storage, uniform, uniformArray, mix, sign } from "three/tsl";
 import { evalShTsl } from "../orbital/sh-basis";
@@ -93,7 +93,7 @@ export class OrbitalCloud implements Component {
   private storeUnsub: (() => void) | null = null;
 
   private numParticles: number;
-  private points: Sprite | null = null;
+  private points: InstancedMesh | null = null;
   private material: SpriteNodeMaterial | null = null;
   // Storage handles (initialized in init()). Filled in across Tasks 4-6.
   private positionsStorage: any = null;
@@ -292,11 +292,11 @@ export class OrbitalCloud implements Component {
     const POS_COLOR = vec3(0.95, 0.35, 0.25);
     const NEG_COLOR = vec3(0.25, 0.55, 0.95);
 
-    // SpriteNodeMaterial renders each particle as a billboarded quad. We use
-    // it with `THREE.Sprite` (count = N) — the canonical three.js WebGPU
-    // compute-particles pattern. `Points` + SpriteNodeMaterial would still
-    // emit point primitives (clamped to 1px on Apple Silicon and many other
-    // GPUs), which is why pointSize had no effect.
+    // SpriteNodeMaterial does the billboard rotation in its TSL nodes using
+    // `cameraViewMatrix`, which works on any mesh primitive. We pair it with
+    // `InstancedMesh` (which has real per-instance `instanceIndex`) — three
+    // r170's `Sprite` class has NO `.count` property, so setting one silently
+    // renders a single quad, which is why pointSize/positions appeared broken.
     const mat = new SpriteNodeMaterial();
     mat.positionNode = this.positionsStorage.toAttribute();
     // sign ∈ {-1, 0, 1}. Map to t ∈ [0, 0.5, 1] for mix(NEG, POS, t).
@@ -315,12 +315,14 @@ export class OrbitalCloud implements Component {
     // rendering it in a separate non-AO post step.
     mat.transparent = false;
 
-    // Sprite with .count = N is the documented three.js WebGPU pattern.
-    // The Sprite class has its own internal quad geometry; positionNode
-    // overrides per-instance placement from the storage buffer.
-    const pts = new Sprite(mat);
-    (pts as any).count = N;
-    pts.frustumCulled = false; // particles can roam past initial bounds
+    // InstancedMesh of a tiny unit-quad — real per-instance dispatch via
+    // `instanceIndex` (which `positionNode = storage.toAttribute()` reads
+    // from). The geometry size is 1.0 in object space; scaleNode shrinks
+    // it. PlaneGeometry vertices are in [-0.5, 0.5]² which SpriteNodeMaterial
+    // interprets as billboard offsets.
+    const quadGeom = new PlaneGeometry(1, 1);
+    const pts = new InstancedMesh(quadGeom, mat, N);
+    pts.frustumCulled = false; // particles roam past the initial bounds
     this.points = pts;
     this.material = mat;
     this.scene.add(pts);
@@ -368,10 +370,10 @@ export class OrbitalCloud implements Component {
 
   private rebuild(n: number): void {
     // Dispose current GPU resources.
-    // Sprite has no geometry to dispose (it uses three's internal shared
-    // quad); only the material needs disposal.
     if (this.points) {
       this.scene.remove(this.points);
+      this.points.geometry.dispose();
+      this.points.dispose();
       this.material?.dispose();
       this.points = null;
       this.material = null;
@@ -395,6 +397,8 @@ export class OrbitalCloud implements Component {
     this.uniforms = null;
     if (this.points) {
       this.scene.remove(this.points);
+      this.points.geometry.dispose();
+      this.points.dispose();
       this.material?.dispose();
       this.points = null;
       this.material = null;
