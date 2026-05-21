@@ -51,6 +51,9 @@ const LINE_COLORS: readonly LineSpec[] = [
 ];
 
 export class DebugView {
+  static id = "debugView";
+  static label = "Debug View";
+
   private lines = new Map<LineStoreKey, TimeSeriesRenderer>();
   private backgroundGrid = new DebugGrid();
   private scrollingBeatGridMarkers: BeatGridMarkers;
