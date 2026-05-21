@@ -1,8 +1,4 @@
-import {
-  BufferGeometry,
-  BufferAttribute,
-  Points,
-} from "three";
+import { Sprite, AdditiveBlending } from "three";
 import { SpriteNodeMaterial, StorageBufferAttribute } from "three/webgpu";
 import { Fn, instanceIndex, hash, vec3, float, storage, uniform, uniformArray, mix, sign } from "three/tsl";
 import { evalShTsl } from "../orbital/sh-basis";
@@ -97,7 +93,7 @@ export class OrbitalCloud implements Component {
   private storeUnsub: (() => void) | null = null;
 
   private numParticles: number;
-  private points: Points | null = null;
+  private points: Sprite | null = null;
   private material: SpriteNodeMaterial | null = null;
   // Storage handles (initialized in init()). Filled in across Tasks 4-6.
   private positionsStorage: any = null;
@@ -290,37 +286,38 @@ export class OrbitalCloud implements Component {
       this.signsStorage.element(instanceIndex).assign(sign(psiNew));
     })().compute(this.numParticles);
 
-    // Build the points geometry. The position attribute is bound from the
-    // storage buffer via `toAttribute()` so the Points mesh and the compute
-    // kernel share the same memory.
-    const geom = new BufferGeometry();
-    // A dummy attribute is required to satisfy three's draw count detection;
-    // the actual positions come from positionNode below.
-    geom.setAttribute("position", new BufferAttribute(new Float32Array(N * 3), 3));
-    geom.setDrawRange(0, N);
-
     // Bipolar color: positive lobes warm (red), negative lobes cool (blue).
     // Particles with sign=0 (unevaluated; first frame) render as black —
     // they get overwritten the next frame.
     const POS_COLOR = vec3(0.95, 0.35, 0.25);
     const NEG_COLOR = vec3(0.25, 0.55, 0.95);
 
-    // SpriteNodeMaterial renders each particle as a billboarded quad so
-    // scaleNode controls the actual rendered size — PointsNodeMaterial's
-    // sizeNode was clamped to 1px by WebGPU on most GPUs.
+    // SpriteNodeMaterial renders each particle as a billboarded quad. We use
+    // it with `THREE.Sprite` (count = N) — the canonical three.js WebGPU
+    // compute-particles pattern. `Points` + SpriteNodeMaterial would still
+    // emit point primitives (clamped to 1px on Apple Silicon and many other
+    // GPUs), which is why pointSize had no effect.
     const mat = new SpriteNodeMaterial();
-    // toAttribute() is method-chained at runtime via addMethodChaining;
-    // positionsStorage is typed `any` to avoid the missing TS declaration.
     mat.positionNode = this.positionsStorage.toAttribute();
     // sign ∈ {-1, 0, 1}. Map to t ∈ [0, 0.5, 1] for mix(NEG, POS, t).
     const signAttrNode = this.signsStorage.toAttribute();
     const t = signAttrNode.mul(0.5).add(0.5);
     mat.colorNode = mix(NEG_COLOR, POS_COLOR, t) as unknown as any;
-    // scaleNode controls billboard quad size on SpriteNodeMaterial.
-    (mat as any).scaleNode = uniform(this.params.pointSize);
-    mat.transparent = false;
+    // scaleNode controls billboard quad size in WORLD UNITS. The slider's
+    // 0.5..8 range is interpreted as a tenth of a world unit so the cloud
+    // (boundaryRadius=8 by default) doesn't get drowned by giant quads.
+    (mat as any).scaleNode = uniform(this.params.pointSize * 0.05);
+    // Additive blending: stacked particles brighten rather than overwrite.
+    // depthWrite off so sprites don't occlude each other.
+    mat.transparent = true;
+    mat.depthWrite = false;
+    mat.blending = AdditiveBlending;
 
-    const pts = new Points(geom, mat);
+    // Sprite with .count = N is the documented three.js WebGPU pattern.
+    // The Sprite class has its own internal quad geometry; positionNode
+    // overrides per-instance placement from the storage buffer.
+    const pts = new Sprite(mat);
+    (pts as any).count = N;
     pts.frustumCulled = false; // particles can roam past initial bounds
     this.points = pts;
     this.material = mat;
@@ -336,7 +333,8 @@ export class OrbitalCloud implements Component {
       }
       if (key === "orbitalCloud.pointSize" && typeof value === "number") {
         // scaleNode controls billboard quad size on SpriteNodeMaterial.
-        if (this.material) (this.material as any).scaleNode = uniform(value);
+        // Same 0.05 factor as init() so the slider behaves consistently.
+        if (this.material) (this.material as any).scaleNode = uniform(value * 0.05);
       }
     });
   }
@@ -368,9 +366,10 @@ export class OrbitalCloud implements Component {
 
   private rebuild(n: number): void {
     // Dispose current GPU resources.
+    // Sprite has no geometry to dispose (it uses three's internal shared
+    // quad); only the material needs disposal.
     if (this.points) {
       this.scene.remove(this.points);
-      this.points.geometry.dispose();
       this.material?.dispose();
       this.points = null;
       this.material = null;
@@ -394,7 +393,6 @@ export class OrbitalCloud implements Component {
     this.uniforms = null;
     if (this.points) {
       this.scene.remove(this.points);
-      this.points.geometry.dispose();
       this.material?.dispose();
       this.points = null;
       this.material = null;
