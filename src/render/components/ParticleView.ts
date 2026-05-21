@@ -72,6 +72,8 @@ export class ParticleView implements Component {
   private dummy = new Object3D();
   private curlOut = new Float32Array(3);
   private curlNoise!: (x: number, y: number, z: number, out: Float32Array) => void;
+  private lastNoiseScale = NaN;
+  private lastDamping = NaN;
   private disposed = false;
 
   constructor(deps: ComponentDeps, params: Record<string, number>) {
@@ -194,14 +196,27 @@ export class ParticleView implements Component {
   update(): void {
     if (!this.world || !this.mesh) return;
     const noiseStrength = this.params.noiseStrength;
-    const damping = this.params.damping;
+    // noiseScale is a hot param — re-create the noise function only when
+    // the slider value changes. createCurlNoise's `scale` is closed over
+    // at construction, so there's no per-call way to vary it.
+    if (this.params.noiseScale !== this.lastNoiseScale) {
+      this.curlNoise = createCurlNoise({ scale: this.params.noiseScale });
+      this.lastNoiseScale = this.params.noiseScale;
+    }
+    // damping is hot — sweep all bodies only when the slider moved.
+    // Without this guard we'd burn ~1.2M setter calls/s at 10k particles.
+    if (this.params.damping !== this.lastDamping) {
+      for (const b of this.bodies) {
+        b.setLinearDamping(this.params.damping);
+        b.setAngularDamping(this.params.damping);
+      }
+      this.lastDamping = this.params.damping;
+    }
     this.world.step();
     const dt = this.world.timestep;
 
     for (let i = 0; i < this.numParticles; i++) {
       const body = this.bodies[i];
-      body.setLinearDamping(damping);
-      body.setAngularDamping(damping);
 
       this.lifetimes[i] -= dt;
       if (this.lifetimes[i] <= 0) {
