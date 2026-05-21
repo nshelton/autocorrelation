@@ -130,25 +130,7 @@ export class ParticleView implements Component {
     this.attractorMesh = aMesh;
     this.scene.add(aMesh);
 
-    // InstancedMesh allocated to MAX_PARTICLES; mesh.count controls how many
-    // we render. Per-instance color via our own InstancedBufferAttribute.
-    const colorArr = new Float32Array(MAX_PARTICLES * 3);
-    const tmpColor = new Color(1, 1, 1);
-    for (let i = 0; i < MAX_PARTICLES; i++) tmpColor.toArray(colorArr, i * 3);
-    const colorAttr = new InstancedBufferAttribute(colorArr, 3);
-
-    const mat = new MeshBasicNodeMaterial();
-    const instColor = vec3(instancedBufferAttribute(colorAttr, "vec3", 3, 0));
-    const lightDir = vec3(0.408, 0.866, 0.306);
-    const ndotl = max(dot(normalWorld, lightDir), float(0.0));
-    const lit = ndotl.mul(0.7).add(0.3);
-    mat.colorNode = vec4(instColor.mul(lit), 1.0);
-
-    const geom = new IcosahedronGeometry(BASE_RADIUS, 1);
-    const mesh = new InstancedMesh(geom, mat, MAX_PARTICLES);
-    mesh.count = this.numParticles;
-    this.mesh = mesh;
-    this.scene.add(mesh);
+    this.createInstancedMesh(this.numParticles);
 
     // Seed the lastFoo guards now that init() created the initial
     // curlNoise (and damping/restitution will sweep on first update if
@@ -197,6 +179,40 @@ export class ParticleView implements Component {
     make(half + t, t, half + t, 0, -(half + t), 0); // -y
     make(half + t, half + t, t, 0, 0, half + t); // +z
     make(half + t, half + t, t, 0, 0, -(half + t)); // -z
+  }
+
+  // Allocate the InstancedMesh to *exactly* `n` instances, not MAX_PARTICLES.
+  // Three.js's WebGPU backend binds the per-instance matrix buffer as a
+  // uniform buffer at small instance counts, capped at 64KB. MAX_PARTICLES=10000
+  // produces a 640KB buffer that exceeds the uniform limit and causes silent
+  // render failures below ~1024 instances (where the backend doesn't switch
+  // to a storage buffer). Sizing to numParticles avoids that path entirely.
+  private createInstancedMesh(n: number): void {
+    const colorArr = new Float32Array(n * 3);
+    const tmpColor = new Color(1, 1, 1);
+    for (let i = 0; i < n; i++) tmpColor.toArray(colorArr, i * 3);
+    const colorAttr = new InstancedBufferAttribute(colorArr, 3);
+
+    const mat = new MeshBasicNodeMaterial();
+    const instColor = vec3(instancedBufferAttribute(colorAttr, "vec3", 3, 0));
+    const lightDir = vec3(0.408, 0.866, 0.306);
+    const ndotl = max(dot(normalWorld, lightDir), float(0.0));
+    const lit = ndotl.mul(0.7).add(0.3);
+    mat.colorNode = vec4(instColor.mul(lit), 1.0);
+
+    const geom = new IcosahedronGeometry(BASE_RADIUS, 1);
+    const mesh = new InstancedMesh(geom, mat, n);
+    this.mesh = mesh;
+    this.scene.add(mesh);
+  }
+
+  private disposeInstancedMesh(): void {
+    if (!this.mesh) return;
+    this.scene.remove(this.mesh);
+    this.mesh.geometry.dispose();
+    (this.mesh.material as MeshBasicNodeMaterial).dispose();
+    this.mesh.dispose();
+    this.mesh = null;
   }
 
   private addAttractor(radius: number): void {
@@ -262,10 +278,11 @@ export class ParticleView implements Component {
   }
 
   private rebuildBodies(n: number): void {
-    if (!this.world || !this.mesh) return;
+    if (!this.world) return;
     // Free the entire world (drops all bodies + colliders), recreate it,
-    // re-add walls, spawn the new body pool. The InstancedMesh and SoA
-    // arrays persist — we just change mesh.count and reuse the storage.
+    // re-add walls, spawn the new body pool. Also dispose + recreate the
+    // InstancedMesh at the new size — see createInstancedMesh for why we
+    // size to numParticles rather than reusing one mesh at MAX_PARTICLES.
     this.world.free();
     this.bodies = [];
     this.colliders = [];
@@ -274,8 +291,9 @@ export class ParticleView implements Component {
     this.addWalls(this.params.containerSize);
     this.addAttractor(this.params.attractorRadius);
     this.spawnBodies(n);
+    this.disposeInstancedMesh();
+    this.createInstancedMesh(n);
     this.numParticles = n;
-    this.mesh.count = n;
     // Force the hot-param trackers to NaN so the next frame re-applies
     // their values to the freshly-created colliders + bodies.
     this.lastDamping = NaN;
@@ -405,13 +423,7 @@ export class ParticleView implements Component {
     this.disposed = true;
     this.storeUnsub?.();
     this.storeUnsub = null;
-    if (this.mesh) {
-      this.scene.remove(this.mesh);
-      this.mesh.geometry.dispose();
-      (this.mesh.material as MeshBasicNodeMaterial).dispose();
-      this.mesh.dispose();
-      this.mesh = null;
-    }
+    this.disposeInstancedMesh();
     if (this.attractorMesh) {
       this.scene.remove(this.attractorMesh);
       this.attractorMesh.geometry.dispose();
