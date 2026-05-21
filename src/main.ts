@@ -101,7 +101,7 @@ async function buildPageDeps(
   const renderer = await createRenderer(canvas);
 
   const sr = context.sampleRate;
-  const fftSize = store.get("dsp.windowSize");
+  const fftSize = store.get("dsp.windowSize") as number;
   console.log(
     "[audio] FFT bins map: bin0=DC, bin1=" +
       (sr / fftSize).toFixed(1) +

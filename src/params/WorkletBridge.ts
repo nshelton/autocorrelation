@@ -39,8 +39,8 @@ export class WorkletBridge {
   bootstrap(): void {
     this.port.postMessage({
       type: "configure",
-      windowSize: this.store.get("dsp.windowSize"),
-      rmsHistoryLen: this.store.get("dsp.rmsHistoryLen"),
+      windowSize: this.store.get("dsp.windowSize") as number,
+      rmsHistoryLen: this.store.get("dsp.rmsHistoryLen") as number,
     });
     for (const k of HOT_KEYS) {
       this.port.postMessage({
@@ -55,8 +55,8 @@ export class WorkletBridge {
     if (key === "dsp.windowSize" || key === "dsp.rmsHistoryLen") {
       this.port.postMessage({
         type: "configure",
-        windowSize: this.store.get("dsp.windowSize"),
-        rmsHistoryLen: this.store.get("dsp.rmsHistoryLen"),
+        windowSize: this.store.get("dsp.windowSize") as number,
+        rmsHistoryLen: this.store.get("dsp.rmsHistoryLen") as number,
       });
       return;
     }
@@ -73,9 +73,9 @@ export class WorkletBridge {
   }
 
   private resolveHotValue(key: (typeof HOT_KEYS)[number]): number {
-    const value = this.store.get(`dsp.${key}`);
+    const value = this.store.get(`dsp.${key}`) as number;
     if (key === "hopSize") {
-      return Math.min(value, this.store.get("dsp.windowSize"));
+      return Math.min(value, this.store.get("dsp.windowSize") as number);
     }
     return value;
   }

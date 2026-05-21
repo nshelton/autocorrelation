@@ -38,11 +38,15 @@ export class ParamPanel {
         options: Object.fromEntries(schema.options.map((v) => [String(v), v])),
       });
     }
-    return folder.addBinding(this.bindings, schema.key, {
-      label: schema.label,
-      min: schema.min,
-      max: schema.max,
-      step: schema.step,
-    });
+    if (schema.kind === "continuous") {
+      return folder.addBinding(this.bindings, schema.key, {
+        label: schema.label,
+        min: schema.min,
+        max: schema.max,
+        step: schema.step,
+      });
+    }
+    // boolean kind — Task 3 will replace this with a proper checkbox widget.
+    return folder.addBinding(this.bindings, schema.key, { label: schema.label });
   }
 }

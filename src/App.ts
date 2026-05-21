@@ -189,7 +189,7 @@ export class App {
         step: opts.step ?? (opts.max - opts.min) / 100,
       });
       // Pull back the (possibly persisted) value the store now holds.
-      view.params[k] = store.get(key);
+      view.params[k] = store.get(key) as number;
       folder
         .addBinding(view.params, k, opts)
         .on("change", (e: { value: number }) => store.set(key, e.value));
@@ -201,7 +201,7 @@ export class App {
         if (!key.startsWith(prefix)) return;
         const local = key.slice(prefix.length);
         if (local in view.params) {
-          view.params[local] = value;
+          view.params[local] = value as number;
           pane.refresh();
         }
       }),
