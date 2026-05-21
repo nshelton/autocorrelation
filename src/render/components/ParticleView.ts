@@ -205,35 +205,27 @@ export class ParticleView implements Component {
 
   // Write orbital initial conditions for a single particle into spawnState:
   // position = random point on a sphere of radius spawnRadius around the
-  // attractor; velocity = tangential, magnitude = sqrt(attractorStrength).
-  // For our 1/r force law, v = sqrt(strength) is the circular-orbit speed
-  // (independent of radius), so freshly spawned particles immediately settle
-  // into roughly circular orbits. 0.8..1.2 jitter so they aren't synced.
+  // attractor; velocity = the swirl field evaluated at that position.
+  // The swirl field is a rigid rotation around the Y axis through the
+  // attractor with angular velocity = swirlStrength (rad/s). Evaluated as
+  // v(p) = (dz, 0, -dx) * swirlStrength where (dx, dz) = (p - attractor)
+  // in the XZ plane. This matches update()'s swirl velocity-target exactly
+  // so freshly spawned particles are already on the field's flow.
   private orbitalInit(): void {
     const r = this.params.spawnRadius;
-    // Uniformly random unit vector on the unit sphere.
     const theta = Math.random() * Math.PI * 2;
     const phi = Math.acos(2 * Math.random() - 1);
     const sinPhi = Math.sin(phi);
     const dx = sinPhi * Math.cos(theta);
     const dy = sinPhi * Math.sin(theta);
     const dz = Math.cos(phi);
-    // Tangential direction = normalize(cross(d, up)). Use Y as the up axis;
-    // fall back to X when d is near-parallel to Y so the cross isn't degenerate.
-    let ax = 0, ay = 1, az = 0;
-    if (Math.abs(dy) > 0.95) { ax = 1; ay = 0; az = 0; }
-    let tx = dy * az - dz * ay;
-    let ty = dz * ax - dx * az;
-    let tz = dx * ay - dy * ax;
-    const tmag = Math.sqrt(tx * tx + ty * ty + tz * tz);
-    tx /= tmag; ty /= tmag; tz /= tmag;
-    const speed = Math.sqrt(this.params.attractorStrength) * (0.8 + Math.random() * 0.4);
+    const sw = this.params.swirlStrength;
     this.spawnState[0] = ATTRACTOR_POSITION.x + dx * r;
     this.spawnState[1] = ATTRACTOR_POSITION.y + dy * r;
     this.spawnState[2] = ATTRACTOR_POSITION.z + dz * r;
-    this.spawnState[3] = tx * speed;
-    this.spawnState[4] = ty * speed;
-    this.spawnState[5] = tz * speed;
+    this.spawnState[3] = dz * r * sw;
+    this.spawnState[4] = 0;
+    this.spawnState[5] = -dx * r * sw;
   }
 
   private spawnBodies(n: number): void {
@@ -378,30 +370,41 @@ export class ParticleView implements Component {
         const dz = ATTRACTOR_POSITION.z - t.z;
         const distSq = dx * dx + dy * dy + dz * dz;
         const dist = Math.sqrt(distSq);
-        const clamped = Math.max(dist, attractorRadius);
-        // accelMag ∝ 1/r (linear falloff in 1/distance, not 1/distance²).
-        // Direction = unit vector toward attractor = (dx, dy, dz) / dist.
-        // So per-axis: dx/dist * (strength / clamped) = dx * strength / (dist * clamped).
-        const k = attractorStrength / (dist * clamped);
+ 
+        const k = attractorStrength / (dist * dist);
         ax = dx * k;
         ay = dy * k;
         az = dz * k;
       }
 
-      // Swirl: rigid-rotation field around the Y axis through the attractor.
-      // cross((0, 1, 0), (p - attractor)) = (pz - Az, 0, -(px - Ax)).
-      // Magnitude scales with distance from the axis, so every particle has
-      // the same angular velocity — clean orbital look.
+      // Swirl is a VELOCITY field (not an acceleration): a rigid rotation
+      // around the Y axis through the attractor with angular velocity
+      // swirlStrength (rad/s). Target velocity at point p is:
+      //     v_target = cross((0,1,0), p - attractor) * swirlStrength
+      //              = (dz, 0, -dx) * swirlStrength
+      // We split the existing XZ velocity into tangential + radial, replace
+      // the tangential component with the swirl target, and leave the radial
+      // component free for the attractor pull. orbitalInit writes initial
+      // velocity using the same formula so spawn is consistent with the field.
       const swDx = t.x - ATTRACTOR_POSITION.x;
       const swDz = t.z - ATTRACTOR_POSITION.z;
-      const sx = swDz * swirlStrength;
-      const sz = -swDx * swirlStrength;
+      const vTargetX = swDz * swirlStrength;
+      const vTargetZ = -swDx * swirlStrength;
+      // Radial unit vector in the XZ plane (degenerate at the axis → no radial).
+      const r2xz = swDx * swDx + swDz * swDz;
+      let radialX = 0, radialZ = 0, vRadialMag = 0;
+      if (r2xz > 1e-12) {
+        const rxz = Math.sqrt(r2xz);
+        radialX = swDx / rxz;
+        radialZ = swDz / rxz;
+        vRadialMag = v.x * radialX + v.z * radialZ;
+      }
 
       body.setLinvel(
         {
-          x: v.x + this.curlOut[0] * noiseStrength * dt + ax * dt + sx * dt,
-          y: v.y + this.curlOut[1] * noiseStrength * dt + ay * dt,
-          z: v.z + this.curlOut[2] * noiseStrength * dt + az * dt + sz * dt,
+          x: vTargetX + radialX * vRadialMag + ax * dt + this.curlOut[0] * noiseStrength * dt,
+          y: v.y + ay * dt + this.curlOut[1] * noiseStrength * dt,
+          z: vTargetZ + radialZ * vRadialMag + az * dt + this.curlOut[2] * noiseStrength * dt,
         },
         true,
       );
