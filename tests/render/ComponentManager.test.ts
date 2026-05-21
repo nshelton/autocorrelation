@@ -54,6 +54,9 @@ function makeDeps(): ComponentDeps {
     store: new FeatureStore(),
     paramStore: new ParamStore(),
     audioContext,
+    renderer: {
+      computeAsync: () => Promise.resolve(),
+    } as unknown as import("three/webgpu").WebGPURenderer,
   };
 }
 

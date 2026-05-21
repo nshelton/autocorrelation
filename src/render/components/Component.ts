@@ -1,4 +1,5 @@
 import type { Scene } from "three";
+import type { WebGPURenderer } from "three/webgpu";
 import type { FeatureStore } from "../../store/FeatureStore";
 import type { ParamStore } from "../../params/ParamStore";
 
@@ -9,6 +10,9 @@ export interface ComponentDeps {
   store: FeatureStore;
   paramStore: ParamStore;
   audioContext: AudioContext;
+  // Required for components that dispatch WebGPU compute (e.g. OrbitalCloud).
+  // Existing components ignore it.
+  renderer: WebGPURenderer;
 }
 
 // A component is a class with update() + dispose(). update() takes no args;

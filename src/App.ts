@@ -12,6 +12,33 @@ import { COMPONENTS } from "./render/components";
 
 import type { ParamStore } from "./params/ParamStore";
 import type { WebGPURenderer } from "three/webgpu";
+import type { CameraPose } from "./render/CameraRig";
+
+const CAMERA_POSE_KEY = "autocorrelation.camera.pose";
+
+function loadCameraPose(): CameraPose | null {
+  const raw = localStorage.getItem(CAMERA_POSE_KEY);
+  if (!raw) return null;
+  try {
+    const o = JSON.parse(raw) as { position: [number, number, number]; target: [number, number, number] };
+    return {
+      position: new Vector3(...o.position),
+      target: new Vector3(...o.target),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function saveCameraPose(pose: CameraPose): void {
+  localStorage.setItem(
+    CAMERA_POSE_KEY,
+    JSON.stringify({
+      position: [pose.position.x, pose.position.y, pose.position.z],
+      target: [pose.target.x, pose.target.y, pose.target.z],
+    }),
+  );
+}
 
 export interface AppDeps {
   canvas: HTMLCanvasElement;
@@ -50,6 +77,7 @@ export class App {
         store: this.store,
         paramStore,
         audioContext,
+        renderer,
       },
       COMPONENTS,
     );
@@ -70,7 +98,7 @@ export class App {
     this.post = new PostProcessing(renderer);
     this.post.outputNode = sceneColor.mul(aoNode);
 
-    this.rig = new CameraRig(camera);
+    this.rig = new CameraRig(camera, renderer.domElement);
     this.rig.addPreset("front", {
       position: new Vector3(0, 0, 4),
       target: new Vector3(0, 0, 0),
@@ -95,7 +123,15 @@ export class App {
       position: new Vector3(0, -1.0, 1.4),
       target: new Vector3(0, -1.0, 0),
     });
-    void this.rig.goTo("front", { duration: 0 });
+    const saved = loadCameraPose();
+    if (saved) {
+      this.rig.setPose(saved);
+    } else {
+      void this.rig.goTo("front", { duration: 0 });
+    }
+    this.rig.controls.addEventListener("end", () => {
+      saveCameraPose(this.rig.getPose());
+    });
 
     this.fps.mount();
 
@@ -108,15 +144,18 @@ export class App {
       "5": "buffer-acf",
       "6": "rms-acf",
     };
+    const savePoseAfter = (p: Promise<void>) => {
+      void p.then(() => saveCameraPose(this.rig.getPose()));
+    };
     this.keydownHandler = (e) => {
       const preset = presetKeys[e.key];
       if (preset) {
-        this.rig.goTo(preset, { duration: 0.8 });
+        savePoseAfter(this.rig.goTo(preset, { duration: 0.8 }));
         return;
       }
       if (e.key === " ") {
         toggled = !toggled;
-        this.rig.goTo(toggled ? "side" : "front", { duration: 0.8 });
+        savePoseAfter(this.rig.goTo(toggled ? "side" : "front", { duration: 0.8 }));
       }
     };
     window.addEventListener("keydown", this.keydownHandler);
@@ -148,8 +187,8 @@ export class App {
     this.rafHandle = requestAnimationFrame(loop);
   }
 
-  bindUI(pane: import("tweakpane").Pane): void {
-    this.components.bindUI(pane);
+  bindUI(parent: import("tweakpane").FolderApi): void {
+    this.components.bindUI(parent);
   }
 
   dispose(): void {
@@ -160,6 +199,7 @@ export class App {
     window.removeEventListener("keydown", this.keydownHandler);
     window.removeEventListener("resize", this.resizeHandler);
     this.components?.dispose();
+    this.rig?.dispose();
     this.fps.unmount();
     this.deps.workletNode.port.onmessage = null;
   }
