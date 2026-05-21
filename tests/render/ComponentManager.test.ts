@@ -178,4 +178,54 @@ describe("ComponentManager", () => {
     deps.paramStore.set("fakeB.gain", 0.25);
     expect(FakeWithParams.instances[0].params.gain).toBe(0.25);
   });
+
+  it("registers discrete schemas for keys declared in paramKinds", () => {
+    class FakeDiscrete {
+      static id = "fakeDisc";
+      static label = "Fake Discrete";
+      static paramPrefix = "fakeDisc";
+      static paramOpts = { count: { min: 0, max: 0, step: 0 } }; // ignored for discrete
+      static paramDefaults = { count: 1000 };
+      static paramKinds = { count: "discrete" as const };
+      static paramDiscreteOptions = { count: [500, 1000, 2000, 5000] };
+      public params: Record<string, number>;
+      constructor(_deps: ComponentDeps, params: Record<string, number>) {
+        this.params = params;
+      }
+      update(): void {}
+      dispose(): void {}
+    }
+
+    const deps = makeDeps();
+    const mgr = new ComponentManager(deps, [FakeDiscrete as unknown as ComponentClass]);
+    mgr.start();
+    const schema = deps.paramStore.schemasInOrder().find((s) => s.key === "fakeDisc.count");
+    expect(schema).toBeDefined();
+    expect(schema!.kind).toBe("discrete");
+    if (schema!.kind === "discrete") {
+      expect(schema!.options).toEqual([500, 1000, 2000, 5000]);
+    }
+    expect(deps.paramStore.get("fakeDisc.count")).toBe(1000);
+  });
+
+  it("rejects a discrete value not in the allowed options", () => {
+    class FakeDiscrete {
+      static id = "fakeDisc2";
+      static label = "Fake Discrete 2";
+      static paramPrefix = "fakeDisc2";
+      static paramOpts = { count: { min: 0, max: 0, step: 0 } };
+      static paramDefaults = { count: 1000 };
+      static paramKinds = { count: "discrete" as const };
+      static paramDiscreteOptions = { count: [500, 1000, 2000] };
+      constructor(_deps: ComponentDeps, _params: Record<string, number>) {}
+      update(): void {}
+      dispose(): void {}
+    }
+
+    const deps = makeDeps();
+    const mgr = new ComponentManager(deps, [FakeDiscrete as unknown as ComponentClass]);
+    mgr.start();
+    deps.paramStore.set("fakeDisc2.count", 1234);  // not in [500, 1000, 2000]
+    expect(deps.paramStore.get("fakeDisc2.count")).toBe(1000);
+  });
 });
