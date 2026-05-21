@@ -1,4 +1,4 @@
-import { Sprite, AdditiveBlending } from "three";
+import { Sprite } from "three";
 import { SpriteNodeMaterial, StorageBufferAttribute } from "three/webgpu";
 import { Fn, instanceIndex, hash, vec3, float, storage, uniform, uniformArray, mix, sign } from "three/tsl";
 import { evalShTsl } from "../orbital/sh-basis";
@@ -304,14 +304,16 @@ export class OrbitalCloud implements Component {
     const t = signAttrNode.mul(0.5).add(0.5);
     mat.colorNode = mix(NEG_COLOR, POS_COLOR, t) as unknown as any;
     // scaleNode controls billboard quad size in WORLD UNITS. The slider's
-    // 0.5..8 range is interpreted as a tenth of a world unit so the cloud
-    // (boundaryRadius=8 by default) doesn't get drowned by giant quads.
-    (mat as any).scaleNode = uniform(this.params.pointSize * 0.05);
-    // Additive blending: stacked particles brighten rather than overwrite.
-    // depthWrite off so sprites don't occlude each other.
-    mat.transparent = true;
-    mat.depthWrite = false;
-    mat.blending = AdditiveBlending;
+    // 0.5..8 range is interpreted as 1% of a world unit (default 2.0 →
+    // 0.02 units, ~0.25% of boundaryRadius=8). Sized aggressively small
+    // because additive blending + dense overdraw was freezing the GPU.
+    (mat as any).scaleNode = uniform(this.params.pointSize * 0.01);
+    // Opaque rendering: additive blending into the scene's MRT (color +
+    // view-space normal) target was corrupting normals, causing GTAO to
+    // ray-march garbage and saturate the GPU. Re-introducing additive
+    // blending will require excluding OrbitalCloud from the MRT pass or
+    // rendering it in a separate non-AO post step.
+    mat.transparent = false;
 
     // Sprite with .count = N is the documented three.js WebGPU pattern.
     // The Sprite class has its own internal quad geometry; positionNode
@@ -333,8 +335,8 @@ export class OrbitalCloud implements Component {
       }
       if (key === "orbitalCloud.pointSize" && typeof value === "number") {
         // scaleNode controls billboard quad size on SpriteNodeMaterial.
-        // Same 0.05 factor as init() so the slider behaves consistently.
-        if (this.material) (this.material as any).scaleNode = uniform(value * 0.05);
+        // Same 0.01 factor as init() so the slider behaves consistently.
+        if (this.material) (this.material as any).scaleNode = uniform(value * 0.01);
       }
     });
   }
