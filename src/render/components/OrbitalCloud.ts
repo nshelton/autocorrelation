@@ -91,7 +91,8 @@ export class OrbitalCloud implements Component {
   private params: Record<string, number>;
   private scene: ComponentDeps["scene"];
   private renderer: ComponentDeps["renderer"];
-  // private paramStore: ComponentDeps["paramStore"]; // used in Task 10
+  private paramStore: ComponentDeps["paramStore"];
+  private storeUnsub: (() => void) | null = null;
 
   private numParticles: number;
   private points: Points | null = null;
@@ -107,7 +108,7 @@ export class OrbitalCloud implements Component {
   constructor(deps: ComponentDeps, params: Record<string, number>) {
     this.scene = deps.scene;
     this.renderer = deps.renderer;
-    // this.paramStore = deps.paramStore;
+    this.paramStore = deps.paramStore;
     this.params = params;
     this.numParticles = Math.round(params.numParticles);
     this.init();
@@ -278,6 +279,20 @@ export class OrbitalCloud implements Component {
     this.points = pts;
     this.material = mat;
     this.scene.add(pts);
+
+    this.storeUnsub = this.paramStore.subscribe((key, value) => {
+      if (this.disposed) return;
+      if (key === "orbitalCloud.numParticles" && typeof value === "number") {
+        const n = Math.round(value);
+        if (n !== this.numParticles) {
+          this.rebuild(n);
+        }
+      }
+      if (key === "orbitalCloud.pointSize" && typeof value === "number") {
+        // pointSize uniform was set via uniform(); update it.
+        if (this.material) (this.material as any).sizeNode = uniform(value);
+      }
+    });
   }
 
   update(): void {
@@ -304,9 +319,30 @@ export class OrbitalCloud implements Component {
     void this.renderer.computeAsync(this.updateKernel);
   }
 
+  private rebuild(n: number): void {
+    // Dispose current GPU resources.
+    if (this.points) {
+      this.scene.remove(this.points);
+      this.points.geometry.dispose();
+      this.material?.dispose();
+      this.points = null;
+      this.material = null;
+    }
+    // Drop the kernel handle — instancedArray instances are GC'd when
+    // unreferenced.
+    this.updateKernel = null;
+    this.positionsStorage = null;
+    this.signsStorage = null;
+
+    this.numParticles = n;
+    this.init();
+  }
+
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
+    this.storeUnsub?.();
+    this.storeUnsub = null;
     this.uniforms = null;
     if (this.points) {
       this.scene.remove(this.points);
