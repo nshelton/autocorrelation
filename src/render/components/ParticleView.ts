@@ -80,6 +80,7 @@ export class ParticleView implements Component {
   private curlNoise!: (x: number, y: number, z: number, out: Float32Array) => void;
   private lastNoiseScale = NaN;
   private lastDamping = NaN;
+  private lastRestitution = NaN;
   private storeUnsub: (() => void) | null = null;
   private disposed = false;
 
@@ -125,6 +126,11 @@ export class ParticleView implements Component {
     mesh.count = this.numParticles;
     this.mesh = mesh;
     this.scene.add(mesh);
+
+    // Seed the lastFoo guards now that init() created the initial
+    // curlNoise (and damping/restitution will sweep on first update if
+    // their lastFoo stays NaN — leave those NaN to force the sweep).
+    this.lastNoiseScale = this.params.noiseScale;
 
     // Listen for reconfig param changes. Hot params (lifetime, noiseScale,
     // noiseStrength, restitution, attractorStrength, attractorMinRadius,
@@ -233,6 +239,7 @@ export class ParticleView implements Component {
     this.mesh.count = n;
     // Force lastDamping reset so the next frame re-applies it to the new bodies.
     this.lastDamping = NaN;
+    this.lastRestitution = NaN;
   }
 
   private rebuildWalls(half: number): void {
@@ -240,6 +247,7 @@ export class ParticleView implements Component {
     for (const c of this.wallColliders) this.world.removeCollider(c, false);
     this.wallColliders = [];
     this.addWalls(half);
+    this.lastRestitution = NaN;
   }
 
   update(): void {
@@ -262,6 +270,14 @@ export class ParticleView implements Component {
         b.setAngularDamping(this.params.damping);
       }
       this.lastDamping = this.params.damping;
+    }
+    // restitution is hot — sweep all colliders (particles + walls) only
+    // when the slider moved. Same rationale as damping.
+    if (this.params.restitution !== this.lastRestitution) {
+      const r = this.params.restitution;
+      for (const c of this.colliders) c.setRestitution(r);
+      for (const c of this.wallColliders) c.setRestitution(r);
+      this.lastRestitution = r;
     }
     this.world.step();
     const dt = this.world.timestep;
