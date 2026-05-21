@@ -2,10 +2,11 @@ import {
   BufferGeometry,
   BufferAttribute,
   Points,
-  Color,
 } from "three";
 import { PointsNodeMaterial, StorageBufferAttribute } from "three/webgpu";
-import { Fn, instanceIndex, hash, vec3, float, storage, uniform } from "three/tsl";
+import { Fn, instanceIndex, hash, vec3, float, storage, uniform, uniformArray, mix, sign } from "three/tsl";
+import { evalShTsl } from "../orbital/sh-basis";
+import { evalRadialTsl } from "../orbital/radial";
 import type { Component, ComponentDeps } from "./Component";
 
 // ---- coefficient layout (must match sh-basis.ts) ----
@@ -15,6 +16,7 @@ const SH_LABELS = [
   "c_2_-2", "c_2_-1", "c_2_0", "c_2_1", "c_2_2",
   "c_3_-3", "c_3_-2", "c_3_-1", "c_3_0", "c_3_1", "c_3_2", "c_3_3",
 ];
+const SH_COUNT = SH_LABELS.length;
 
 // ---- discrete numParticles options ----
 const PARTICLE_COUNTS = [10000, 100000, 500000, 1000000] as const;
@@ -81,6 +83,7 @@ export class OrbitalCloud implements Component {
   private material: PointsNodeMaterial | null = null;
   // Storage handles (initialized in init()). Filled in across Tasks 4-6.
   private positionsStorage: any = null;
+  private signsStorage: any = null;
   private uniforms: any = null;
   private updateKernel: any = null;
   private frameCounter = 0;
@@ -119,11 +122,27 @@ export class OrbitalCloud implements Component {
     const posAttr = new StorageBufferAttribute(positionsCpu, 3);
     this.positionsStorage = storage(posAttr, "vec3", N);
 
+    // Per-particle sign(ψ). Initialized to zeros; first frame overwrites.
+    const signCpu = new Float32Array(N);
+    const signAttr = new StorageBufferAttribute(signCpu, 1);
+    this.signsStorage = storage(signAttr, "float", N);
+
+    // 16-element SH coefficient array, n (as float for the shader), radialScale.
+    // Updated each frame from the params bag.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const shCoefs = uniformArray(new Float32Array(SH_COUNT) as unknown as any[], "float");
+    for (let i = 0; i < SH_COUNT; i++) {
+      shCoefs.array[i] = this.params[SH_LABELS[i]];
+    }
+
     // Uniforms updated each frame from the params bag in update().
     this.uniforms = {
-      dt:        uniform(0.0),
-      diffusion: uniform(this.params.diffusion),
-      frame:     uniform(0),
+      dt:          uniform(0.0),
+      diffusion:   uniform(this.params.diffusion),
+      frame:       uniform(0),
+      n:           uniform(this.params.n),
+      radialScale: uniform(this.params.radialScale),
+      shCoefs,
     };
 
     // Compute kernel: pos += diffusion * randn(3) * sqrt(dt).
@@ -141,15 +160,27 @@ export class OrbitalCloud implements Component {
     this.updateKernel = (Fn as any)(() => {
       const p = positions.element(instanceIndex);
 
-      // Three independent hashes per particle per frame mapped to N(0,1) approx.
+      // --- Diffusion (unchanged from Task 5) ---
       const seed = float(instanceIndex).add(frameU.mul(0x9E3779B1));
       const rx = hash(seed.add(0)).sub(0.5).mul(Math.sqrt(12));
       const ry = hash(seed.add(1)).sub(0.5).mul(Math.sqrt(12));
       const rz = hash(seed.add(2)).sub(0.5).mul(Math.sqrt(12));
-
       const sigma = diffU.mul(dtU.sqrt());
       const dp = vec3(rx, ry, rz).mul(sigma);
-      p.assign(p.add(dp));
+      const pNew = p.add(dp);
+      p.assign(pNew);
+
+      // --- Evaluate ψ(pNew) for sign(ψ) coloring ---
+      // r in spherical coords, direction = pNew/r.
+      const rLen = pNew.length().max(1e-6);
+      const rScaled = rLen.div(this.uniforms.radialScale);
+      const xh = pNew.x.div(rLen);
+      const yh = pNew.y.div(rLen);
+      const zh = pNew.z.div(rLen);
+      const R = evalRadialTsl(rScaled, this.uniforms.n);
+      const Y = evalShTsl(this.uniforms.shCoefs, xh, yh, zh);
+      const psi = R.mul(Y);
+      this.signsStorage.element(instanceIndex).assign(sign(psi));
     })().compute(this.numParticles);
 
     // Build the points geometry. The position attribute is bound from the
@@ -161,11 +192,20 @@ export class OrbitalCloud implements Component {
     geom.setAttribute("position", new BufferAttribute(new Float32Array(N * 3), 3));
     geom.setDrawRange(0, N);
 
+    // Bipolar color: positive lobes warm (red), negative lobes cool (blue).
+    // Particles with sign=0 (unevaluated; first frame) render as black —
+    // they get overwritten the next frame.
+    const POS_COLOR = vec3(0.95, 0.35, 0.25);
+    const NEG_COLOR = vec3(0.25, 0.55, 0.95);
+
     const mat = new PointsNodeMaterial();
     // toAttribute() is method-chained at runtime via addMethodChaining;
     // positionsStorage is typed `any` to avoid the missing TS declaration.
     mat.positionNode = this.positionsStorage.toAttribute();
-    mat.colorNode = uniform(new Color(1, 1, 1)) as unknown as any;
+    // sign ∈ {-1, 0, 1}. Map to t ∈ [0, 0.5, 1] for mix(NEG, POS, t).
+    const signAttrNode = this.signsStorage.toAttribute();
+    const t = signAttrNode.mul(0.5).add(0.5);
+    mat.colorNode = mix(NEG_COLOR, POS_COLOR, t) as unknown as any;
     // sizeNode exists at runtime but @types/three omits it from PointsNodeMaterial.
     (mat as any).sizeNode = uniform(this.params.pointSize);
     mat.transparent = false;
@@ -186,6 +226,12 @@ export class OrbitalCloud implements Component {
     this.uniforms.dt.value = dt;
     this.uniforms.diffusion.value = this.params.diffusion;
     this.uniforms.frame.value = ++this.frameCounter;
+    // Push the 16 SH coefficients + n + radialScale into uniforms each frame.
+    for (let i = 0; i < SH_COUNT; i++) {
+      this.uniforms.shCoefs.array[i] = this.params[SH_LABELS[i]];
+    }
+    this.uniforms.n.value = this.params.n;
+    this.uniforms.radialScale.value = this.params.radialScale;
     void this.renderer.computeAsync(this.updateKernel);
   }
 
