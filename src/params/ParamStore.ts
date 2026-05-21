@@ -26,6 +26,9 @@ export class ParamStore {
 
   register(schema: ParamSchema): void {
     this.schemas.set(schema.key, schema);
+    // Idempotent: keep in-memory value across HMR re-registers. Only seed
+    // from persisted/default the first time a key shows up.
+    if (this.values.has(schema.key)) return;
     const initial = this.persisted[schema.key];
     this.values.set(schema.key, initial !== undefined ? initial : schema.default);
   }

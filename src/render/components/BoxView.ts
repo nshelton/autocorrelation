@@ -29,12 +29,25 @@ export interface BoxViewDeps {
 const BOX_COUNT = 1024;
 const CONTAINER_HALF = 1.5;
 const BASE_SIZE = 0.12;
-// Rest line: boxes spaced along X, centered at origin.
-const REST_SPACING = 0.0025;
-// Per-frame velocity nudge toward rest position.
-const PULL = 0.5;
 
 export class BoxView {
+  // Live-tunable params. App.bindUI wires these to ParamStore (persisted to localStorage)
+  // and to tweakpane via the prefix. Mutated in place; read each frame in update().
+  public paramPrefix = "boxView";
+  public params: Record<string, number> = {
+    pull: 0.3,
+    timestep: 1 / 30,
+    width: 0.5,
+  };
+  public paramOpts: Record<
+    string,
+    { min: number; max: number; step?: number }
+  > = {
+    pull: { min: 0, max: 1, step: 0.01 },
+    timestep: { min: 0.005, max: 0.1, step: 0.001 },
+    width: { min: 0, max: 2, step: 0.01 },
+  };
+
   private scene: Scene;
   private store: FeatureStore;
   private mesh: InstancedMesh | null = null;
@@ -55,26 +68,27 @@ export class BoxView {
     if (this.disposed) return;
 
     const world = new RAPIER.World({ x: 0, y: 0, z: 0 });
-    world.timestep = 1 / 60;
+    world.timestep = this.params.timestep;
 
     const c = CONTAINER_HALF;
 
-    // Per-instance HSL colors. Owned by us (not via setColorAt) so the auto-instance-color
-    // path in NodeMaterial doesn't kick in and clobber our custom colorNode.
+    // Per-instance HSL colors via our own InstancedBufferAttribute. setColorAt would route
+    // through NodeMaterial's vInstanceColor varying, which is broken for our setup in r170.
     const colorArr = new Float32Array(BOX_COUNT * 3);
     const tmpColor = new Color();
     for (let i = 0; i < BOX_COUNT; i++) {
-      tmpColor.setHSL(i / BOX_COUNT, 0.7, 0.6);
+      // tmpColor.setHSL(i / BOX_COUNT, 0.7, 0.6);
+      tmpColor.setHSL(1, 1, 1);
       tmpColor.toArray(colorArr, i * 3);
     }
     const colorAttr = new InstancedBufferAttribute(colorArr, 3);
 
+    // MeshStandardNodeMaterial with custom colorNode silently drops lights in r170 + WebGPU +
+    // InstancedMesh. Hand-rolled lambert on MeshBasicNodeMaterial is what works.
     const mat = new MeshBasicNodeMaterial();
     const instColor = vec3(instancedBufferAttribute(colorAttr, "vec3", 3, 0));
-    // Hardcoded normalized world-space light direction (≈ from upper-right-front).
     const lightDir = vec3(0.408, 0.866, 0.306);
     const ndotl = max(dot(normalWorld, lightDir), float(0.0));
-    // 0.3 ambient + 0.7 lambert. Multiplied by per-instance albedo.
     const lit = ndotl.mul(0.7).add(0.3);
     mat.colorNode = vec4(instColor.mul(lit), 1.0);
 
@@ -99,8 +113,8 @@ export class BoxView {
             y: (Math.random() - 0.5) * 2,
             z: (Math.random() - 0.5) * 2,
           })
-          .setLinearDamping(0.5)
-          .setAngularDamping(0.5),
+          .setLinearDamping(0.1)
+          .setAngularDamping(0.1),
       );
       const collider = world.createCollider(
         RAPIER.ColliderDesc.cuboid(half, half, half).setRestitution(0.9),
@@ -117,7 +131,9 @@ export class BoxView {
 
   update(): void {
     if (!this.world || !this.mesh) return;
+    this.world.timestep = this.params.timestep;
     this.world.step();
+    const PULL = this.params.pull;
 
     const spec = this.store.get("spectrum");
     const specLen = spec.length;
@@ -129,7 +145,7 @@ export class BoxView {
       const t = b.translation();
       const r = b.rotation();
 
-      const restX = (i - halfCount) * REST_SPACING;
+      const restX = ((i - halfCount) * this.params.width) / BOX_COUNT;
       const vel = b.linvel();
       b.setLinvel(
         {

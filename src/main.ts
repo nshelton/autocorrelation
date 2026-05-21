@@ -128,6 +128,7 @@ function buildAppLayer(deps: AppDeps): void {
   panel = new ParamPanelCtor(deps.paramStore);
   bridge = new WorkletBridgeCtor(deps.paramStore, deps.workletNode.port);
   app.start();
+  app.bindUI(panel.pane);
   if (initialBootstrap) {
     bridge.bootstrap();
     initialBootstrap = false;
@@ -145,9 +146,6 @@ function teardownAppLayer(): void {
 
 const startMic = document.getElementById("start-mic") as HTMLButtonElement;
 const startTab = document.getElementById("start-tab") as HTMLButtonElement;
-const startTest = document.getElementById(
-  "start-test",
-) as HTMLButtonElement | null;
 const buttons = document.getElementById("start-buttons") as HTMLDivElement;
 
 let started = false;

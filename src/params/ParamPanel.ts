@@ -2,7 +2,7 @@ import { Pane } from "tweakpane";
 import { ParamStore, type ParamSchema, type ParamValue } from "./ParamStore";
 
 export class ParamPanel {
-  private pane: Pane;
+  public pane: Pane;
   private bindings: Record<string, ParamValue> = {};
   private unsubscribe: () => void;
 

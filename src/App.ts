@@ -1,13 +1,14 @@
 import { Vector3 } from "three";
 import { PostProcessing } from "three/webgpu";
 import { pass, mrt, output, transformedNormalView } from "three/tsl";
+// @ts-expect-error - local copy of three's GTAONode example, no .d.ts
 import { ao } from "./render/GTAONode.js";
 import { createSceneAndCamera } from "./render/Scene";
 import { CameraRig } from "./render/CameraRig";
 import { DebugView } from "./render/debug/DebugView";
 import { FeatureStore } from "./store/FeatureStore";
 import { FpsOverlay } from "./ui/Stats";
-import { BoxView } from "./render/BoxView";
+import { BoxView } from "./render/components/BoxView";
 
 import type { ParamStore } from "./params/ParamStore";
 import type { WebGPURenderer } from "three/webgpu";
@@ -25,6 +26,14 @@ type WorkletMsg = {
   buffers: Record<string, Float32Array>;
 };
 
+// Convention for views that want auto-bound, persisted UI params.
+// Expose live values, tweakpane metadata, and a namespace prefix.
+export interface ViewWithParams {
+  params: Record<string, number>;
+  paramOpts: Record<string, { min: number; max: number; step?: number }>;
+  paramPrefix: string;
+}
+
 export class App {
   private rig!: CameraRig;
   private store = new FeatureStore();
@@ -36,6 +45,7 @@ export class App {
   private debugView!: DebugView;
   private boxView!: BoxView;
   private post!: PostProcessing;
+  private uiUnsubs: Array<() => void> = [];
 
   constructor(private deps: AppDeps) {}
 
@@ -150,6 +160,54 @@ export class App {
     this.rafHandle = requestAnimationFrame(loop);
   }
 
+  bindUI(pane: import("tweakpane").Pane): void {
+    // Add new persistent views here — convention does the rest.
+    this.bindViewParams(this.boxView, pane);
+  }
+
+  // Wires a view's params/paramOpts/paramPrefix into ParamStore + tweakpane.
+  // Side effects: registers schemas, restores persisted values into view.params,
+  // adds a folder under the prefix, and propagates external store updates back
+  // to view.params so the reset button & cross-source writes work.
+  private bindViewParams(
+    view: ViewWithParams,
+    pane: import("tweakpane").Pane,
+  ): void {
+    const store = this.deps.paramStore;
+    const folder = pane.addFolder({ title: view.paramPrefix });
+
+    for (const [k, opts] of Object.entries(view.paramOpts)) {
+      const key = `${view.paramPrefix}.${k}`;
+      store.register({
+        key,
+        label: k,
+        kind: "continuous",
+        reconfig: false,
+        default: view.params[k],
+        min: opts.min,
+        max: opts.max,
+        step: opts.step ?? (opts.max - opts.min) / 100,
+      });
+      // Pull back the (possibly persisted) value the store now holds.
+      view.params[k] = store.get(key);
+      folder
+        .addBinding(view.params, k, opts)
+        .on("change", (e: { value: number }) => store.set(key, e.value));
+    }
+
+    this.uiUnsubs.push(
+      store.subscribe((key, value) => {
+        const prefix = view.paramPrefix + ".";
+        if (!key.startsWith(prefix)) return;
+        const local = key.slice(prefix.length);
+        if (local in view.params) {
+          view.params[local] = value;
+          pane.refresh();
+        }
+      }),
+    );
+  }
+
   dispose(): void {
     if (this.rafHandle !== null) {
       cancelAnimationFrame(this.rafHandle);
@@ -157,6 +215,8 @@ export class App {
     }
     window.removeEventListener("keydown", this.keydownHandler);
     window.removeEventListener("resize", this.resizeHandler);
+    this.uiUnsubs.forEach((u) => u());
+    this.uiUnsubs = [];
     this.debugView?.dispose();
     this.boxView?.dispose();
     this.fps.unmount();
