@@ -1,9 +1,9 @@
-import { InstancedMesh, PlaneGeometry } from "three";
+import { InstancedMesh, IcosahedronGeometry } from "three";
 import { MeshBasicNodeMaterial, StorageBufferAttribute } from "three/webgpu";
 import {
-  Fn, instanceIndex, hash, vec3, vec4, float, storage,
+  Fn, instanceIndex, hash, vec3, float, storage,
   uniform, uniformArray, mix, sign,
-  positionLocal, cameraWorldMatrix,
+  positionLocal,
 } from "three/tsl";
 import { evalShTsl } from "../orbital/sh-basis";
 import { evalRadialTsl } from "../orbital/radial";
@@ -297,45 +297,37 @@ export class OrbitalCloud implements Component {
     const POS_COLOR = vec3(0.95, 0.35, 0.25);
     const NEG_COLOR = vec3(0.25, 0.55, 0.95);
 
-    // Manual billboarding in TSL. SpriteNodeMaterial overrode positionNode
-    // internally to do single-sprite billboarding, ignoring our per-instance
-    // storage attribute → only one quad rendered.
-    //
-    // For each vertex of each instance: place a screen-aligned offset
-    // around the instance's world-space center. The screen-aligned offset
-    // is `cameraWorldMatrix * (vertex.xy * scale, 0, 0)` — the camera's
-    // world-space basis vectors scaled by the per-vertex local position
-    // (PlaneGeometry vertices live in [-0.5, 0.5]²).
+    // DIAGNOSTIC: simplify radically to verify whether the storage→vertex
+    // per-instance binding even works. Use a tiny IcosahedronGeometry (no
+    // billboarding, no PlaneGeometry) — same pattern as ParticleView which
+    // is known to work. If N spheres appear distributed in space, the
+    // instancing path is OK and the previous failures were billboarding-
+    // specific. If we still see one or a few stretched shapes, the
+    // storage→vertex binding itself is wrong.
     const mat = new MeshBasicNodeMaterial();
-    // Per-instance center. `.toAttribute()` exposes the storage buffer as a
-    // READ-ONLY instanced attribute — necessary because WebGPU forbids
-    // read_write storage bindings in the vertex stage. The compute kernel
-    // still has read_write access via the same buffer object.
+    // Per-instance center via toAttribute(). Position the entire mesh of
+    // each instance at that center — sphere is symmetric, no billboarding
+    // needed.
     const center = this.positionsStorage.toAttribute();
-    // Hold scaleUniform on the instance so the slider can update it live.
+    // The default positionLocal is the geometry vertex; we want
+    // center + vertex_local. (TSL's `positionNode` overrides
+    // positionLocal in the model→world step.)
     this.scaleUniform = uniform(this.params.pointSize * 0.01);
-    const offsetCamSpace = vec4(
-      positionLocal.x.mul(this.scaleUniform),
-      positionLocal.y.mul(this.scaleUniform),
-      0,
-      0,
-    );
-    const offsetWorld = cameraWorldMatrix.mul(offsetCamSpace).xyz;
-    mat.positionNode = center.add(offsetWorld) as unknown as any;
+    // Per-vertex world position = instance_center + local_vertex_offset.
+    // (positionLocal is the geometry's vertex attribute. The sphere stays
+    // intact; just shifted to the per-instance center.)
+    mat.positionNode = center.add(positionLocal) as unknown as any;
     // Bipolar color: positive lobes warm, negative cool.
     const signAttrNode = this.signsStorage.toAttribute();
     const t = signAttrNode.mul(0.5).add(0.5);
     mat.colorNode = mix(NEG_COLOR, POS_COLOR, t) as unknown as any;
-    // Opaque rendering — additive blending corrupts the GTAO normal MRT
-    // target. Re-enabling additive requires excluding OrbitalCloud from
-    // the AO pass or a separate post step.
     mat.transparent = false;
 
-    // InstancedMesh of a unit quad — three's documented instancing path.
-    // `positionsStorage.toAttribute()` above is an instanced attribute, so
-    // each instance gets its own world-space center.
-    const quadGeom = new PlaneGeometry(1, 1);
-    const pts = new InstancedMesh(quadGeom, mat, N);
+    // Tiny sphere — radius keyed off pointSize so the slider still works.
+    // PlaneGeometry + manual billboard was producing stretched triangles
+    // even with .toAttribute(), so we abandon billboard for now.
+    const sphereGeom = new IcosahedronGeometry(this.params.pointSize * 0.01, 0);
+    const pts = new InstancedMesh(sphereGeom, mat, N);
     pts.frustumCulled = false; // particles roam past the initial bounds
     this.points = pts;
     this.material = mat;
