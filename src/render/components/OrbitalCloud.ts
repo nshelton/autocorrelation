@@ -5,7 +5,7 @@ import {
   Color,
 } from "three";
 import { PointsNodeMaterial, StorageBufferAttribute } from "three/webgpu";
-import { storage, uniform } from "three/tsl";
+import { Fn, instanceIndex, hash, vec3, float, storage, uniform } from "three/tsl";
 import type { Component, ComponentDeps } from "./Component";
 
 // ---- coefficient layout (must match sh-basis.ts) ----
@@ -73,7 +73,7 @@ export class OrbitalCloud implements Component {
 
   private params: Record<string, number>;
   private scene: ComponentDeps["scene"];
-  // private renderer: ComponentDeps["renderer"];   // used in Task 5
+  private renderer: ComponentDeps["renderer"];
   // private paramStore: ComponentDeps["paramStore"]; // used in Task 10
 
   private numParticles: number;
@@ -81,12 +81,14 @@ export class OrbitalCloud implements Component {
   private material: PointsNodeMaterial | null = null;
   // Storage handles (initialized in init()). Filled in across Tasks 4-6.
   private positionsStorage: any = null;
-  private uniforms: Record<string, unknown> | null = null;
+  private uniforms: any = null;
+  private updateKernel: any = null;
+  private frameCounter = 0;
   private disposed = false;
 
   constructor(deps: ComponentDeps, params: Record<string, number>) {
     this.scene = deps.scene;
-    // this.renderer = deps.renderer;
+    this.renderer = deps.renderer;
     // this.paramStore = deps.paramStore;
     this.params = params;
     this.numParticles = Math.round(params.numParticles);
@@ -112,10 +114,43 @@ export class OrbitalCloud implements Component {
     }
 
     // Wrap as a TSL storage buffer. StorageBufferAttribute marks the buffer
-    // for GPU storage binding. (In Task 5 we drive this from the compute
-    // shader; for now it just feeds the points geometry.)
+    // for GPU storage binding. The compute kernel and the Points mesh share
+    // the same backing allocation via toAttribute().
     const posAttr = new StorageBufferAttribute(positionsCpu, 3);
     this.positionsStorage = storage(posAttr, "vec3", N);
+
+    // Uniforms updated each frame from the params bag in update().
+    this.uniforms = {
+      dt:        uniform(0.0),
+      diffusion: uniform(this.params.diffusion),
+      frame:     uniform(0),
+    };
+
+    // Compute kernel: pos += diffusion * randn(3) * sqrt(dt).
+    // randn produced via hash() of (instanceIndex, frame) per axis,
+    // Box-Muller-approximated: uniform [0,1) → [-0.5, 0.5) × √12 gives
+    // variance 1. Visually indistinguishable from gaussian at these magnitudes.
+    const positions = this.positionsStorage;
+    const dtU = this.uniforms.dt;
+    const diffU = this.uniforms.diffusion;
+    const frameU = this.uniforms.frame;
+
+    // Cast the callback to `any` — Fn's TS overloads require a Node return, but
+    // compute kernels are side-effecting and return void at the JS level.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    this.updateKernel = (Fn as any)(() => {
+      const p = positions.element(instanceIndex);
+
+      // Three independent hashes per particle per frame mapped to N(0,1) approx.
+      const seed = float(instanceIndex).add(frameU.mul(0x9E3779B1));
+      const rx = hash(seed.add(0)).sub(0.5).mul(Math.sqrt(12));
+      const ry = hash(seed.add(1)).sub(0.5).mul(Math.sqrt(12));
+      const rz = hash(seed.add(2)).sub(0.5).mul(Math.sqrt(12));
+
+      const sigma = diffU.mul(dtU.sqrt());
+      const dp = vec3(rx, ry, rz).mul(sigma);
+      p.assign(p.add(dp));
+    })().compute(this.numParticles);
 
     // Build the points geometry. The position attribute is bound from the
     // storage buffer via `toAttribute()` so the Points mesh and the compute
@@ -143,9 +178,15 @@ export class OrbitalCloud implements Component {
   }
 
   update(): void {
-    // No compute yet — particles are static. Task 5 wires the kernel and
-    // populates this.uniforms for hot-param updates.
-    void this.uniforms;
+    if (!this.updateKernel || this.disposed) return;
+    // Frame-locked dt; clock-locked dt would be more precise but irrelevant
+    // since the kernel just adds randn(3) per particle (statistical, not
+    // deterministic).
+    const dt = (1 / 60) * this.params.timescale;
+    this.uniforms.dt.value = dt;
+    this.uniforms.diffusion.value = this.params.diffusion;
+    this.uniforms.frame.value = ++this.frameCounter;
+    void this.renderer.computeAsync(this.updateKernel);
   }
 
   dispose(): void {
