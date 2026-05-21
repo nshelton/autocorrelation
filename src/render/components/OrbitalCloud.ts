@@ -152,12 +152,16 @@ export class OrbitalCloud implements Component {
 
     // Uniforms updated each frame from the params bag in update().
     this.uniforms = {
-      dt:          uniform(0.0),
-      diffusion:   uniform(this.params.diffusion),
-      frame:       uniform(0),
-      n:           uniform(this.params.n),
-      radialScale: uniform(this.params.radialScale),
-      driftGain:   uniform(this.params.driftGain),
+      dt:             uniform(0.0),
+      diffusion:      uniform(this.params.diffusion),
+      frame:          uniform(0),
+      n:              uniform(this.params.n),
+      radialScale:    uniform(this.params.radialScale),
+      driftGain:      uniform(this.params.driftGain),
+      precessionGain: uniform(this.params.precessionGain),
+      Bx:             uniform(this.params.Bx),
+      By:             uniform(this.params.By),
+      Bz:             uniform(this.params.Bz),
       shCoefs,
     };
 
@@ -201,6 +205,8 @@ export class OrbitalCloud implements Component {
 
       // --- Compose velocity ---
       const drift = gradLog.mul(driftU);
+      const B = vec3(this.uniforms.Bx, this.uniforms.By, this.uniforms.Bz);
+      const precess = B.cross(p).mul(this.uniforms.precessionGain);
 
       // --- Diffusion (unchanged) ---
       const seed = float(instanceIndex).add(frameU.mul(0x9E3779B1));
@@ -211,7 +217,7 @@ export class OrbitalCloud implements Component {
       const noiseStep = vec3(rxn, ryn, rzn).mul(sigma);
 
       // --- Update position ---
-      const pNew = p.add(drift.mul(dtU)).add(noiseStep);
+      const pNew = p.add(drift.add(precess).mul(dtU)).add(noiseStep);
       p.assign(pNew);
 
       // --- Write sign(ψ) for coloring (re-evaluate at new position so color
@@ -270,6 +276,10 @@ export class OrbitalCloud implements Component {
     this.uniforms.n.value = this.params.n;
     this.uniforms.radialScale.value = this.params.radialScale;
     this.uniforms.driftGain.value = this.params.driftGain;
+    this.uniforms.precessionGain.value = this.params.precessionGain;
+    this.uniforms.Bx.value = this.params.Bx;
+    this.uniforms.By.value = this.params.By;
+    this.uniforms.Bz.value = this.params.Bz;
     void this.renderer.computeAsync(this.updateKernel);
   }
 
