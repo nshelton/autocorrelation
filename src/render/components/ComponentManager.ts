@@ -1,4 +1,4 @@
-import type { Pane } from "tweakpane";
+import type { FolderApi } from "tweakpane";
 import type { Component, ComponentClass, ComponentDeps } from "./Component";
 
 // Per-component runtime state. paramsBag is null for components that don't
@@ -72,16 +72,15 @@ export class ComponentManager {
   // Add one tweakpane folder per component: enable checkbox first, then
   // (if applicable) one slider per param bound to the stable bag. Must
   // be called AFTER start() — slots are populated there.
-  bindUI(pane: Pane): void {
+  bindUI(parent: FolderApi): void {
     const { paramStore } = this.deps;
 
     for (const slot of this.slots) {
-      const folder = pane.addFolder({ title: slot.cls.label });
+      const enabled = paramStore.get(slot.enabledKey) === true;
+      const folder = parent.addFolder({ title: slot.cls.label, expanded: enabled });
       this.paneTeardowns.push(folder);
 
-      const enabledProxy: { enabled: boolean } = {
-        enabled: paramStore.get(slot.enabledKey) === true,
-      };
+      const enabledProxy: { enabled: boolean } = { enabled };
       const enabledBinding = folder.addBinding(enabledProxy, "enabled", {
         label: "enabled",
       });
@@ -89,16 +88,35 @@ export class ComponentManager {
         paramStore.set(slot.enabledKey, e.value);
       });
       // Mirror external enable changes (e.g. from `Reset to defaults`)
-      // back into the checkbox UI.
+      // back into the checkbox UI, and collapse the folder when a component
+      // is disabled so disabled scenes don't clutter the panel.
       const unsub = paramStore.subscribe((key, value) => {
         if (key === slot.enabledKey && typeof value === "boolean") {
           if (enabledProxy.enabled !== value) {
             enabledProxy.enabled = value;
             folder.refresh();
           }
+          folder.expanded = value;
         }
       });
       this.paneTeardowns.push({ dispose: unsub });
+
+      // Per-component reset button. Only touches THIS component's params;
+      // does not reset the enabled flag or any other component's params.
+      // Setting each key through paramStore.set() flows through the mirror
+      // subscriber (which updates slot.paramsBag), but tweakpane caches
+      // the displayed value, so we folder.refresh() at the end to re-pull.
+      if (slot.paramsBag && slot.cls.paramDefaults) {
+        const defaults = slot.cls.paramDefaults;
+        const prefix = slot.cls.paramPrefix ?? slot.cls.id;
+        const resetBtn = folder.addButton({ title: "Reset to defaults" });
+        resetBtn.on("click", () => {
+          for (const [k, def] of Object.entries(defaults)) {
+            paramStore.set(`${prefix}.${k}`, def);
+          }
+          folder.refresh();
+        });
+      }
 
       if (!slot.paramsBag) continue;
       // Slider/dropdown bindings are not pushed into paneTeardowns
