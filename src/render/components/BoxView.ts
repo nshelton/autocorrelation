@@ -1,5 +1,4 @@
 import {
-  Scene,
   InstancedMesh,
   InstancedBufferAttribute,
   BoxGeometry,
@@ -17,39 +16,32 @@ import {
   instancedBufferAttribute,
 } from "three/tsl";
 import RAPIER from "@dimforge/rapier3d-compat";
-import type { FeatureStore } from "../store/FeatureStore";
-import type { ParamStore } from "../params/ParamStore";
-
-export interface BoxViewDeps {
-  scene: Scene;
-  store: FeatureStore;
-  paramStore: ParamStore;
-}
+import type { Component, ComponentDeps } from "./Component";
 
 const BOX_COUNT = 1024;
 const CONTAINER_HALF = 1.5;
 const BASE_SIZE = 0.12;
 
-export class BoxView {
-  // Live-tunable params. App.bindUI wires these to ParamStore (persisted to localStorage)
-  // and to tweakpane via the prefix. Mutated in place; read each frame in update().
-  public paramPrefix = "boxView";
-  public params: Record<string, number> = {
-    pull: 0.3,
-    timestep: 1 / 30,
-    width: 0.5,
-  };
-  public paramOpts: Record<
-    string,
-    { min: number; max: number; step?: number }
-  > = {
+export class BoxView implements Component {
+  static id = "boxView";
+  static label = "Box View";
+  static paramPrefix = "boxView";
+  static paramOpts = {
     pull: { min: 0, max: 1, step: 0.01 },
     timestep: { min: 0.005, max: 0.1, step: 0.001 },
     width: { min: 0, max: 2, step: 0.01 },
   };
+  static paramDefaults = {
+    pull: 0.3,
+    timestep: 1 / 30,
+    width: 0.5,
+  };
 
-  private scene: Scene;
-  private store: FeatureStore;
+  // Reference to App-owned stable bag — read each frame, mutated by tweakpane.
+  // Never reassigned; tweakpane bindings depend on the object identity.
+  private params: Record<string, number>;
+  private scene: ComponentDeps["scene"];
+  private store: ComponentDeps["store"];
   private mesh: InstancedMesh | null = null;
   private world: RAPIER.World | null = null;
   private bodies: RAPIER.RigidBody[] = [];
@@ -57,9 +49,10 @@ export class BoxView {
   private dummy = new Object3D();
   private disposed = false;
 
-  constructor(deps: BoxViewDeps) {
+  constructor(deps: ComponentDeps, params: Record<string, number>) {
     this.scene = deps.scene;
     this.store = deps.store;
+    this.params = params;
     void this.init();
   }
 
@@ -77,7 +70,6 @@ export class BoxView {
     const colorArr = new Float32Array(BOX_COUNT * 3);
     const tmpColor = new Color();
     for (let i = 0; i < BOX_COUNT; i++) {
-      // tmpColor.setHSL(i / BOX_COUNT, 0.7, 0.6);
       tmpColor.setHSL(1, 1, 1);
       tmpColor.toArray(colorArr, i * 3);
     }
