@@ -263,8 +263,11 @@ export class OrbitalCloud implements Component {
 
       // --- Compose final position and lifetime ---
       const outsideMask = pNew.length().greaterThan(bR);
-      // TSL bool OR: add the two 0/1 values and check > 0.
-      const shouldRespawn = outsideMask.add(expired).greaterThan(0);
+      // TSL bool OR via float cast: WGSL rejects (bool + bool), so each
+      // boolean is cast to f32 individually before the add.
+      const shouldRespawn = outsideMask.select(float(1), float(0))
+        .add(expired.select(float(1), float(0)))
+        .greaterThan(0);
       const pFinal = shouldRespawn.select(reseeded, pNew);
       const ltFinal = shouldRespawn.select(freshLifetime, ltNew);
 
