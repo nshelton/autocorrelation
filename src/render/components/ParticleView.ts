@@ -23,6 +23,7 @@ const MAX_PARTICLES = 10000;
 const BASE_RADIUS = 0.04;
 const COLLISION_RATIO = 0.5;
 const SPAWN_POINT = { x: 0, y: 0, z: 0 };
+const ATTRACTOR_POSITION = { x: 0.5, y: 0, z: 0 };
 // Scale factor random range. Visual radius = BASE_RADIUS * scale.
 const SCALE_MIN = 0.5;
 const SCALE_MAX = 1.5;
@@ -41,6 +42,8 @@ export class ParticleView implements Component {
     containerSize: { min: 0.5, max: 4, step: 0.05 },
     restitution: { min: 0, max: 1, step: 0.01 },
     damping: { min: 0, max: 2, step: 0.01 },
+    attractorStrength: { min: 0, max: 50, step: 0.1 },
+    attractorMinRadius: { min: 0.05, max: 0.5, step: 0.01 },
   };
   static paramDefaults = {
     numParticles: 2000,
@@ -50,6 +53,8 @@ export class ParticleView implements Component {
     containerSize: 1.5,
     restitution: 0.6,
     damping: 0.2,
+    attractorStrength: 5,
+    attractorMinRadius: 0.2,
   };
   static paramKinds = {
     numParticles: "discrete" as const,
@@ -196,6 +201,8 @@ export class ParticleView implements Component {
   update(): void {
     if (!this.world || !this.mesh) return;
     const noiseStrength = this.params.noiseStrength;
+    const attractorStrength = this.params.attractorStrength;
+    const attractorMinRadius = this.params.attractorMinRadius;
     // noiseScale is a hot param — re-create the noise function only when
     // the slider value changes. createCurlNoise's `scale` is closed over
     // at construction, so there's no per-call way to vary it.
@@ -236,6 +243,21 @@ export class ParticleView implements Component {
         },
         true,
       );
+
+      // Newtonian attractor: F = strength * (A - p) / |A - p|^3.
+      // Clamp |A - p| at attractorMinRadius to avoid singularity at r=0.
+      if (attractorStrength > 0) {
+        const dx = ATTRACTOR_POSITION.x - t.x;
+        const dy = ATTRACTOR_POSITION.y - t.y;
+        const dz = ATTRACTOR_POSITION.z - t.z;
+        const r2 = dx * dx + dy * dy + dz * dz;
+        const r = Math.sqrt(r2);
+        if (r >= attractorMinRadius) {
+          const invR3 = 1 / (r * r2);
+          const k = attractorStrength * invR3;
+          body.addForce({ x: dx * k, y: dy * k, z: dz * k }, true);
+        }
+      }
 
       const r = body.rotation();
       const s = this.scales[i];
