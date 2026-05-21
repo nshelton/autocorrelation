@@ -84,4 +84,51 @@ describe("ParamStore", () => {
     expect(fn).toHaveBeenCalledWith("test.alpha", 0.2);
     expect(fn).toHaveBeenCalledWith("test.size", 512);
   });
+
+  const booleanSchema: ParamSchema = {
+    key: "test.flag",
+    label: "Flag",
+    kind: "boolean",
+    default: true,
+    reconfig: false,
+  };
+
+  it("boolean kind: register loads default when no persisted entry", () => {
+    const store = new ParamStore();
+    store.register(booleanSchema);
+    expect(store.get("test.flag")).toBe(true);
+  });
+
+  it("boolean kind: restores persisted boolean from localStorage", () => {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ "test.flag": false }));
+    const store = new ParamStore();
+    store.register(booleanSchema);
+    expect(store.get("test.flag")).toBe(false);
+  });
+
+  it("boolean kind: set accepts a boolean and persists it", () => {
+    const store = new ParamStore();
+    store.register(booleanSchema);
+    store.set("test.flag", false);
+    expect(store.get("test.flag")).toBe(false);
+    const persisted = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "{}");
+    expect(persisted["test.flag"]).toBe(false);
+  });
+
+  it("boolean kind: set rejects non-boolean values", () => {
+    const store = new ParamStore();
+    store.register(booleanSchema);
+    const fn = vi.fn();
+    store.subscribe(fn);
+    store.set("test.flag", 1 as unknown as boolean);
+    expect(store.get("test.flag")).toBe(true);
+    expect(fn).not.toHaveBeenCalled();
+  });
+
+  it("continuous kind: set rejects a boolean value", () => {
+    const store = new ParamStore();
+    store.register(continuousSchema);
+    store.set("test.alpha", true as unknown as number);
+    expect(store.get("test.alpha")).toBe(0.2);
+  });
 });

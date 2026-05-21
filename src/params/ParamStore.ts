@@ -1,4 +1,4 @@
-export type ParamValue = number;
+export type ParamValue = number | boolean;
 
 export type ParamSchema = {
   key: string;
@@ -6,8 +6,9 @@ export type ParamSchema = {
   default: ParamValue;
   reconfig: boolean;
 } & (
-  | { kind: "discrete"; options: ParamValue[] }
+  | { kind: "discrete"; options: number[] }
   | { kind: "continuous"; min: number; max: number; step: number }
+  | { kind: "boolean" }
 );
 
 type Subscriber = (key: string, value: ParamValue) => void;
@@ -30,7 +31,13 @@ export class ParamStore {
     // from persisted/default the first time a key shows up.
     if (this.values.has(schema.key)) return;
     const initial = this.persisted[schema.key];
-    this.values.set(schema.key, initial !== undefined ? initial : schema.default);
+    // Drop a persisted value whose type no longer matches the schema (e.g.
+    // a key was repurposed). Fall back to default rather than throwing.
+    const usable =
+      initial !== undefined && this.matchesKind(schema, initial)
+        ? initial
+        : schema.default;
+    this.values.set(schema.key, usable);
   }
 
   get(key: string): ParamValue {
@@ -42,7 +49,7 @@ export class ParamStore {
     const schema = this.schemas.get(key);
     if (!schema) throw new Error(`ParamStore: unknown key ${key}`);
     if (!this.validate(schema, value)) {
-      console.warn(`ParamStore: rejected ${key}=${value} (out of range)`);
+      console.warn(`ParamStore: rejected ${key}=${value} (out of range or wrong type)`);
       return;
     }
     this.values.set(key, value);
@@ -83,7 +90,14 @@ export class ParamStore {
     return Array.from(this.schemas.values());
   }
 
+  private matchesKind(schema: ParamSchema, value: ParamValue): boolean {
+    if (schema.kind === "boolean") return typeof value === "boolean";
+    return typeof value === "number";
+  }
+
   private validate(schema: ParamSchema, value: ParamValue): boolean {
+    if (schema.kind === "boolean") return typeof value === "boolean";
+    if (typeof value !== "number") return false;
     if (schema.kind === "discrete") return schema.options.includes(value);
     return value >= schema.min && value <= schema.max;
   }
