@@ -1,9 +1,10 @@
-import { InstancedMesh, IcosahedronGeometry } from "three";
-import { MeshBasicNodeMaterial, StorageBufferAttribute } from "three/webgpu";
+import {
+  Points, BufferGeometry, BufferAttribute, AdditiveBlending,
+} from "three";
+import { PointsNodeMaterial, StorageBufferAttribute } from "three/webgpu";
 import {
   Fn, instanceIndex, hash, vec3, float, storage,
   uniform, uniformArray, mix, sign,
-  positionLocal,
 } from "three/tsl";
 import { evalShTsl } from "../orbital/sh-basis";
 import { evalRadialTsl } from "../orbital/radial";
@@ -97,8 +98,8 @@ export class OrbitalCloud implements Component {
   private storeUnsub: (() => void) | null = null;
 
   private numParticles: number;
-  private points: InstancedMesh | null = null;
-  private material: MeshBasicNodeMaterial | null = null;
+  private points: Points | null = null;
+  private material: PointsNodeMaterial | null = null;
   private scaleUniform: any = null;
   // Storage handles (initialized in init()). Filled in across Tasks 4-6.
   private positionsStorage: any = null;
@@ -297,37 +298,39 @@ export class OrbitalCloud implements Component {
     const POS_COLOR = vec3(0.95, 0.35, 0.25);
     const NEG_COLOR = vec3(0.25, 0.55, 0.95);
 
-    // DIAGNOSTIC: simplify radically to verify whether the storage→vertex
-    // per-instance binding even works. Use a tiny IcosahedronGeometry (no
-    // billboarding, no PlaneGeometry) — same pattern as ParticleView which
-    // is known to work. If N spheres appear distributed in space, the
-    // instancing path is OK and the previous failures were billboarding-
-    // specific. If we still see one or a few stretched shapes, the
-    // storage→vertex binding itself is wrong.
-    const mat = new MeshBasicNodeMaterial();
-    // Per-instance center via toAttribute(). Position the entire mesh of
-    // each instance at that center — sphere is symmetric, no billboarding
-    // needed.
-    const center = this.positionsStorage.toAttribute();
-    // The default positionLocal is the geometry vertex; we want
-    // center + vertex_local. (TSL's `positionNode` overrides
-    // positionLocal in the model→world step.)
-    this.scaleUniform = uniform(this.params.pointSize * 0.01);
-    // Per-vertex world position = instance_center + local_vertex_offset.
-    // (positionLocal is the geometry's vertex attribute. The sphere stays
-    // intact; just shifted to the per-instance center.)
-    mat.positionNode = center.add(positionLocal) as unknown as any;
-    // Bipolar color: positive lobes warm, negative cool.
+    // THREE.Points: one vertex per particle. The storage buffer has N
+    // entries and the geometry has N vertices, so vertex-index IS particle-
+    // index — `positionsStorage.toAttribute()` reads positions[i] for the
+    // i-th point without any instancing confusion.
+    //
+    // Trade: WebGPU point primitives are clamped to 1px on Apple Silicon
+    // and many other GPUs, so pointSize doesn't visibly resize particles.
+    // The visual density comes from sheer particle count + additive
+    // blending: many overlapping 1px hits → bright glow where density is
+    // high.
+    const mat = new PointsNodeMaterial();
+    mat.positionNode = this.positionsStorage.toAttribute();
     const signAttrNode = this.signsStorage.toAttribute();
     const t = signAttrNode.mul(0.5).add(0.5);
     mat.colorNode = mix(NEG_COLOR, POS_COLOR, t) as unknown as any;
-    mat.transparent = false;
+    // Keep scaleUniform for API symmetry (the live-update subscriber
+    // mutates it); has no visible effect with point primitives.
+    this.scaleUniform = uniform(this.params.pointSize * 0.01);
 
-    // Tiny sphere — radius keyed off pointSize so the slider still works.
-    // PlaneGeometry + manual billboard was producing stretched triangles
-    // even with .toAttribute(), so we abandon billboard for now.
-    const sphereGeom = new IcosahedronGeometry(this.params.pointSize * 0.01, 0);
-    const pts = new InstancedMesh(sphereGeom, mat, N);
+    // Additive blending: stacked particles brighten into a glow rather than
+    // overwrite. depthWrite off so transparent draw order doesn't matter.
+    // 1px point fragments keep total fragment work bounded even at 1M, so
+    // this doesn't trigger the GTAO/MRT freeze we hit with billboards.
+    mat.transparent = true;
+    mat.depthWrite = false;
+    mat.blending = AdditiveBlending;
+
+    // Geometry: a dummy position attribute is required so three knows the
+    // draw count. Actual positions come from positionNode above.
+    const geom = new BufferGeometry();
+    geom.setAttribute("position", new BufferAttribute(new Float32Array(N * 3), 3));
+    geom.setDrawRange(0, N);
+    const pts = new Points(geom, mat);
     pts.frustumCulled = false; // particles roam past the initial bounds
     this.points = pts;
     this.material = mat;
@@ -375,11 +378,11 @@ export class OrbitalCloud implements Component {
   }
 
   private rebuild(n: number): void {
-    // Dispose current GPU resources.
+    // Dispose current GPU resources. THREE.Points has no own .dispose();
+    // its geometry and material do.
     if (this.points) {
       this.scene.remove(this.points);
       this.points.geometry.dispose();
-      this.points.dispose();
       this.material?.dispose();
       this.points = null;
       this.material = null;
@@ -405,7 +408,6 @@ export class OrbitalCloud implements Component {
     if (this.points) {
       this.scene.remove(this.points);
       this.points.geometry.dispose();
-      this.points.dispose();
       this.material?.dispose();
       this.points = null;
       this.material = null;
