@@ -70,7 +70,8 @@ export class ComponentManager {
   }
 
   // Add one tweakpane folder per component: enable checkbox first, then
-  // (if applicable) one slider per param bound to the stable bag.
+  // (if applicable) one slider per param bound to the stable bag. Must
+  // be called AFTER start() — slots are populated there.
   bindUI(pane: Pane): void {
     const { paramStore } = this.deps;
 
@@ -93,13 +94,16 @@ export class ComponentManager {
         if (key === slot.enabledKey && typeof value === "boolean") {
           if (enabledProxy.enabled !== value) {
             enabledProxy.enabled = value;
-            pane.refresh();
+            folder.refresh();
           }
         }
       });
       this.paneTeardowns.push({ dispose: unsub });
 
       if (!slot.paramsBag || !slot.cls.paramOpts) continue;
+      // Slider bindings are not pushed into paneTeardowns explicitly;
+      // tweakpane's folder.dispose() cascades to child bindings and
+      // their change listeners, and the folder IS in paneTeardowns.
       for (const [k, opts] of Object.entries(slot.cls.paramOpts)) {
         const fullKey = `${slot.cls.paramPrefix ?? slot.cls.id}.${k}`;
         const slider = folder.addBinding(slot.paramsBag, k, {
@@ -113,6 +117,8 @@ export class ComponentManager {
     }
   }
 
+  // No-op after dispose() (slots cleared); safe to call from a paused
+  // RAF loop without guarding.
   update(): void {
     for (const slot of this.slots) {
       slot.instance?.update();
