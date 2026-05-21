@@ -30,4 +30,10 @@ export interface ComponentClass {
   paramPrefix?: string;
   paramOpts?: Record<string, { min: number; max: number; step?: number }>;
   paramDefaults?: Record<string, number>;
+  // Per-key kind override. Absent or "continuous" → continuous (uses paramOpts
+  // min/max/step). "discrete" → uses paramDiscreteOptions for the value set.
+  paramKinds?: Record<string, "continuous" | "discrete">;
+  // For each key whose paramKinds entry is "discrete", the allowed values.
+  // Must be present when paramKinds[key] === "discrete".
+  paramDiscreteOptions?: Record<string, number[]>;
 }
