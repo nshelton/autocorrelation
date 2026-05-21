@@ -10,13 +10,21 @@ export class ParamPanel {
     this.pane = new Pane({ title: "Analysis", container });
     const folder = this.pane.addFolder({ title: "DSP" });
 
+    // ParamPanel owns the DSP folder only. Component-toggle and
+    // component-param schemas are rendered by ComponentManager.bindUI()
+    // into their own per-component folders. Without this filter, HMR
+    // double-renders component widgets here AND in the component folders
+    // (ParamStore.register is idempotent, so on the 2nd page-lifetime mount
+    // it has already-registered component schemas in scope).
     for (const schema of store.schemasInOrder()) {
+      if (!schema.key.startsWith("dsp.")) continue;
       this.bindings[schema.key] = store.get(schema.key);
       const widget = this.addWidget(folder, schema);
       widget.on("change", (e: { value: ParamValue }) => store.set(schema.key, e.value));
     }
 
     this.unsubscribe = store.subscribe((key, value) => {
+      if (!key.startsWith("dsp.")) return;
       if (this.bindings[key] !== value) {
         this.bindings[key] = value;
         this.pane.refresh();
