@@ -1,6 +1,7 @@
 import {
   InstancedMesh,
   IcosahedronGeometry,
+  Mesh,
   Object3D,
   Color,
   InstancedBufferAttribute,
@@ -36,6 +37,7 @@ export class ParticleView implements Component {
   static paramPrefix = "particleView";
   static paramOpts = {
     numParticles: { min: 0, max: 0, step: 0 }, // ignored — discrete kind below
+    timescale: { min: 0, max: 3, step: 0.01 },
     lifetime: { min: 1, max: 10, step: 0.1 },
     noiseScale: { min: 0.1, max: 5.0, step: 0.05 },
     noiseStrength: { min: 0, max: 20, step: 0.1 },
@@ -43,10 +45,11 @@ export class ParticleView implements Component {
     restitution: { min: 0, max: 1, step: 0.01 },
     damping: { min: 0, max: 2, step: 0.01 },
     attractorStrength: { min: 0, max: 50, step: 0.1 },
-    attractorMinRadius: { min: 0.05, max: 0.5, step: 0.01 },
+    attractorRadius: { min: 0.05, max: 1.0, step: 0.01 },
   };
   static paramDefaults = {
     numParticles: 2000,
+    timescale: 1.0,
     lifetime: 3,
     noiseScale: 1.5,
     noiseStrength: 5,
@@ -54,7 +57,7 @@ export class ParticleView implements Component {
     restitution: 0.6,
     damping: 0.2,
     attractorStrength: 5,
-    attractorMinRadius: 0.2,
+    attractorRadius: 0.25,
   };
   static paramKinds = {
     numParticles: "discrete" as const,
@@ -72,6 +75,8 @@ export class ParticleView implements Component {
   private bodies: RAPIER.RigidBody[] = [];
   private colliders: RAPIER.Collider[] = [];
   private wallColliders: RAPIER.Collider[] = [];
+  private attractorCollider: RAPIER.Collider | null = null;
+  private attractorMesh: Mesh | null = null;
   private lifetimes!: Float32Array;
   private maxLifetimes!: Float32Array;
   private scales!: Float32Array;
@@ -81,6 +86,8 @@ export class ParticleView implements Component {
   private lastNoiseScale = NaN;
   private lastDamping = NaN;
   private lastRestitution = NaN;
+  private lastAttractorRadius = NaN;
+  private lastTimescale = NaN;
   private storeUnsub: (() => void) | null = null;
   private disposed = false;
 
@@ -105,7 +112,23 @@ export class ParticleView implements Component {
 
     this.world = new RAPIER.World({ x: 0, y: 0, z: 0 });
     this.addWalls(this.params.containerSize);
+    this.addAttractor(this.params.attractorRadius);
     this.spawnBodies(this.numParticles);
+
+    // Visible attractor sphere — non-instanced single Mesh at fixed position.
+    // Geometry is unit radius; mesh.scale carries the actual radius so the
+    // attractorRadius hot-sweep is a single scale update, no geometry rebuild.
+    const aMat = new MeshBasicNodeMaterial();
+    const aLightDir = vec3(0.408, 0.866, 0.306);
+    const aNdotl = max(dot(normalWorld, aLightDir), float(0.0));
+    const aLit = aNdotl.mul(0.7).add(0.3);
+    aMat.colorNode = vec4(vec3(1.0, 0.6, 0.2).mul(aLit), 1.0);
+    const aGeom = new IcosahedronGeometry(1, 2);
+    const aMesh = new Mesh(aGeom, aMat);
+    aMesh.position.set(ATTRACTOR_POSITION.x, ATTRACTOR_POSITION.y, ATTRACTOR_POSITION.z);
+    aMesh.scale.setScalar(this.params.attractorRadius);
+    this.attractorMesh = aMesh;
+    this.scene.add(aMesh);
 
     // InstancedMesh allocated to MAX_PARTICLES; mesh.count controls how many
     // we render. Per-instance color via our own InstancedBufferAttribute.
@@ -176,6 +199,21 @@ export class ParticleView implements Component {
     make(half + t, half + t, t, 0, 0, -(half + t)); // -z
   }
 
+  private addAttractor(radius: number): void {
+    if (!this.world) return;
+    const body = this.world.createRigidBody(
+      RAPIER.RigidBodyDesc.fixed().setTranslation(
+        ATTRACTOR_POSITION.x,
+        ATTRACTOR_POSITION.y,
+        ATTRACTOR_POSITION.z,
+      ),
+    );
+    this.attractorCollider = this.world.createCollider(
+      RAPIER.ColliderDesc.ball(radius).setRestitution(this.params.restitution),
+      body,
+    );
+  }
+
   private spawnBodies(n: number): void {
     if (!this.world) return;
     const c = this.params.containerSize;
@@ -234,12 +272,16 @@ export class ParticleView implements Component {
     this.wallColliders = [];
     this.world = new RAPIER.World({ x: 0, y: 0, z: 0 });
     this.addWalls(this.params.containerSize);
+    this.addAttractor(this.params.attractorRadius);
     this.spawnBodies(n);
     this.numParticles = n;
     this.mesh.count = n;
-    // Force lastDamping reset so the next frame re-applies it to the new bodies.
+    // Force the hot-param trackers to NaN so the next frame re-applies
+    // their values to the freshly-created colliders + bodies.
     this.lastDamping = NaN;
     this.lastRestitution = NaN;
+    this.lastAttractorRadius = NaN;
+    this.lastTimescale = NaN;
   }
 
   private rebuildWalls(half: number): void {
@@ -254,7 +296,7 @@ export class ParticleView implements Component {
     if (!this.world || !this.mesh) return;
     const noiseStrength = this.params.noiseStrength;
     const attractorStrength = this.params.attractorStrength;
-    const attractorMinRadius = this.params.attractorMinRadius;
+    const attractorRadius = this.params.attractorRadius;
     // noiseScale is a hot param — re-create the noise function only when
     // the slider value changes. createCurlNoise's `scale` is closed over
     // at construction, so there's no per-call way to vary it.
@@ -271,13 +313,29 @@ export class ParticleView implements Component {
       }
       this.lastDamping = this.params.damping;
     }
-    // restitution is hot — sweep all colliders (particles + walls) only
-    // when the slider moved. Same rationale as damping.
+    // restitution is hot — sweep all colliders (particles + walls +
+    // attractor) only when the slider moved. Same rationale as damping.
     if (this.params.restitution !== this.lastRestitution) {
       const r = this.params.restitution;
       for (const c of this.colliders) c.setRestitution(r);
       for (const c of this.wallColliders) c.setRestitution(r);
+      if (this.attractorCollider) this.attractorCollider.setRestitution(r);
       this.lastRestitution = r;
+    }
+    // attractorRadius is hot — sweep the physical sphere collider AND the
+    // visible mesh scale on change. Force-clamp distance uses the same
+    // value so particles never get sucked inside the sphere.
+    if (attractorRadius !== this.lastAttractorRadius) {
+      if (this.attractorCollider) this.attractorCollider.setRadius(attractorRadius);
+      if (this.attractorMesh) this.attractorMesh.scale.setScalar(attractorRadius);
+      this.lastAttractorRadius = attractorRadius;
+    }
+    // timescale is hot — multiplier on rapier's per-step dt. Range capped
+    // at 3x because the solver assumes small timesteps; bigger and contacts
+    // start to tunnel. 0 = paused (rendering continues, physics stops).
+    if (this.params.timescale !== this.lastTimescale) {
+      this.world.timestep = (1 / 60) * this.params.timescale;
+      this.lastTimescale = this.params.timescale;
     }
     this.world.step();
     const dt = this.world.timestep;
@@ -304,7 +362,8 @@ export class ParticleView implements Component {
       // numerically harsh: it goes from gentle at r=1 to brutal at
       // r=0.1. We use a 1/r falloff instead — acceleration drops with
       // distance but never by the same orders of magnitude. Clamped at
-      // attractorMinRadius to avoid the singularity at r=0.
+      // attractorRadius (the physical sphere surface) so particles never
+      // see infinite pull from the singularity at r=0.
       let ax = 0, ay = 0, az = 0;
       if (attractorStrength > 0) {
         const dx = ATTRACTOR_POSITION.x - t.x;
@@ -312,7 +371,7 @@ export class ParticleView implements Component {
         const dz = ATTRACTOR_POSITION.z - t.z;
         const distSq = dx * dx + dy * dy + dz * dz;
         const dist = Math.sqrt(distSq);
-        const clamped = Math.max(dist, attractorMinRadius);
+        const clamped = Math.max(dist, attractorRadius);
         // accelMag ∝ 1/r (linear falloff in 1/distance, not 1/distance²).
         // Direction = unit vector toward attractor = (dx, dy, dz) / dist.
         // So per-axis: dx/dist * (strength / clamped) = dx * strength / (dist * clamped).
@@ -353,13 +412,20 @@ export class ParticleView implements Component {
       this.mesh.dispose();
       this.mesh = null;
     }
+    if (this.attractorMesh) {
+      this.scene.remove(this.attractorMesh);
+      this.attractorMesh.geometry.dispose();
+      (this.attractorMesh.material as MeshBasicNodeMaterial).dispose();
+      this.attractorMesh = null;
+    }
     if (this.world) {
-      // Frees all bodies + colliders too.
+      // Frees all bodies + colliders too (including the attractor).
       this.world.free();
       this.world = null;
     }
     this.bodies = [];
     this.colliders = [];
     this.wallColliders = [];
+    this.attractorCollider = null;
   }
 }
