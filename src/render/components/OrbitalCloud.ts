@@ -1,6 +1,10 @@
 import { InstancedMesh, PlaneGeometry } from "three";
-import { SpriteNodeMaterial, StorageBufferAttribute } from "three/webgpu";
-import { Fn, instanceIndex, hash, vec3, float, storage, uniform, uniformArray, mix, sign } from "three/tsl";
+import { MeshBasicNodeMaterial, StorageBufferAttribute } from "three/webgpu";
+import {
+  Fn, instanceIndex, hash, vec3, vec4, float, storage,
+  uniform, uniformArray, mix, sign,
+  positionLocal, cameraWorldMatrix,
+} from "three/tsl";
 import { evalShTsl } from "../orbital/sh-basis";
 import { evalRadialTsl } from "../orbital/radial";
 import type { Component, ComponentDeps } from "./Component";
@@ -94,7 +98,8 @@ export class OrbitalCloud implements Component {
 
   private numParticles: number;
   private points: InstancedMesh | null = null;
-  private material: SpriteNodeMaterial | null = null;
+  private material: MeshBasicNodeMaterial | null = null;
+  private scaleUniform: any = null;
   // Storage handles (initialized in init()). Filled in across Tasks 4-6.
   private positionsStorage: any = null;
   private signsStorage: any = null;
@@ -292,34 +297,40 @@ export class OrbitalCloud implements Component {
     const POS_COLOR = vec3(0.95, 0.35, 0.25);
     const NEG_COLOR = vec3(0.25, 0.55, 0.95);
 
-    // SpriteNodeMaterial does the billboard rotation in its TSL nodes using
-    // `cameraViewMatrix`, which works on any mesh primitive. We pair it with
-    // `InstancedMesh` (which has real per-instance `instanceIndex`) — three
-    // r170's `Sprite` class has NO `.count` property, so setting one silently
-    // renders a single quad, which is why pointSize/positions appeared broken.
-    const mat = new SpriteNodeMaterial();
-    mat.positionNode = this.positionsStorage.toAttribute();
-    // sign ∈ {-1, 0, 1}. Map to t ∈ [0, 0.5, 1] for mix(NEG, POS, t).
+    // Manual billboarding in TSL. SpriteNodeMaterial overrode positionNode
+    // internally to do single-sprite billboarding, ignoring our per-instance
+    // storage attribute → only one quad rendered.
+    //
+    // For each vertex of each instance: place a screen-aligned offset
+    // around the instance's world-space center. The screen-aligned offset
+    // is `cameraWorldMatrix * (vertex.xy * scale, 0, 0)` — the camera's
+    // world-space basis vectors scaled by the per-vertex local position
+    // (PlaneGeometry vertices live in [-0.5, 0.5]²).
+    const mat = new MeshBasicNodeMaterial();
+    // Per-instance center, fetched from the storage buffer via instanceIndex.
+    const center = this.positionsStorage.element(instanceIndex);
+    // Hold scaleUniform on the instance so the slider can update it live.
+    this.scaleUniform = uniform(this.params.pointSize * 0.01);
+    const offsetCamSpace = vec4(
+      positionLocal.x.mul(this.scaleUniform),
+      positionLocal.y.mul(this.scaleUniform),
+      0,
+      0,
+    );
+    const offsetWorld = cameraWorldMatrix.mul(offsetCamSpace).xyz;
+    mat.positionNode = center.add(offsetWorld) as unknown as any;
+    // Bipolar color: positive lobes warm, negative cool.
     const signAttrNode = this.signsStorage.toAttribute();
     const t = signAttrNode.mul(0.5).add(0.5);
     mat.colorNode = mix(NEG_COLOR, POS_COLOR, t) as unknown as any;
-    // scaleNode controls billboard quad size in WORLD UNITS. The slider's
-    // 0.5..8 range is interpreted as 1% of a world unit (default 2.0 →
-    // 0.02 units, ~0.25% of boundaryRadius=8). Sized aggressively small
-    // because additive blending + dense overdraw was freezing the GPU.
-    (mat as any).scaleNode = uniform(this.params.pointSize * 0.01);
-    // Opaque rendering: additive blending into the scene's MRT (color +
-    // view-space normal) target was corrupting normals, causing GTAO to
-    // ray-march garbage and saturate the GPU. Re-introducing additive
-    // blending will require excluding OrbitalCloud from the MRT pass or
-    // rendering it in a separate non-AO post step.
+    // Opaque rendering — additive blending corrupts the GTAO normal MRT
+    // target. Re-enabling additive requires excluding OrbitalCloud from
+    // the AO pass or a separate post step.
     mat.transparent = false;
 
-    // InstancedMesh of a tiny unit-quad — real per-instance dispatch via
-    // `instanceIndex` (which `positionNode = storage.toAttribute()` reads
-    // from). The geometry size is 1.0 in object space; scaleNode shrinks
-    // it. PlaneGeometry vertices are in [-0.5, 0.5]² which SpriteNodeMaterial
-    // interprets as billboard offsets.
+    // InstancedMesh of a unit quad — three's documented instancing path.
+    // `instanceIndex` (used above) dispatches per-instance for the storage
+    // buffer lookups.
     const quadGeom = new PlaneGeometry(1, 1);
     const pts = new InstancedMesh(quadGeom, mat, N);
     pts.frustumCulled = false; // particles roam past the initial bounds
@@ -336,9 +347,9 @@ export class OrbitalCloud implements Component {
         }
       }
       if (key === "orbitalCloud.pointSize" && typeof value === "number") {
-        // scaleNode controls billboard quad size on SpriteNodeMaterial.
-        // Same 0.01 factor as init() so the slider behaves consistently.
-        if (this.material) (this.material as any).scaleNode = uniform(value * 0.01);
+        // Update the scale uniform in-place. Rebuilding the node would
+        // require re-binding the shader; mutating .value is hot.
+        if (this.scaleUniform) this.scaleUniform.value = value * 0.01;
       }
     });
   }
@@ -384,6 +395,7 @@ export class OrbitalCloud implements Component {
     this.positionsStorage = null;
     this.signsStorage = null;
     this.lifetimesStorage = null;
+    this.scaleUniform = null;
 
     this.numParticles = n;
     this.init();
