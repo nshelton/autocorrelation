@@ -20,4 +20,13 @@ export const postSchemas: ParamSchema[] = [
     options: [0, 1, 2, 3], optionLabels: ["None", "AgX", "ACES", "Neutral"],
     default: 0, reconfig: false },
   { key: "post.tonemap.exposure",label: "Tonemap exposure", kind: "continuous", min: 0.0, max: 4.0, step: 0.01, default: 1.0, reconfig: false },
+
+  // Lens: combined barrel distortion + chromatic aberration + vignette,
+  // implemented as a single resample pass (LensNode uses convertToTexture
+  // internally so it can re-sample the upstream chain at warped UVs).
+  { key: "post.lens.enabled",        label: "Lens on",          kind: "boolean",    default: false, reconfig: false },
+  { key: "post.lens.distortion",     label: "Lens distortion",  kind: "continuous", min: -0.5, max: 0.5,  step: 0.01,  default: 0.0,   reconfig: false },
+  { key: "post.lens.chromatic",      label: "Lens chromatic",   kind: "continuous", min: 0.0,  max: 0.05, step: 0.001, default: 0.005, reconfig: false },
+  { key: "post.lens.vignette",       label: "Lens vignette",    kind: "continuous", min: 0.0,  max: 1.0,  step: 0.01,  default: 0.5,   reconfig: false },
+  { key: "post.lens.vignetteRadius", label: "Lens vig. radius", kind: "continuous", min: 0.0,  max: 1.0,  step: 0.01,  default: 0.4,   reconfig: false },
 ];
