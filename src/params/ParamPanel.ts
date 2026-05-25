@@ -16,7 +16,9 @@ export class ParamPanel {
       widget.on("change", (e: { value: ParamValue }) => store.set(schema.key, e.value));
     }
 
-    this.unsubscribe = store.subscribe((key, value) => {
+    this.unsubscribe = store.subscribe((key, value, source) => {
+      if (source !== "user") return;
+      if (!key.startsWith("dsp.")) return;
       if (this.bindings[key] !== value) {
         this.bindings[key] = value;
         this.pane.refresh();
