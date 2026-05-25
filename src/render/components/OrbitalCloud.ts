@@ -1,13 +1,15 @@
 import {
   Points, BufferGeometry, BufferAttribute, AdditiveBlending,
-  InstancedMesh, BoxGeometry, PlaneGeometry,
+  InstancedMesh, BoxGeometry, PlaneGeometry, DoubleSide,
 } from "three";
 import {
-  PointsNodeMaterial, MeshBasicNodeMaterial, StorageBufferAttribute,
+  PointsNodeMaterial, MeshBasicNodeMaterial,
+  StorageBufferAttribute, StorageInstancedBufferAttribute,
 } from "three/webgpu";
 import {
   Fn, instanceIndex, hash, vec3, vec4, float, storage,
-  uniform, uniformArray, mix, positionLocal, normalWorld, dot, max,
+  uniform, uniformArray, positionLocal, normalLocal, cameraViewMatrix,
+  dot, max,
 } from "three/tsl";
 import { evalShTsl } from "../orbital/sh-basis";
 import { evalRadialTsl } from "../orbital/radial";
@@ -63,14 +65,15 @@ function buildParamOpts(): Record<string, { min: number; max: number; step?: num
   opts.diffusion      = { min: 0, max: 0.2, step: 0.001 };
   opts.driftGain      = { min: 0, max: 5, step: 0.01 };
   opts.precessionGain = { min: 0, max: 10, step: 0.01 };
-  opts.timescale      = { min: 0, max: 3, step: 0.01 };
+  opts.timescale      = { min: 0, max: 1, step: 0.01 };
   opts.numParticles   = { min: 0, max: 0, step: 0 };  // discrete; ignored
   opts.renderMode     = { min: 0, max: 0, step: 0 };  // discrete; ignored
   // Drives splat (mode 1) and cube (mode 2) size live via scaleUniform;
-  // Points (mode 0) ignores it (WebGPU clamps to 1px). Range extends well
-  // below 0.5 because splats stack additively — even sub-pixel splats are
-  // visible at high particle counts.
-  opts.pointSize      = { min: 0.05, max: 8, step: 0.05 };
+  // Points (mode 0) ignores it (WebGPU clamps to 1px). Range is wide because
+  // the per-particle size fade (lifeFactor × |ψ|) brings the average size
+  // well below the slider value — needs headroom to feel substantial at
+  // peak.
+  opts.pointSize      = { min: 0.05, max: 80, step: 0.05 };
   opts.boundaryRadius = { min: 1, max: 20, step: 0.1 };
   opts.lifetime       = { min: 0.5, max: 30, step: 0.1 };
   opts.colorScale     = { min: 0.1, max: 200, step: 0.1 };
@@ -164,6 +167,15 @@ export class OrbitalCloud implements Component {
   private normalsStorage: any = null;
   private lifetimesStorage: any = null;
   private uniforms: any = null;
+  // RAF handle for a deferred rebuild. Mode swaps and particle-count changes
+  // schedule a rebuild on the next animation frame instead of running it
+  // synchronously inside the param-store subscriber. Without this defer,
+  // teardown runs mid-frame and disposes GPU resources that App's RAF loop
+  // is still holding via in-flight `void renderer.computeAsync(...)` /
+  // `void postStack.renderAsync()` promises — the next frame then trips
+  // over the half-disposed pipeline and the page hangs. Reload works
+  // because there are no in-flight commands at startup.
+  private rebuildRaf: number | null = null;
   private updateKernel: any = null;
   private frameCounter = 0;
   private disposed = false;
@@ -195,31 +207,50 @@ export class OrbitalCloud implements Component {
       positionsCpu[i * 3 + 2] = r * Math.cos(phi);
     }
 
-    // Wrap as a TSL storage buffer. StorageBufferAttribute marks the buffer
-    // for GPU storage binding. The compute kernel and the Points mesh share
-    // the same backing allocation via toAttribute().
-    const posAttr = new StorageBufferAttribute(positionsCpu, 3);
+    // Attribute type depends on render mode:
+    //   mode 0 (Points)  : StorageBufferAttribute        (per-vertex)
+    //   mode 1 (Splats)  : StorageInstancedBufferAttribute (per-instance)
+    //   mode 2 (Cubes)   : StorageInstancedBufferAttribute (per-instance)
+    // Both are usable as storage buffers (compute kernel writes via
+    // storage(attr).element(instanceIndex)) AND as vertex attributes
+    // (material reads via storage.toAttribute()). The instanced variant
+    // tells the renderer to advance the attribute per-instance, which is
+    // what InstancedMesh needs — without it, every instance's vertices
+    // read positions[v_index] producing stretched garbage geometry.
+    const mode = Math.round(this.params.renderMode);
+    const useInstanced = mode !== 0;
+    const makeAttr = (data: Float32Array, itemSize: number) =>
+      useInstanced
+        ? new StorageInstancedBufferAttribute(data, itemSize)
+        : new StorageBufferAttribute(data, itemSize);
+
+    const posAttr = makeAttr(positionsCpu, 3);
     this.positionsStorage = storage(posAttr, "vec3", N);
 
     // Per-particle ψ value (signed, continuous). Initialized to zeros; first
     // frame overwrites. Material maps it through a tanh-normalized diverging
     // colormap, so amplitude — not just sign — drives the per-particle color.
     const psiCpu = new Float32Array(N);
-    const psiAttr = new StorageBufferAttribute(psiCpu, 1);
+    const psiAttr = makeAttr(psiCpu, 1);
     this.psiStorage = storage(psiAttr, "float", N);
 
     // Per-particle normalized ∇|ψ|² direction (vec3). Initialized to zero;
     // kernel writes safe.select(normalize(gradLog), +Z) each frame.
     const normalsCpu = new Float32Array(N * 3);
-    const normalsAttr = new StorageBufferAttribute(normalsCpu, 3);
+    const normalsAttr = makeAttr(normalsCpu, 3);
     this.normalsStorage = storage(normalsAttr, "vec3", N);
 
     // Per-particle lifetime counter (seconds). Staggered so respawns spread
-    // across time rather than all firing on the same frame.
+    // across time rather than all firing on the same frame. MUST go through
+    // makeAttr — when the renderer reads it via toAttribute() for the size
+    // fade, it has to be per-instance like the others. A hardcoded
+    // StorageBufferAttribute here made each of the 24 cube vertices read a
+    // different particle's lifetime, distorting the cube into "almost-cube"
+    // shapes that fluctuated with the lifetime cycle.
     const maxLt = this.params.lifetime;
     const lifetimesCpu = new Float32Array(N);
     for (let i = 0; i < N; i++) lifetimesCpu[i] = Math.random() * maxLt;
-    const lifetimesAttr = new StorageBufferAttribute(lifetimesCpu, 1);
+    const lifetimesAttr = makeAttr(lifetimesCpu, 1);
     this.lifetimesStorage = storage(lifetimesAttr, "float", N);
 
     // 16-element SH coefficient array, n (as float for the shader), radialScale.
@@ -347,9 +378,13 @@ export class OrbitalCloud implements Component {
       const lt = lifetimes.element(instanceIndex);
       const ltNew = lt.sub(dtU);
       const expired = ltNew.lessThan(0);
-      // Fresh lifetime: lifetime * (0.5..1.0) jitter, decorrelated from position seeds.
-      const ltSeed = hash(seed.add(100));
-      const freshLifetime = lifetimeU.mul(ltSeed.mul(0.5).add(0.5));
+      // Fresh lifetime = full uniform (no per-particle jitter). The renderer
+      // computes a per-particle size fade from lifetimeAttr / lifetimeU, and
+      // jittered max lifetimes would shift the fade curve unpredictably (a
+      // particle with 0.5× max would spawn already at peak size). The initial
+      // CPU stagger spreads deaths across time on its own; the post-respawn
+      // schedule then stays spread because each particle keeps its own phase.
+      const freshLifetime = lifetimeU;
 
       // --- Compose final position and lifetime ---
       const outsideMask = pNew.length().greaterThan(bR);
@@ -383,61 +418,102 @@ export class OrbitalCloud implements Component {
 
     this.scaleUniform = uniform(this.params.pointSize * 0.01);
 
-    const mode = Math.round(this.params.renderMode);
     let mesh: Points | InstancedMesh;
     let mat: PointsNodeMaterial | MeshBasicNodeMaterial;
 
-    // Storage→attribute conversion for the render path. Points (mode 0) wants
-    // PER-VERTEX (vertex index = particle index). InstancedMesh (modes 1, 2)
-    // wants PER-INSTANCE (geometry has G vertices × N instances, and we want
-    // each instance to read storage[instanceIndex], NOT storage[vIndex]).
-    // `.toAttribute()` defaults to per-vertex; `.setInstanced(true)` is what
-    // flags it as per-instance — without it cubes/splats pull their 8 (or 4)
-    // vertices from 8 (or 4) random particle slots, producing garbage blobs.
-    const wantInstanced = mode !== 0;
-    const psiAttrNode = wantInstanced
-      ? this.psiStorage.toAttribute().setInstanced(true)
-      : this.psiStorage.toAttribute();
-
-    // Hot-cold mapping shared by all 3 modes; only the underlying attribute's
-    // instanced flag differs.
+    // Hot-cold color, computed once. `toAttribute()` on a per-instance
+    // storage gives per-instance access; on a per-vertex storage (Points),
+    // per-vertex access — driven entirely by the underlying attribute's
+    // isInstancedBufferAttribute flag set at allocation time above.
+    const psiAttrNode = this.psiStorage.toAttribute();
     const xCol = psiAttrNode.mul(this.uniforms.colorScale);
     const tNorm = xCol.div(xCol.abs().add(1));
     const absT = tNorm.abs();
-    const warmSide = mix(MID, WARM, absT);
-    const coolSide = mix(MID, COOL, absT);
-    const rgbColor = tNorm.greaterThan(0).select(warmSide, coolSide);
+    // Equivalent to `tNorm.greaterThan(0).select(mix(MID,WARM,absT), mix(MID,COOL,absT))`
+    // but without the if/else flow control. The select form was producing
+    // visually only-warm output for negative ψ in this material pipeline —
+    // likely a TSL ConditionalNode interaction with per-instance attributes.
+    // Linear combo splits tNorm into its positive/negative halves and adds
+    // both offsets to MID; mathematically identical, no branching.
+    const tPos = tNorm.max(0);            // [0,1] for ψ>0, 0 otherwise
+    const tNeg = tNorm.min(0).abs();      // [0,1] for ψ<0, 0 otherwise
+    const rgbColor = MID
+      .add(WARM.sub(MID).mul(tPos))
+      .add(COOL.sub(MID).mul(tNeg));
+
+    // Per-instance size factor: lifetime trapezoid × field-strength.
+    //   lifeFactor: manual cubic-Hermite smoothstep fade-in (over first
+    //     FADE fraction of life) × matching fade-out (over last FADE
+    //     fraction) → S-curve ramps with a plateau in between, slope=0 at
+    //     both endpoints (no spawn pop / death snap). Inlining the cubic
+    //     instead of calling TSL's smoothstep — that gave garbage geometry
+    //     here, likely because smoothstep's node generation interacts oddly
+    //     with the per-instance attribute chain through positionNode.
+    //   absT (=|tNorm|, sigmoid-normalized |ψ|): 0 near nodes → ~1 at lobe peaks.
+    // Used by cubes and splats; Points ignores it (1px clamp).
+    const FADE = 0.3;
+    const FADE_INV = 1 / FADE;
+    const smoothCubic = (x: any) => {
+      // Clamps to [0,1] and applies 3t² - 2t³ — the cubic Hermite ramp.
+      const t = x.min(1).max(0);
+      return t.mul(t).mul(t.mul(-2).add(3));
+    };
+    const lifetimeAttr = this.lifetimesStorage.toAttribute();
+    const lifeFraction = lifetimeAttr.div(this.uniforms.lifetime).min(1).max(0);
+    const age = float(1).sub(lifeFraction);
+    const fadeIn = smoothCubic(age.mul(FADE_INV));
+    const fadeOut = smoothCubic(float(1).sub(age).mul(FADE_INV));
+    const lifeFactor = fadeIn.mul(fadeOut);
+    const sizeFactor = lifeFactor.mul(absT);
+    const effectiveScale = this.scaleUniform.mul(sizeFactor);
 
     if (mode === 1) {
       // --- Mode 1: Oriented splats ---
       // PlaneGeometry quads laid in the plane perpendicular to ∇|ψ|², so
-      // they tile probability-density isosurfaces. Soft Gaussian alpha
-      // falloff; additive blending stacks them into volume-looking clouds.
-      // No depth write, so GTAO doesn't see them (and the +Z geometry
-      // normal would be wrong post-rotation anyway).
+      // they tile probability-density isosurfaces. Now opaque + depth-writing
+      // (the user wanted them "solid like the cubes"). Lambert lighting uses
+      // the per-instance normal directly — the splat's physical orientation
+      // is the gradient direction, so the standard normalWorld (PlaneGeometry's
+      // +Z, unchanged by our positionNode override) is meaningless here.
       const bMat = new MeshBasicNodeMaterial();
-      // Per-instance reads (see psiAttrNode comment above for why .setInstanced).
-      const center = this.positionsStorage.toAttribute().setInstanced(true);
-      const normalAttr = this.normalsStorage.toAttribute().setInstanced(true);
+      const center = this.positionsStorage.toAttribute();
+      const normalAttr = this.normalsStorage.toAttribute();
       // Tangent basis from the per-instance normal. Cross with X axis,
       // falling back to Y when |normal.x| > 0.9 (cross with X degenerates).
       const useY = normalAttr.x.abs().greaterThan(0.9);
       const helper = useY.select(vec3(0, 1, 0), vec3(1, 0, 0));
       const tangent = normalAttr.cross(helper).normalize();
       const bitangent = normalAttr.cross(tangent);
-      // PlaneGeometry vertex local is [-0.5, 0.5]² × {0}; map onto the
-      // tangent plane around the per-instance center, scaled by size.
-      const offset = tangent.mul(positionLocal.x.mul(this.scaleUniform))
-        .add(bitangent.mul(positionLocal.y.mul(this.scaleUniform)));
+      // PlaneGeometry(1,1) is unit; we scale at the vertex stage via
+      // scaleUniform so pointSize is live-tunable without rebuilding.
+      // Scale is built up by component (scalar × scalar = scalar, then
+      // multiplied by vec3 tangent/bitangent) — the vec3.mul(scalar_uniform)
+      // pattern previously gave unreliable results in this material's
+      // pipeline, so we keep all the per-axis scales as scalars.
+      const sx = positionLocal.x.mul(effectiveScale);
+      const sy = positionLocal.y.mul(effectiveScale);
+      const offset = tangent.mul(sx).add(bitangent.mul(sy));
       bMat.positionNode = center.add(offset);
-      // Gaussian alpha falloff: r² ∈ [0, 0.5]; k=12 puts corners at ~e⁻⁶.
-      const r2 = positionLocal.x.mul(positionLocal.x)
-        .add(positionLocal.y.mul(positionLocal.y));
-      const alpha = r2.mul(-12).exp();
-      bMat.colorNode = vec4(rgbColor, alpha) as unknown as any;
-      bMat.transparent = true;
-      bMat.depthWrite = false;
-      bMat.blending = AdditiveBlending;
+      // Lambert against the per-instance world normal (the splat's gradient-
+      // aligned orientation). `.abs()` lights both sides — splats are
+      // DoubleSide. `.xyz` forces vec3 (storage attrs pad to vec4 via varying).
+      // 50% floor instead of 30% to compose better with GTAO.
+      const lightDir = vec3(0.408, 0.866, 0.306);
+      const ndotl = dot(normalAttr.xyz, lightDir).abs();
+      const lit = ndotl.mul(0.5).add(0.5);
+      bMat.colorNode = vec4(rgbColor.mul(lit), 1.0) as unknown as any;
+      bMat.side = DoubleSide;
+
+      // MRT normal override: splat surface normal is the per-instance
+      // gradient direction (world space). Transform to view via
+      // cameraViewMatrix. Same setupNormal-patch trick as cubes; see the
+      // cube branch for why MeshBasicNodeMaterial needs the override.
+      const splatNormalView = cameraViewMatrix
+        .mul(vec4(normalAttr.xyz, 0))
+        .xyz.normalize();
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (bMat as any).setupNormal = () => splatNormalView;
+
       const planeGeom = new PlaneGeometry(1, 1);
       const im = new InstancedMesh(planeGeom, bMat, N);
       im.frustumCulled = false;
@@ -445,21 +521,66 @@ export class OrbitalCloud implements Component {
       mesh = im;
     } else if (mode === 2) {
       // --- Mode 2: Instanced cubes ---
-      // Opaque BoxGeometry, hand-rolled lambert from BoxView.ts:80 (the
-      // comment there documents why MeshStandardNodeMaterial doesn't work
-      // with InstancedMesh on r170). Cubes write proper geometry normals
-      // to the MRT, so GTAO darkens dense regions — that's the 3D-structure
-      // cue we're after. Particle count should stay modest (< 100k) to
-      // avoid the GTAO/MRT stall hit by prior billboard attempts.
+      // Opaque BoxGeometry, hand-rolled lambert (BoxView.ts:80 recipe —
+      // MeshStandardNodeMaterial silently drops lights with InstancedMesh
+      // on r170). Cubes write proper geometry normals to the MRT, so GTAO
+      // darkens dense regions: that's the 3D-structure cue.
+      //
+      // Unit cube + in-shader scaling + per-instance rotation. The cube's
+      // local Z axis is mapped onto the per-particle ∇|ψ|² direction (same
+      // recipe as splats); local X/Y onto the orthogonal tangent basis.
+      // Each cube now sits aligned to the field, top face perpendicular
+      // to the gradient.
       const cMat = new MeshBasicNodeMaterial();
-      // Per-instance read (see psiAttrNode comment above for why .setInstanced).
-      const center = this.positionsStorage.toAttribute().setInstanced(true);
-      // Unit cube scaled by scaleUniform in-shader → pointSize is live.
-      cMat.positionNode = center.add(positionLocal.mul(this.scaleUniform));
+      const center = this.positionsStorage.toAttribute();
+      const normalAttr = this.normalsStorage.toAttribute();
+      // Tangent basis from per-instance normal — robust against degeneracy.
+      const useY = normalAttr.x.abs().greaterThan(0.9);
+      const helper = useY.select(vec3(0, 1, 0), vec3(1, 0, 0));
+      const tangent = normalAttr.cross(helper).normalize();
+      const bitangent = normalAttr.cross(tangent);
+      // Rotated + scaled vertex position:
+      //   worldOffset = tangent·(localX·s) + bitangent·(localY·s) + normal·(localZ·s)
+      const sx = positionLocal.x.mul(effectiveScale);
+      const sy = positionLocal.y.mul(effectiveScale);
+      const sz = positionLocal.z.mul(effectiveScale);
+      const posOffset = tangent.mul(sx)
+        .add(bitangent.mul(sy))
+        .add(normalAttr.mul(sz));
+      cMat.positionNode = center.add(posOffset) as unknown as any;
+
+      // Rotated face normal in world space, reused for both lambert (color)
+      // and the MRT override (AO). `.xyz` forces vec3 — vec3 storage attrs
+      // are padded to vec4 internally when bridged via varying, causing
+      // WGSL constructor errors when we re-wrap in vec4.
+      const rotatedNormalWorld = tangent.xyz.mul(normalLocal.x)
+        .add(bitangent.xyz.mul(normalLocal.y))
+        .add(normalAttr.xyz.mul(normalLocal.z));
+
+      // Lambert against the rotated world normal. 50% floor so back-lit
+      // faces don't crush channels to near-zero (with the matplotlib
+      // coolwarm endpoints, WARM.g and COOL.r are already near-zero).
       const lightDir = vec3(0.408, 0.866, 0.306);
-      const ndotl = max(dot(normalWorld, lightDir), float(0.0));
-      const lit = ndotl.mul(0.7).add(0.3);
+      const ndotl = max(dot(rotatedNormalWorld, lightDir), float(0.0));
+      const lit = ndotl.mul(0.5).add(0.5);
       cMat.colorNode = vec4(rgbColor.mul(lit), 1.0) as unknown as any;
+
+      // MRT normal override: write the ROTATED face normal in view space
+      // so GTAO sees the actual rendered orientation. Without this, MRT
+      // gets the geometry's un-rotated face normal (±x/y/z) and GTAO
+      // misjudges occlusion → some faces come out fully black.
+      // cameraViewMatrix (= matrixWorldInverse) takes world to view space.
+      //
+      // MeshBasicNodeMaterial.setupNormal hardcodes `return normalView`
+      // (MeshBasicNodeMaterial.js:35-39, ignoring this.normalNode), so we
+      // patch the instance method directly. The MRT's `transformedNormalView`
+      // calls builder.context.setupNormal() which dispatches to this.
+      const rotatedNormalView = cameraViewMatrix
+        .mul(vec4(rotatedNormalWorld, 0))
+        .xyz.normalize();
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (cMat as any).setupNormal = () => rotatedNormalView;
+
       const cubeGeom = new BoxGeometry(1, 1, 1);
       const im = new InstancedMesh(cubeGeom, cMat, N);
       im.frustumCulled = false;
@@ -496,18 +617,20 @@ export class OrbitalCloud implements Component {
       if (key === "orbitalCloud.numParticles" && typeof value === "number") {
         const n = Math.round(value);
         if (n !== this.numParticles) {
-          this.rebuild(n);
+          this.scheduleRebuild(n);
         }
       }
       if (key === "orbitalCloud.renderMode" && typeof value === "number") {
-        // Render mode requires rebuilding the mesh + material; storage
-        // buffers and the compute kernel are reused via init().
-        this.rebuild(this.numParticles);
+        // Mode swap requires rebuilding the mesh + material + storages
+        // (instanced vs. non-instanced attribute type differs by mode).
+        this.scheduleRebuild(this.numParticles);
       }
       if (key === "orbitalCloud.pointSize" && typeof value === "number") {
         // Update the scale uniform in-place. Rebuilding the node would
-        // require re-binding the shader; mutating .value is hot. Mode 1
-        // and Mode 2 read scaleUniform live; Mode 0 (Points) ignores it.
+        // require re-binding the shader; mutating .value is hot. Mode 0
+        // (Points) ignores it (WebGPU clamps points to 1px); modes 1 & 2
+        // bake size into geometry, so this no-ops for them too. Kept for
+        // future use if we restore in-shader scaling.
         if (this.scaleUniform) this.scaleUniform.value = value * 0.01;
       }
     });
@@ -537,6 +660,18 @@ export class OrbitalCloud implements Component {
     this.uniforms.lifetime.value = this.params.lifetime;
     this.uniforms.colorScale.value = this.params.colorScale;
     void this.renderer.computeAsync(this.updateKernel);
+  }
+
+  // Defer rebuild to the next RAF so the current frame's in-flight render
+  // and compute commands flush before we tear down their GPU resources.
+  // Coalesces multiple rapid changes into one rebuild.
+  private scheduleRebuild(n: number): void {
+    if (this.rebuildRaf !== null) cancelAnimationFrame(this.rebuildRaf);
+    this.rebuildRaf = requestAnimationFrame(() => {
+      this.rebuildRaf = null;
+      if (this.disposed) return;
+      this.rebuild(n);
+    });
   }
 
   private rebuild(n: number): void {
@@ -575,6 +710,10 @@ export class OrbitalCloud implements Component {
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
+    if (this.rebuildRaf !== null) {
+      cancelAnimationFrame(this.rebuildRaf);
+      this.rebuildRaf = null;
+    }
     this.uniforms = null;
     this.teardown();
   }
