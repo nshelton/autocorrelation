@@ -4,6 +4,8 @@ import { ParamStore, type ParamSchema, type ParamValue } from "./ParamStore";
 export class ParamPanel {
   public pane: Pane;
   public scenes: FolderApi;
+  public camera: FolderApi;
+  public post: FolderApi;
   private bindings: Record<string, ParamValue> = {};
   private unsubscribe: () => void;
 
@@ -33,6 +35,8 @@ export class ParamPanel {
     });
 
     this.scenes = this.pane.addFolder({ title: "Scenes" });
+    this.camera = this.pane.addFolder({ title: "Camera", expanded: false });
+    this.post = this.pane.addFolder({ title: "Post", expanded: false });
     this.pane.addButton({ title: "Reset to defaults" }).on("click", () => store.reset());
   }
 
