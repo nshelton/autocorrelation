@@ -6,7 +6,7 @@ export type ParamSchema = {
   default: ParamValue;
   reconfig: boolean;
 } & (
-  | { kind: "discrete"; options: number[] }
+  | { kind: "discrete"; options: number[]; optionLabels?: string[] }
   | { kind: "continuous"; min: number; max: number; step: number }
   | { kind: "boolean" }
 );

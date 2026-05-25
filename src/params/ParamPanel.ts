@@ -1,14 +1,15 @@
-import { Pane } from "tweakpane";
+import { FolderApi, Pane } from "tweakpane";
 import { ParamStore, type ParamSchema, type ParamValue } from "./ParamStore";
 
 export class ParamPanel {
   public pane: Pane;
+  public scenes: FolderApi;
   private bindings: Record<string, ParamValue> = {};
   private unsubscribe: () => void;
 
   constructor(store: ParamStore, container?: HTMLElement) {
-    this.pane = new Pane({ title: "Analysis", container });
-    const folder = this.pane.addFolder({ title: "DSP" });
+    this.pane = new Pane({ container });
+    const folder = this.pane.addFolder({ title: "Analysis", expanded: false });
 
     // ParamPanel owns the DSP folder only. Component-toggle and
     // component-param schemas are rendered by ComponentManager.bindUI()
@@ -31,6 +32,7 @@ export class ParamPanel {
       }
     });
 
+    this.scenes = this.pane.addFolder({ title: "Scenes" });
     this.pane.addButton({ title: "Reset to defaults" }).on("click", () => store.reset());
   }
 
@@ -45,9 +47,10 @@ export class ParamPanel {
       return folder.addBinding(this.bindings, schema.key, { label: schema.label });
     }
     if (schema.kind === "discrete") {
+      const labels = schema.optionLabels ?? schema.options.map(String);
       return folder.addBinding(this.bindings, schema.key, {
         label: schema.label,
-        options: Object.fromEntries(schema.options.map((v) => [String(v), v])),
+        options: Object.fromEntries(schema.options.map((v, i) => [labels[i], v])),
       });
     }
     return folder.addBinding(this.bindings, schema.key, {
