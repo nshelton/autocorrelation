@@ -11,6 +11,8 @@ import type { Node, WebGPURenderer } from "three/webgpu";
 import type { FolderApi } from "tweakpane";
 import type { PostEffect, PassCtx } from "../PostEffect";
 import type { ParamStore } from "../../../params/ParamStore";
+import type { Modulator } from "../../../params/Modulator";
+import { bindParam } from "../../../params/bindParam";
 
 // Index -> three.js ToneMapping constant. Must match optionLabels in
 // postSchemas.ts (`post.tonemap.mode`): ["None","AgX","ACES","Neutral"].
@@ -66,24 +68,16 @@ export class TonemapEffect implements PostEffect {
     return input.mul(this.exposureU);
   }
 
-  bindUI(folder: FolderApi, store: ParamStore): void {
-    const b = {
-      enabled: store.get("post.tonemap.enabled") as boolean,
-      mode: store.get("post.tonemap.mode") as number,
-      exposure: store.get("post.tonemap.exposure") as number,
-    };
-    folder
-      .addBinding(b, "enabled", { label: "Enabled" })
-      .on("change", (e: { value: boolean }) => store.set("post.tonemap.enabled", e.value));
-    folder
-      .addBinding(b, "mode", {
-        label: "Mode",
-        options: { None: 0, AgX: 1, ACES: 2, Neutral: 3 },
-      })
-      .on("change", (e: { value: number }) => store.set("post.tonemap.mode", e.value));
-    folder
-      .addBinding(b, "exposure", { label: "Exposure", min: 0, max: 4, step: 0.01 })
-      .on("change", (e: { value: number }) => store.set("post.tonemap.exposure", e.value));
+  bindUI(folder: FolderApi, store: ParamStore, modulator: Modulator): void {
+    for (const key of [
+      "post.tonemap.enabled",
+      "post.tonemap.mode",
+      "post.tonemap.exposure",
+    ]) {
+      const schema = store.schemaFor(key);
+      if (!schema) throw new Error(`TonemapEffect.bindUI: schema ${key} missing`);
+      bindParam(folder, store, modulator, schema);
+    }
   }
 
   dispose(): void {

@@ -200,7 +200,7 @@ export class App {
   }
 
   bindPostUI(folder: FolderApi): void {
-    this.postStack.bindUI(folder);
+    this.postStack.bindUI(folder, this.modulator);
   }
 
   bindCameraUI(folder: FolderApi): void {
