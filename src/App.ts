@@ -2,7 +2,7 @@ import { Vector3 } from "three";
 import { createSceneAndCamera } from "./render/Scene";
 import { CameraRig } from "./render/CameraRig";
 import { PostStack } from "./render/post/PostStack";
-import { POST_EFFECTS } from "./render/post";
+import { buildPostEffects } from "./render/post";
 import { FeatureStore } from "./store/FeatureStore";
 import { FpsOverlay } from "./ui/Stats";
 import { ComponentManager } from "./render/components/ComponentManager";
@@ -86,7 +86,7 @@ export class App {
     );
     this.components.start();
 
-    this.postStack = new PostStack(renderer, scene, camera, paramStore, POST_EFFECTS);
+    this.postStack = new PostStack(renderer, scene, camera, paramStore, buildPostEffects(renderer));
     this.postStack.build();
 
     this.rig = new CameraRig(camera, renderer.domElement);
