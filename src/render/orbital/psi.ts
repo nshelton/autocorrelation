@@ -6,7 +6,7 @@ import { evalRadialTsl } from "./radial";
 // Direction-of-r̂ extraction guards against |r|=0 with a min 1e-6 (same
 // epsilon used by the OrbitalCloud kernel so both renderers see identical
 // values at the origin).
-export const evalPsi = Fn(
+export const evalPsi = /*@__PURE__*/ Fn(
   ([pos, shCoefs, n, radialScale]: [any, any, any, any]) => {
     const rLen = pos.length().max(1e-6);
     const rScaled = rLen.div(radialScale);
