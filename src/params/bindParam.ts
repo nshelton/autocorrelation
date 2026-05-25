@@ -88,7 +88,9 @@ export function bindParam(
   depthBinding.on("change", writeBinding);
 
   // Two-way sync from modulator changes (e.g. persisted-on-load).
-  modulator.subscribe((key) => {
+  // Unsubscribe is intentionally discarded — Modulator.dispose() clears all
+  // UI subs at HMR teardown, and the modulator is recreated per cycle.
+  void modulator.subscribe((key) => {
     if (key !== schema.key) return;
     const current = modulator.getBinding(schema.key);
     modProxy.source = current?.source ?? NONE;
