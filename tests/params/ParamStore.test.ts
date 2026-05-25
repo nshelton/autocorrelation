@@ -14,6 +14,17 @@ const continuousSchema: ParamSchema = {
   reconfig: false,
 };
 
+const FOV_SCHEMA: ParamSchema = {
+  key: "camera.fov",
+  label: "FOV",
+  kind: "continuous",
+  min: 10,
+  max: 120,
+  step: 1,
+  default: 60,
+  reconfig: false,
+};
+
 const discreteSchema: ParamSchema = {
   key: "test.size",
   label: "Size",
@@ -56,7 +67,7 @@ describe("ParamStore", () => {
     const fn = vi.fn();
     store.subscribe(fn);
     store.set("test.alpha", 0.3);
-    expect(fn).toHaveBeenCalledWith("test.alpha", 0.3);
+    expect(fn).toHaveBeenCalledWith("test.alpha", 0.3, "user");
   });
 
   it("set rejects out-of-range continuous values", () => {
@@ -81,8 +92,8 @@ describe("ParamStore", () => {
     expect(store.get("test.alpha")).toBe(0.2);
     expect(store.get("test.size")).toBe(512);
     expect(localStorage.getItem(STORAGE_KEY)).toBeNull();
-    expect(fn).toHaveBeenCalledWith("test.alpha", 0.2);
-    expect(fn).toHaveBeenCalledWith("test.size", 512);
+    expect(fn).toHaveBeenCalledWith("test.alpha", 0.2, "user");
+    expect(fn).toHaveBeenCalledWith("test.size", 512, "user");
   });
 
   const booleanSchema: ParamSchema = {
@@ -130,5 +141,36 @@ describe("ParamStore", () => {
     store.register(continuousSchema);
     store.set("test.alpha", true as unknown as number);
     expect(store.get("test.alpha")).toBe(0.2);
+  });
+
+  describe("notify / schemaFor / source arg", () => {
+    let store: ParamStore;
+    beforeEach(() => {
+      store = new ParamStore();
+      store.register(FOV_SCHEMA);
+    });
+
+    it("set() fires subscribers with source='user'", () => {
+      const calls: Array<[string, unknown, string]> = [];
+      store.subscribe((k, v, s) => calls.push([k, v, s]));
+      store.set("camera.fov", 75);
+      expect(calls).toEqual([["camera.fov", 75, "user"]]);
+    });
+
+    it("notify() fires subscribers with source='modulator' without mutating value or persisting", () => {
+      store.set("camera.fov", 75);
+      const calls: Array<[string, unknown, string]> = [];
+      store.subscribe((k, v, s) => calls.push([k, v, s]));
+      store.notify("camera.fov", 90);
+      expect(calls).toEqual([["camera.fov", 90, "modulator"]]);
+      expect(store.get("camera.fov")).toBe(75);
+      expect(JSON.parse(localStorage.getItem("autocorrelation.params.v1")!))
+        .toEqual({ "camera.fov": 75 });
+    });
+
+    it("schemaFor() returns the schema by key", () => {
+      expect(store.schemaFor("camera.fov")).toBe(FOV_SCHEMA);
+      expect(store.schemaFor("does.not.exist")).toBeUndefined();
+    });
   });
 });

@@ -11,7 +11,7 @@ export type ParamSchema = {
   | { kind: "boolean" }
 );
 
-type Subscriber = (key: string, value: ParamValue) => void;
+type Subscriber = (key: string, value: ParamValue, source: "user" | "modulator") => void;
 
 const STORAGE_KEY = "autocorrelation.params.v1";
 
@@ -54,12 +54,20 @@ export class ParamStore {
     }
     this.values.set(key, value);
     this.writePersisted();
-    for (const fn of this.subscribers) fn(key, value);
+    for (const fn of this.subscribers) fn(key, value, "user");
   }
 
   subscribe(fn: Subscriber): () => void {
     this.subscribers.add(fn);
     return () => this.subscribers.delete(fn);
+  }
+
+  notify(key: string, value: ParamValue): void {
+    for (const fn of this.subscribers) fn(key, value, "modulator");
+  }
+
+  schemaFor(key: string): ParamSchema | undefined {
+    return this.schemas.get(key);
   }
 
   reset(): void {
@@ -78,7 +86,7 @@ export class ParamStore {
       }
     }
     for (const [key, value] of changed) {
-      for (const fn of this.subscribers) fn(key, value);
+      for (const fn of this.subscribers) fn(key, value, "user");
     }
   }
 
