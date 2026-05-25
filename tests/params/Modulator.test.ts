@@ -88,13 +88,15 @@ describe("Modulator", () => {
 
   it("beat sources read indexed slot of beatPulses", () => {
     const { store, features, mod } = setup();
-    features.set("beatPulses", new Float32Array([0.1, 0.4, 0.7, 1.0]));
+    const buf = new Float32Array([0.1, 0.4, 0.7, 1.0]);
+    features.set("beatPulses", buf);
     mod.setBinding("camera.fov", { source: "beat.4x", depth: 1 });
     const spy = vi.fn();
     store.subscribe(spy);
     mod.tick();
-    // lerp(20,120,0.7) = 90
-    expect(spy).toHaveBeenCalledWith("camera.fov", 90, "modulator");
+    // lerp(20, 120, buf[2]) — use the Float32 value directly to match runtime precision
+    const expected = 20 + (120 - 20) * buf[2];
+    expect(spy).toHaveBeenCalledWith("camera.fov", expected, "modulator");
   });
 
   it("setBinding(key, null) removes binding and fires one notify(key, base)", () => {

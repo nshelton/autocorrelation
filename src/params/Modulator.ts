@@ -77,9 +77,7 @@ export class Modulator {
       // snap to base rather than lerp(min,max,0) or lerp(min,max,NaN).
       const hasSignal = buf.length > 0 && Number.isFinite(v);
       const target = schema.min + (schema.max - schema.min) * v;
-      const raw = hasSignal ? base + (target - base) * b.depth : base;
-      // Round to step precision to strip Float32 noise (e.g. 0.7f32 → 89.999…).
-      const eff = Math.round(raw / schema.step) * schema.step;
+      const eff = hasSignal ? base + (target - base) * b.depth : base;
       this.store.notify(key, eff);
     }
   }
