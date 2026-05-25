@@ -1,6 +1,6 @@
 import type { PerspectiveCamera, Scene } from "three";
 import type { ShaderNodeObject } from "three/tsl";
-import type { Node, TextureNode } from "three/webgpu";
+import type { Node } from "three/webgpu";
 import type { ParamStore } from "../../params/ParamStore";
 import type { FolderApi } from "tweakpane";
 
@@ -9,9 +9,9 @@ export interface PassCtx {
   scene: Scene;
   camera: PerspectiveCamera;
   // View-space normal. NULL if no enabled effect requested it.
-  sceneNormal: ShaderNodeObject<TextureNode> | null;
+  sceneNormal: ShaderNodeObject<Node> | null;
   // Always available.
-  sceneDepth: ShaderNodeObject<TextureNode>;
+  sceneDepth: ShaderNodeObject<Node>;
 }
 
 export interface PostEffect {

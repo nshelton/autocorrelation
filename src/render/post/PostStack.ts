@@ -1,8 +1,7 @@
 import { PostProcessing } from "three/webgpu";
 import { pass, mrt, output, transformedNormalView } from "three/tsl";
 import type { PerspectiveCamera, Scene } from "three";
-import type { Node, TextureNode, WebGPURenderer } from "three/webgpu";
-import type { ShaderNodeObject } from "three/tsl";
+import type { Node, WebGPURenderer } from "three/webgpu";
 import type { ParamStore } from "../../params/ParamStore";
 import type { FolderApi } from "tweakpane";
 import type { PostEffect, PassCtx } from "./PostEffect";
@@ -66,14 +65,9 @@ export class PostStack {
         : mrt({ output }),
     );
 
-    // @types/three declares getTextureNode as ShaderNodeObject<Node>, but at
-    // runtime it returns a TextureNode subclass — cast through unknown to
-    // match the PassCtx contract (consumers index uvNode/levelNode/etc.).
-    const sceneColor = scenePass.getTextureNode("output") as unknown as ShaderNodeObject<TextureNode>;
-    const sceneNormal = needsNormal
-      ? (scenePass.getTextureNode("normal") as unknown as ShaderNodeObject<TextureNode>)
-      : null;
-    const sceneDepth = scenePass.getTextureNode("depth") as unknown as ShaderNodeObject<TextureNode>;
+    const sceneColor = scenePass.getTextureNode("output");
+    const sceneNormal = needsNormal ? scenePass.getTextureNode("normal") : null;
+    const sceneDepth = scenePass.getTextureNode("depth");
 
     const ctx: PassCtx = {
       scene: this.scene,
