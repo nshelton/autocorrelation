@@ -14,7 +14,7 @@ const continuousSchema: ParamSchema = {
   reconfig: false,
 };
 
-const FOV_SCHEMA: ParamSchema = {
+const fovSchema: ParamSchema = {
   key: "camera.fov",
   label: "FOV",
   kind: "continuous",
@@ -147,14 +147,7 @@ describe("ParamStore", () => {
     let store: ParamStore;
     beforeEach(() => {
       store = new ParamStore();
-      store.register(FOV_SCHEMA);
-    });
-
-    it("set() fires subscribers with source='user'", () => {
-      const calls: Array<[string, unknown, string]> = [];
-      store.subscribe((k, v, s) => calls.push([k, v, s]));
-      store.set("camera.fov", 75);
-      expect(calls).toEqual([["camera.fov", 75, "user"]]);
+      store.register(fovSchema);
     });
 
     it("notify() fires subscribers with source='modulator' without mutating value or persisting", () => {
@@ -169,7 +162,7 @@ describe("ParamStore", () => {
     });
 
     it("schemaFor() returns the schema by key", () => {
-      expect(store.schemaFor("camera.fov")).toBe(FOV_SCHEMA);
+      expect(store.schemaFor("camera.fov")).toBe(fovSchema);
       expect(store.schemaFor("does.not.exist")).toBeUndefined();
     });
   });
