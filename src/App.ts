@@ -226,19 +226,25 @@ export class App {
       .on("change", (e: { value: boolean }) => store.set("light.directional.enabled", e.value));
 
     // Subscribe so persisted-on-load values and external writes apply.
-    this.cameraUnsub = store.subscribe((key, value) => {
+    // Side-effects that mutate THREE state (camera.fov, scene.add) run for
+    // both user and modulator sources. UI proxy mirrors (fovBinding etc.)
+    // are gated to source==="user" so per-frame modulator notifies don't
+    // jitter the slider.
+    this.cameraUnsub = store.subscribe((key, value, source) => {
       if (key === "camera.fov" && typeof value === "number") {
         camera.fov = value;
         camera.updateProjectionMatrix();
-        fovBinding.fov = value;
+        if (source === "user") fovBinding.fov = value;
       } else if (key === "camera.preset" && typeof value === "number") {
-        const name = CAMERA_PRESET_NAMES[value];
-        if (name) void this.rig.goTo(name, { duration: 0.8 });
-        presetBinding.preset = value;
+        if (source === "user") {
+          const name = CAMERA_PRESET_NAMES[value];
+          if (name) void this.rig.goTo(name, { duration: 0.8 });
+          presetBinding.preset = value;
+        }
       } else if (key === "light.directional.enabled" && typeof value === "boolean") {
         if (value) this.scene.add(this.directionalLight);
         else this.scene.remove(this.directionalLight);
-        lightBinding.enabled = value;
+        if (source === "user") lightBinding.enabled = value;
       }
     });
 
