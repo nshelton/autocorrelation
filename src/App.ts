@@ -9,6 +9,7 @@ import { ComponentManager } from "./render/components/ComponentManager";
 import { COMPONENTS } from "./render/components";
 
 import { Modulator } from "./params/Modulator";
+import { bindParam } from "./params/bindParam";
 import type { ParamStore } from "./params/ParamStore";
 import type { WebGPURenderer } from "three/webgpu";
 import type { CameraPose } from "./render/CameraRig";
@@ -206,53 +207,34 @@ export class App {
     const store = this.deps.paramStore;
     const camera = this.rig.camera;
 
-    // FOV: live-write to camera + projection update.
-    const fovBinding = { fov: store.get("camera.fov") as number };
-    folder
-      .addBinding(fovBinding, "fov", { label: "FOV", min: 20, max: 120, step: 1 })
-      .on("change", (e: { value: number }) => store.set("camera.fov", e.value));
+    const fovSchema = store.schemaFor("camera.fov");
+    const presetSchema = store.schemaFor("camera.preset");
+    const lightSchema = store.schemaFor("light.directional.enabled");
+    if (!fovSchema || !presetSchema || !lightSchema) {
+      throw new Error("bindCameraUI: required schemas missing");
+    }
+    bindParam(folder, store, this.modulator, fovSchema);
+    bindParam(folder, store, this.modulator, presetSchema);
+    bindParam(folder, store, this.modulator, lightSchema);
 
-    // Preset: dropdown -> rig.goTo. Stored as integer index.
-    const presetBinding = { preset: store.get("camera.preset") as number };
-    folder
-      .addBinding(presetBinding, "preset", {
-        label: "Preset",
-        options: Object.fromEntries(CAMERA_PRESET_NAMES.map((name, i) => [name, i])),
-      })
-      .on("change", (e: { value: number }) => store.set("camera.preset", e.value));
-
-    // Directional light toggle. Lit materials are not in the scene yet, so
-    // visible impact is currently nil — wired now so future lit materials
-    // (OrbitalCloud cube/splat modes are candidates) pick up the same source.
-    const lightBinding = { enabled: store.get("light.directional.enabled") as boolean };
-    folder
-      .addBinding(lightBinding, "enabled", { label: "Light" })
-      .on("change", (e: { value: boolean }) => store.set("light.directional.enabled", e.value));
-
-    // Subscribe so persisted-on-load values and external writes apply.
-    // Side-effects that mutate THREE state (camera.fov, scene.add) run for
-    // both user and modulator sources. UI proxy mirrors (fovBinding etc.)
-    // are gated to source==="user" so per-frame modulator notifies don't
-    // jitter the slider.
+    // Side-effects subscriber. `camera.fov` is the only key here that may be
+    // modulated, so its camera-uniform write runs on every notify. The other
+    // two keys (preset, light) are not modulatable; their side-effects are
+    // gated on source==="user" defensively — they aren't modulatable and would
+    // never fire from the modulator, but gating is cheap.
     this.cameraUnsub = store.subscribe((key, value, source) => {
       if (key === "camera.fov" && typeof value === "number") {
         camera.fov = value;
         camera.updateProjectionMatrix();
-        if (source === "user") fovBinding.fov = value;
-      } else if (key === "camera.preset" && typeof value === "number") {
-        if (source === "user") {
-          const name = CAMERA_PRESET_NAMES[value];
-          if (name) void this.rig.goTo(name, { duration: 0.8 });
-          presetBinding.preset = value;
-        }
-      } else if (key === "light.directional.enabled" && typeof value === "boolean") {
+      } else if (key === "camera.preset" && typeof value === "number" && source === "user") {
+        const name = CAMERA_PRESET_NAMES[value];
+        if (name) void this.rig.goTo(name, { duration: 0.8 });
+      } else if (key === "light.directional.enabled" && typeof value === "boolean" && source === "user") {
         if (value) this.scene.add(this.directionalLight);
         else this.scene.remove(this.directionalLight);
-        if (source === "user") lightBinding.enabled = value;
       }
     });
 
-    // Apply current persisted values once on bind so reload restores state.
     camera.fov = store.get("camera.fov") as number;
     camera.updateProjectionMatrix();
   }
