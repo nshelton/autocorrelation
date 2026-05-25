@@ -11,25 +11,9 @@ import {
   uniform, uniformArray, positionLocal, normalLocal, cameraViewMatrix,
   dot, max,
 } from "three/tsl";
-import { evalShTsl } from "../orbital/sh-basis";
-import { evalRadialTsl } from "../orbital/radial";
+import { evalPsi } from "../orbital/psi";
 import type { Component, ComponentDeps } from "./Component";
 import type { ParamStore } from "../../params/ParamStore";
-
-const PSI_EPS = 1e-4;
-
-// TSL Fn that returns ψ(pos). Used both for sign read-out and finite-difference
-// gradient inside the compute kernel.
-const evalPsi = Fn(([pos, shCoefs, n, radialScale]: [any, any, any, any]) => {
-  const rLen = pos.length().max(1e-6);
-  const rScaled = rLen.div(radialScale);
-  const xh = pos.x.div(rLen);
-  const yh = pos.y.div(rLen);
-  const zh = pos.z.div(rLen);
-  const R = evalRadialTsl(rScaled, n);
-  const Y = evalShTsl(shCoefs, xh, yh, zh);
-  return R.mul(Y);
-});
 
 // ---- coefficient layout (must match sh-basis.ts) ----
 const SH_LABELS = [
@@ -303,6 +287,7 @@ export class OrbitalCloud implements Component {
 
       // --- Evaluate ψ(p) and gradient via central differences ---
       // 6 offset evaluations for ∇log|ψ|² via central differences.
+      const PSI_EPS = 1e-4;
       const eps = float(PSI_EPS);
       const psiXp = evalPsi(p.add(vec3(eps, 0, 0)), shCoefsU, nU, rsU);
       const psiXm = evalPsi(p.add(vec3(eps.negate(), 0, 0)), shCoefsU, nU, rsU);
