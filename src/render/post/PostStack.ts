@@ -1,7 +1,7 @@
 import { PostProcessing } from "three/webgpu";
 import { pass, mrt, output, transformedNormalView } from "three/tsl";
 import type { PerspectiveCamera, Scene } from "three";
-import type { Node, WebGPURenderer } from "three/webgpu";
+import type { WebGPURenderer } from "three/webgpu";
 import type { ParamStore } from "../../params/ParamStore";
 import type { FolderApi } from "tweakpane";
 import type { PostEffect, PassCtx } from "./PostEffect";
@@ -76,7 +76,7 @@ export class PostStack {
       sceneDepth,
     };
 
-    let node: Node = sceneColor;
+    let node = sceneColor;
     for (const effect of enabled) node = effect.build(node, ctx);
 
     this.post.outputNode = node;

@@ -23,7 +23,7 @@ export interface PostEffect {
   enabled: boolean;
 
   // Build this effect's node chain. `input` is the upstream color node.
-  build(input: Node, ctx: PassCtx): Node;
+  build(input: ShaderNodeObject<Node>, ctx: PassCtx): ShaderNodeObject<Node>;
 
   // Register param schemas + uniform subscriptions. Called once at construction.
   registerParams(store: ParamStore, requestRebuild: () => void): void;

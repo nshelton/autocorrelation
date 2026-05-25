@@ -1,5 +1,7 @@
 import type { PostEffect } from "./PostEffect";
+import { AoEffect } from "./effects/AoEffect";
 
 // Canonical order. Effects are reordered only by editing this list.
-// Empty for now — populated in subsequent tasks.
-export const POST_EFFECTS: PostEffect[] = [];
+export const POST_EFFECTS: PostEffect[] = [
+  new AoEffect(),
+];
