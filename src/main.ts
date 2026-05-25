@@ -128,7 +128,7 @@ function buildAppLayer(deps: AppDeps): void {
   panel = new ParamPanelCtor(deps.paramStore);
   bridge = new WorkletBridgeCtor(deps.paramStore, deps.workletNode.port);
   app.start();
-  app.bindUI(panel.pane);
+  app.bindUI(panel.scenes);
   if (initialBootstrap) {
     bridge.bootstrap();
     initialBootstrap = false;

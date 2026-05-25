@@ -1,4 +1,5 @@
 import { PerspectiveCamera, Vector3 } from "three";
+import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 
 export interface CameraPose {
   position: Vector3;
@@ -26,13 +27,27 @@ const linearEase = (t: number) => t;
 
 export class CameraRig {
   readonly camera: PerspectiveCamera;
+  readonly controls: OrbitControls;
   private presets = new Map<string, CameraPose>();
   private currentTarget = new Vector3();
   private tween: ActiveTween | null = null;
   private procedural: ProceduralController | null = null;
 
-  constructor(camera: PerspectiveCamera) {
+  constructor(camera: PerspectiveCamera, domElement: HTMLElement) {
     this.camera = camera;
+    this.controls = new OrbitControls(camera, domElement);
+    // OrbitControls fires 'start' on pointerdown before its own enabled-check
+    // gates motion, so a drag mid-tween cancels the tween even though the
+    // controls are disabled at the moment of input.
+    this.controls.addEventListener("start", () => {
+      if (this.tween) {
+        const resolve = this.tween.resolve;
+        this.tween = null;
+        this.controls.target.copy(this.currentTarget);
+        this.controls.enabled = true;
+        resolve();
+      }
+    });
   }
 
   addPreset(name: string, pose: CameraPose): void {
@@ -50,6 +65,7 @@ export class CameraRig {
     }
 
     this.procedural = null;
+    this.controls.enabled = false;
     const from: CameraPose = {
       position: this.camera.position.clone(),
       target: this.currentTarget.clone(),
@@ -70,6 +86,7 @@ export class CameraRig {
 
   setProceduralController(fn: ProceduralController | null): void {
     this.procedural = fn;
+    this.controls.enabled = fn === null;
   }
 
   update(dt: number): void {
@@ -88,6 +105,8 @@ export class CameraRig {
       if (raw >= 1) {
         const resolve = this.tween.resolve;
         this.tween = null;
+        this.controls.target.copy(this.currentTarget);
+        this.controls.enabled = this.procedural === null;
         resolve();
       }
       return;
@@ -95,7 +114,26 @@ export class CameraRig {
 
     if (this.procedural) {
       this.procedural(dt, this.camera);
+      return;
     }
+
+    this.controls.update();
+  }
+
+  dispose(): void {
+    this.controls.dispose();
+  }
+
+  getPose(): CameraPose {
+    return {
+      position: this.camera.position.clone(),
+      target: this.currentTarget.clone(),
+      fov: this.camera.fov,
+    };
+  }
+
+  setPose(pose: CameraPose): void {
+    this.applyPose(pose);
   }
 
   private applyPose(pose: CameraPose): void {
@@ -106,5 +144,7 @@ export class CameraRig {
       this.camera.fov = pose.fov;
       this.camera.updateProjectionMatrix();
     }
+    this.controls.target.copy(pose.target);
+    this.controls.enabled = this.procedural === null;
   }
 }
