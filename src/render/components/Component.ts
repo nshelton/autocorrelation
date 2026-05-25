@@ -1,4 +1,5 @@
 import type { Scene } from "three";
+import type { WebGPURenderer } from "three/webgpu";
 import type { FeatureStore } from "../../store/FeatureStore";
 import type { ParamStore } from "../../params/ParamStore";
 
@@ -9,6 +10,9 @@ export interface ComponentDeps {
   store: FeatureStore;
   paramStore: ParamStore;
   audioContext: AudioContext;
+  // Required for components that dispatch WebGPU compute (e.g. OrbitalCloud).
+  // Existing components ignore it.
+  renderer: WebGPURenderer;
 }
 
 // A component is a class with update() + dispose(). update() takes no args;
@@ -30,4 +34,22 @@ export interface ComponentClass {
   paramPrefix?: string;
   paramOpts?: Record<string, { min: number; max: number; step?: number }>;
   paramDefaults?: Record<string, number>;
+  // Per-key kind override. Absent or "continuous" → continuous (uses paramOpts
+  // min/max/step). "discrete" → uses paramDiscreteOptions for the value set.
+  paramKinds?: Record<string, "continuous" | "discrete">;
+  // For each key whose paramKinds entry is "discrete", the allowed values.
+  // Must be present when paramKinds[key] === "discrete".
+  paramDiscreteOptions?: Record<string, number[]>;
+  // Optional human-readable labels for discrete options, parallel to
+  // paramDiscreteOptions[key]. When absent, the dropdown shows String(value).
+  // Useful for keys whose numeric values are uninformative (e.g. mode flags).
+  paramDiscreteLabels?: Record<string, string[]>;
+  // Optional extra buttons rendered in the component's tweakpane folder, after
+  // the per-component "Reset to defaults" button. Each onClick gets the param
+  // store; ComponentManager calls folder.refresh() after the handler returns
+  // so any param mutations land in the UI.
+  paramButtons?: Array<{
+    title: string;
+    onClick: (paramStore: ParamStore) => void;
+  }>;
 }

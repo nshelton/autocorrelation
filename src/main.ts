@@ -128,7 +128,9 @@ function buildAppLayer(deps: AppDeps): void {
   panel = new ParamPanelCtor(deps.paramStore);
   bridge = new WorkletBridgeCtor(deps.paramStore, deps.workletNode.port);
   app.start();
-  app.bindUI(panel.pane);
+  app.bindUI(panel.scenes);
+  app.bindCameraUI(panel.camera);
+  app.bindPostUI(panel.post);
   if (initialBootstrap) {
     bridge.bootstrap();
     initialBootstrap = false;
@@ -156,7 +158,13 @@ const onStart = async (factory: SourceProvider): Promise<void> => {
   try {
     if (!paramStore) {
       paramStore = new ParamStore();
+      const { postSchemas } = await import("./params/postSchemas");
+      const { cameraSchemas } = await import("./params/cameraSchemas");
+      const { lightSchemas } = await import("./params/lightSchemas");
       for (const s of analysisSchemas) paramStore.register(s);
+      for (const s of postSchemas) paramStore.register(s);
+      for (const s of cameraSchemas) paramStore.register(s);
+      for (const s of lightSchemas) paramStore.register(s);
     }
     sourceProvider = wrapAsReusable(factory);
     pageDeps = await buildPageDeps(sourceProvider, paramStore);

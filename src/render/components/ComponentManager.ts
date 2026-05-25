@@ -1,4 +1,4 @@
-import type { Pane } from "tweakpane";
+import type { FolderApi } from "tweakpane";
 import type { Component, ComponentClass, ComponentDeps } from "./Component";
 
 // Per-component runtime state. paramsBag is null for components that don't
@@ -72,16 +72,15 @@ export class ComponentManager {
   // Add one tweakpane folder per component: enable checkbox first, then
   // (if applicable) one slider per param bound to the stable bag. Must
   // be called AFTER start() — slots are populated there.
-  bindUI(pane: Pane): void {
+  bindUI(parent: FolderApi): void {
     const { paramStore } = this.deps;
 
     for (const slot of this.slots) {
-      const folder = pane.addFolder({ title: slot.cls.label });
+      const enabled = paramStore.get(slot.enabledKey) === true;
+      const folder = parent.addFolder({ title: slot.cls.label, expanded: enabled });
       this.paneTeardowns.push(folder);
 
-      const enabledProxy: { enabled: boolean } = {
-        enabled: paramStore.get(slot.enabledKey) === true,
-      };
+      const enabledProxy: { enabled: boolean } = { enabled };
       const enabledBinding = folder.addBinding(enabledProxy, "enabled", {
         label: "enabled",
       });
@@ -89,28 +88,76 @@ export class ComponentManager {
         paramStore.set(slot.enabledKey, e.value);
       });
       // Mirror external enable changes (e.g. from `Reset to defaults`)
-      // back into the checkbox UI.
+      // back into the checkbox UI, and collapse the folder when a component
+      // is disabled so disabled scenes don't clutter the panel.
       const unsub = paramStore.subscribe((key, value) => {
         if (key === slot.enabledKey && typeof value === "boolean") {
           if (enabledProxy.enabled !== value) {
             enabledProxy.enabled = value;
             folder.refresh();
           }
+          folder.expanded = value;
         }
       });
       this.paneTeardowns.push({ dispose: unsub });
 
-      if (!slot.paramsBag || !slot.cls.paramOpts) continue;
-      // Slider bindings are not pushed into paneTeardowns explicitly;
-      // tweakpane's folder.dispose() cascades to child bindings and
-      // their change listeners, and the folder IS in paneTeardowns.
-      for (const [k, opts] of Object.entries(slot.cls.paramOpts)) {
-        const fullKey = `${slot.cls.paramPrefix ?? slot.cls.id}.${k}`;
-        const slider = folder.addBinding(slot.paramsBag, k, {
-          ...opts,
-          step: opts.step ?? (opts.max - opts.min) / 100,
+      // Per-component reset button. Only touches THIS component's params;
+      // does not reset the enabled flag or any other component's params.
+      // Setting each key through paramStore.set() flows through the mirror
+      // subscriber (which updates slot.paramsBag), but tweakpane caches
+      // the displayed value, so we folder.refresh() at the end to re-pull.
+      if (slot.paramsBag && slot.cls.paramDefaults) {
+        const defaults = slot.cls.paramDefaults;
+        const prefix = slot.cls.paramPrefix ?? slot.cls.id;
+        const resetBtn = folder.addButton({ title: "Reset to defaults" });
+        resetBtn.on("click", () => {
+          for (const [k, def] of Object.entries(defaults)) {
+            paramStore.set(`${prefix}.${k}`, def);
+          }
+          folder.refresh();
         });
-        slider.on("change", (e: { value: number }) => {
+      }
+
+      if (slot.cls.paramButtons) {
+        for (const btn of slot.cls.paramButtons) {
+          const b = folder.addButton({ title: btn.title });
+          b.on("click", () => {
+            btn.onClick(paramStore);
+            folder.refresh();
+          });
+        }
+      }
+
+      if (!slot.paramsBag) continue;
+      // Slider/dropdown bindings are not pushed into paneTeardowns
+      // explicitly; tweakpane's folder.dispose() cascades to child
+      // bindings and their change listeners, and the folder IS in
+      // paneTeardowns.
+      const allKeys = new Set<string>([
+        ...Object.keys(slot.cls.paramOpts ?? {}),
+        ...Object.keys(slot.cls.paramDefaults ?? {}),
+      ]);
+      for (const k of allKeys) {
+        const fullKey = `${slot.cls.paramPrefix ?? slot.cls.id}.${k}`;
+        const kind = slot.cls.paramKinds?.[k] ?? "continuous";
+        let binding;
+        if (kind === "discrete") {
+          const options = slot.cls.paramDiscreteOptions?.[k] ?? [];
+          const labels = slot.cls.paramDiscreteLabels?.[k];
+          binding = folder.addBinding(slot.paramsBag, k, {
+            options: Object.fromEntries(
+              options.map((v, i) => [labels?.[i] ?? String(v), v]),
+            ),
+          });
+        } else {
+          const opts = slot.cls.paramOpts?.[k];
+          if (!opts) continue;
+          binding = folder.addBinding(slot.paramsBag, k, {
+            ...opts,
+            step: opts.step ?? (opts.max - opts.min) / 100,
+          });
+        }
+        binding.on("change", (e: { value: number }) => {
           paramStore.set(fullKey, e.value);
         });
       }
@@ -155,17 +202,35 @@ export class ComponentManager {
     const prefix = cls.paramPrefix ?? cls.id;
     for (const [k, def] of Object.entries(cls.paramDefaults)) {
       const fullKey = `${prefix}.${k}`;
-      const opts = cls.paramOpts?.[k];
-      paramStore.register({
-        key: fullKey,
-        label: k,
-        kind: "continuous",
-        reconfig: false,
-        default: def,
-        min: opts?.min ?? 0,
-        max: opts?.max ?? 1,
-        step: opts?.step ?? 0.01,
-      });
+      const kind = cls.paramKinds?.[k] ?? "continuous";
+      if (kind === "discrete") {
+        const options = cls.paramDiscreteOptions?.[k];
+        if (!options) {
+          throw new Error(
+            `ComponentManager: ${cls.id}.${k} declared discrete but paramDiscreteOptions[${k}] is missing`,
+          );
+        }
+        paramStore.register({
+          key: fullKey,
+          label: k,
+          kind: "discrete",
+          reconfig: false,
+          default: def,
+          options,
+        });
+      } else {
+        const opts = cls.paramOpts?.[k];
+        paramStore.register({
+          key: fullKey,
+          label: k,
+          kind: "continuous",
+          reconfig: false,
+          default: def,
+          min: opts?.min ?? 0,
+          max: opts?.max ?? 1,
+          step: opts?.step ?? 0.01,
+        });
+      }
       const v = paramStore.get(fullKey);
       bag[k] = typeof v === "number" ? v : def;
     }

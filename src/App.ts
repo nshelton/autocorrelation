@@ -1,10 +1,8 @@
-import { Vector3 } from "three";
-import { PostProcessing } from "three/webgpu";
-import { pass, mrt, output, transformedNormalView } from "three/tsl";
-// @ts-expect-error - local copy of three's GTAONode example, no .d.ts
-import { ao } from "./render/GTAONode.js";
+import { DirectionalLight, Scene, Vector3 } from "three";
 import { createSceneAndCamera } from "./render/Scene";
 import { CameraRig } from "./render/CameraRig";
+import { PostStack } from "./render/post/PostStack";
+import { buildPostEffects } from "./render/post";
 import { FeatureStore } from "./store/FeatureStore";
 import { FpsOverlay } from "./ui/Stats";
 import { ComponentManager } from "./render/components/ComponentManager";
@@ -12,6 +10,37 @@ import { COMPONENTS } from "./render/components";
 
 import type { ParamStore } from "./params/ParamStore";
 import type { WebGPURenderer } from "three/webgpu";
+import type { CameraPose } from "./render/CameraRig";
+import type { FolderApi } from "tweakpane";
+
+const CAMERA_POSE_KEY = "autocorrelation.camera.pose";
+
+// Order MUST match optionLabels in cameraSchemas.ts (`camera.preset`).
+const CAMERA_PRESET_NAMES = ["front", "side", "spectrum", "rms", "buffer-acf", "rms-acf"] as const;
+
+function loadCameraPose(): CameraPose | null {
+  const raw = localStorage.getItem(CAMERA_POSE_KEY);
+  if (!raw) return null;
+  try {
+    const o = JSON.parse(raw) as { position: [number, number, number]; target: [number, number, number] };
+    return {
+      position: new Vector3(...o.position),
+      target: new Vector3(...o.target),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function saveCameraPose(pose: CameraPose): void {
+  localStorage.setItem(
+    CAMERA_POSE_KEY,
+    JSON.stringify({
+      position: [pose.position.x, pose.position.y, pose.position.z],
+      target: [pose.target.x, pose.target.y, pose.target.z],
+    }),
+  );
+}
 
 export interface AppDeps {
   canvas: HTMLCanvasElement;
@@ -35,7 +64,10 @@ export class App {
   private keydownHandler: (e: KeyboardEvent) => void = () => {};
   private resizeHandler: () => void = () => {};
   private components!: ComponentManager;
-  private post!: PostProcessing;
+  private postStack!: PostStack;
+  private cameraUnsub: (() => void) | null = null;
+  private directionalLight!: DirectionalLight;
+  private scene!: Scene;
 
   constructor(private deps: AppDeps) {}
 
@@ -43,6 +75,16 @@ export class App {
     const { renderer, workletNode, paramStore, audioContext } = this.deps;
 
     const { scene, camera } = createSceneAndCamera();
+    this.scene = scene;
+
+    // Direction matches OrbitalCloud's previous hardcoded lightDir so when
+    // its cube/splat modes eventually consume this uniform their look stays
+    // continuous. Toggle adds/removes from scene in the bindCameraUI handler.
+    this.directionalLight = new DirectionalLight(0xffffff, 1.0);
+    this.directionalLight.position.set(4.08, 8.66, 3.06);
+    if (paramStore.get("light.directional.enabled") as boolean) {
+      scene.add(this.directionalLight);
+    }
 
     this.components = new ComponentManager(
       {
@@ -50,27 +92,16 @@ export class App {
         store: this.store,
         paramStore,
         audioContext,
+        renderer,
       },
       COMPONENTS,
     );
     this.components.start();
 
-    // Post-processing: scene pass with MRT (color + view-space normal) → GTAO → multiply.
-    const scenePass = pass(scene, camera);
-    scenePass.setMRT(
-      mrt({
-        output,
-        normal: transformedNormalView,
-      }),
-    );
-    const sceneColor = scenePass.getTextureNode("output");
-    const sceneNormal = scenePass.getTextureNode("normal");
-    const sceneDepth = scenePass.getTextureNode("depth");
-    const aoNode = ao(sceneDepth, sceneNormal, camera);
-    this.post = new PostProcessing(renderer);
-    this.post.outputNode = sceneColor.mul(aoNode);
+    this.postStack = new PostStack(renderer, scene, camera, paramStore, buildPostEffects(renderer));
+    this.postStack.build();
 
-    this.rig = new CameraRig(camera);
+    this.rig = new CameraRig(camera, renderer.domElement);
     this.rig.addPreset("front", {
       position: new Vector3(0, 0, 4),
       target: new Vector3(0, 0, 0),
@@ -95,7 +126,15 @@ export class App {
       position: new Vector3(0, -1.0, 1.4),
       target: new Vector3(0, -1.0, 0),
     });
-    void this.rig.goTo("front", { duration: 0 });
+    const saved = loadCameraPose();
+    if (saved) {
+      this.rig.setPose(saved);
+    } else {
+      void this.rig.goTo("front", { duration: 0 });
+    }
+    this.rig.controls.addEventListener("end", () => {
+      saveCameraPose(this.rig.getPose());
+    });
 
     this.fps.mount();
 
@@ -108,15 +147,18 @@ export class App {
       "5": "buffer-acf",
       "6": "rms-acf",
     };
+    const savePoseAfter = (p: Promise<void>) => {
+      void p.then(() => saveCameraPose(this.rig.getPose()));
+    };
     this.keydownHandler = (e) => {
       const preset = presetKeys[e.key];
       if (preset) {
-        this.rig.goTo(preset, { duration: 0.8 });
+        savePoseAfter(this.rig.goTo(preset, { duration: 0.8 }));
         return;
       }
       if (e.key === " ") {
         toggled = !toggled;
-        this.rig.goTo(toggled ? "side" : "front", { duration: 0.8 });
+        savePoseAfter(this.rig.goTo(toggled ? "side" : "front", { duration: 0.8 }));
       }
     };
     window.addEventListener("keydown", this.keydownHandler);
@@ -141,15 +183,68 @@ export class App {
       this.last = now;
       this.rig.update(dt);
       this.components.update();
-      void this.post.renderAsync();
+      void this.postStack.renderAsync();
       this.fps.end();
       this.rafHandle = requestAnimationFrame(loop);
     };
     this.rafHandle = requestAnimationFrame(loop);
   }
 
-  bindUI(pane: import("tweakpane").Pane): void {
-    this.components.bindUI(pane);
+  bindUI(parent: import("tweakpane").FolderApi): void {
+    this.components.bindUI(parent);
+  }
+
+  bindPostUI(folder: FolderApi): void {
+    this.postStack.bindUI(folder);
+  }
+
+  bindCameraUI(folder: FolderApi): void {
+    const store = this.deps.paramStore;
+    const camera = this.rig.camera;
+
+    // FOV: live-write to camera + projection update.
+    const fovBinding = { fov: store.get("camera.fov") as number };
+    folder
+      .addBinding(fovBinding, "fov", { label: "FOV", min: 20, max: 120, step: 1 })
+      .on("change", (e: { value: number }) => store.set("camera.fov", e.value));
+
+    // Preset: dropdown -> rig.goTo. Stored as integer index.
+    const presetBinding = { preset: store.get("camera.preset") as number };
+    folder
+      .addBinding(presetBinding, "preset", {
+        label: "Preset",
+        options: Object.fromEntries(CAMERA_PRESET_NAMES.map((name, i) => [name, i])),
+      })
+      .on("change", (e: { value: number }) => store.set("camera.preset", e.value));
+
+    // Directional light toggle. Lit materials are not in the scene yet, so
+    // visible impact is currently nil — wired now so future lit materials
+    // (OrbitalCloud cube/splat modes are candidates) pick up the same source.
+    const lightBinding = { enabled: store.get("light.directional.enabled") as boolean };
+    folder
+      .addBinding(lightBinding, "enabled", { label: "Light" })
+      .on("change", (e: { value: boolean }) => store.set("light.directional.enabled", e.value));
+
+    // Subscribe so persisted-on-load values and external writes apply.
+    this.cameraUnsub = store.subscribe((key, value) => {
+      if (key === "camera.fov" && typeof value === "number") {
+        camera.fov = value;
+        camera.updateProjectionMatrix();
+        fovBinding.fov = value;
+      } else if (key === "camera.preset" && typeof value === "number") {
+        const name = CAMERA_PRESET_NAMES[value];
+        if (name) void this.rig.goTo(name, { duration: 0.8 });
+        presetBinding.preset = value;
+      } else if (key === "light.directional.enabled" && typeof value === "boolean") {
+        if (value) this.scene.add(this.directionalLight);
+        else this.scene.remove(this.directionalLight);
+        lightBinding.enabled = value;
+      }
+    });
+
+    // Apply current persisted values once on bind so reload restores state.
+    camera.fov = store.get("camera.fov") as number;
+    camera.updateProjectionMatrix();
   }
 
   dispose(): void {
@@ -160,7 +255,11 @@ export class App {
     window.removeEventListener("keydown", this.keydownHandler);
     window.removeEventListener("resize", this.resizeHandler);
     this.components?.dispose();
+    this.postStack?.dispose();
+    this.rig?.dispose();
     this.fps.unmount();
+    this.cameraUnsub?.();
+    this.cameraUnsub = null;
     this.deps.workletNode.port.onmessage = null;
   }
 }
