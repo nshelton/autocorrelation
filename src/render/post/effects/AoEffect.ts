@@ -19,10 +19,11 @@ export class AoEffect implements PostEffect {
   private aoNode: { radius: { value: number } } | null = null;
   private intensityU = uniform(1.0);
   private store: ParamStore | null = null;
+  private unsub: (() => void) | null = null;
 
   registerParams(store: ParamStore): void {
     this.store = store;
-    store.subscribe((key, value) => {
+    this.unsub = store.subscribe((key, value) => {
       if (key === "post.ao.radius" && typeof value === "number") {
         if (this.aoNode) this.aoNode.radius.value = value;
       } else if (key === "post.ao.intensity" && typeof value === "number") {
@@ -64,6 +65,8 @@ export class AoEffect implements PostEffect {
   }
 
   dispose(): void {
+    this.unsub?.();
+    this.unsub = null;
     this.aoNode = null;
   }
 }

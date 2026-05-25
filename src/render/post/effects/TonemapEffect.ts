@@ -37,6 +37,7 @@ export class TonemapEffect implements PostEffect {
 
   private renderer: WebGPURenderer;
   private exposureU = uniform(1.0);
+  private unsub: (() => void) | null = null;
 
   constructor(renderer: WebGPURenderer) {
     this.renderer = renderer;
@@ -47,7 +48,7 @@ export class TonemapEffect implements PostEffect {
     this.applyMode(store);
     this.exposureU.value = store.get("post.tonemap.exposure") as number;
 
-    store.subscribe((key, value) => {
+    this.unsub = store.subscribe((key, value) => {
       if (key === "post.tonemap.exposure" && typeof value === "number") {
         this.exposureU.value = value;
       } else if (key === "post.tonemap.mode") {
@@ -86,6 +87,10 @@ export class TonemapEffect implements PostEffect {
   }
 
   dispose(): void {
+    this.unsub?.();
+    this.unsub = null;
+    // HMR order is teardown then build, so the new TonemapEffect's
+    // applyMode() will restore renderer.toneMapping in registerParams.
     this.renderer.toneMapping = NoToneMapping;
   }
 

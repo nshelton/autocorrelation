@@ -16,10 +16,11 @@ export class BloomEffect implements PostEffect {
 
   private bloomNode: { strength: { value: number }; radius: { value: number }; threshold: { value: number } } | null = null;
   private store: ParamStore | null = null;
+  private unsub: (() => void) | null = null;
 
   registerParams(store: ParamStore): void {
     this.store = store;
-    store.subscribe((key, value) => {
+    this.unsub = store.subscribe((key, value) => {
       if (typeof value !== "number" || !this.bloomNode) return;
       if (key === "post.bloom.strength")       this.bloomNode.strength.value = value;
       else if (key === "post.bloom.radius")    this.bloomNode.radius.value = value;
@@ -63,6 +64,8 @@ export class BloomEffect implements PostEffect {
   }
 
   dispose(): void {
+    this.unsub?.();
+    this.unsub = null;
     this.bloomNode = null;
   }
 }
