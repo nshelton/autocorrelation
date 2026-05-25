@@ -57,8 +57,11 @@ function buildParamOpts(): Record<string, { min: number; max: number; step?: num
 
 function buildParamDefaults(): Record<string, number> {
   return {
-    volumeSteps:  48,
-    shadowSteps:  8,
+    // Conservative defaults — the shader is ~150 ops × volumeSteps ×
+    // (1 + shadowSteps) per pixel. At Retina 2880×1800 even modest steps
+    // saturate integrated GPUs. Crank these up in the panel after enabling.
+    volumeSteps:  24,
+    shadowSteps:  0,
     density:      50,
     boundsRadius: 8,
   };

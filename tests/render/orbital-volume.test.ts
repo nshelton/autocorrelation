@@ -10,8 +10,10 @@ describe("OrbitalVolume static schema", () => {
 
   it("declares all four documented params with defaults", () => {
     const d = OrbitalVolume.paramDefaults!;
-    expect(d.volumeSteps).toBe(48);
-    expect(d.shadowSteps).toBe(8);
+    // Conservative defaults: shadows off, mid-range step count. Retina × an
+    // ambitious step count saturates integrated GPUs (caught the hard way).
+    expect(d.volumeSteps).toBe(24);
+    expect(d.shadowSteps).toBe(0);
     expect(d.density).toBe(50);
     expect(d.boundsRadius).toBe(8);
   });
