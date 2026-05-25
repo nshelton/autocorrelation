@@ -4,15 +4,18 @@ import { AoEffect } from "./effects/AoEffect";
 import { BloomEffect } from "./effects/BloomEffect";
 import { TonemapEffect } from "./effects/TonemapEffect";
 import { LensEffect } from "./effects/LensEffect";
+import { GrainEffect } from "./effects/GrainEffect";
 
 // Canonical order. Reorder only by editing this list. Lens sits after tonemap
 // so optical artifacts (distortion, CA, vignette) apply to the final LDR image
-// like a film-camera path.
+// like a film-camera path. Grain is absolutely last — it's the film stock on
+// top of everything, including any lens artifacts.
 export function buildPostEffects(renderer: WebGPURenderer): PostEffect[] {
   return [
     new AoEffect(),
     new BloomEffect(),
     new TonemapEffect(renderer),
     new LensEffect(),
+    new GrainEffect(),
   ];
 }
