@@ -8,6 +8,7 @@ import { FpsOverlay } from "./ui/Stats";
 import { ComponentManager } from "./render/components/ComponentManager";
 import { COMPONENTS } from "./render/components";
 
+import { Modulator } from "./params/Modulator";
 import type { ParamStore } from "./params/ParamStore";
 import type { WebGPURenderer } from "three/webgpu";
 import type { CameraPose } from "./render/CameraRig";
@@ -65,6 +66,7 @@ export class App {
   private resizeHandler: () => void = () => {};
   private components!: ComponentManager;
   private postStack!: PostStack;
+  public modulator!: Modulator;
   private cameraUnsub: (() => void) | null = null;
   private directionalLight!: DirectionalLight;
   private scene!: Scene;
@@ -96,6 +98,7 @@ export class App {
       },
       COMPONENTS,
     );
+    this.modulator = new Modulator(paramStore, this.store);
     this.components.start();
 
     this.postStack = new PostStack(renderer, scene, camera, paramStore, buildPostEffects(renderer));
@@ -182,6 +185,7 @@ export class App {
       const dt = this.last === 0 ? 0 : (now - this.last) / 1000;
       this.last = now;
       this.rig.update(dt);
+      this.modulator.tick();
       this.components.update();
       void this.postStack.renderAsync();
       this.fps.end();
@@ -261,6 +265,7 @@ export class App {
     window.removeEventListener("keydown", this.keydownHandler);
     window.removeEventListener("resize", this.resizeHandler);
     this.components?.dispose();
+    this.modulator?.dispose();
     this.postStack?.dispose();
     this.rig?.dispose();
     this.fps.unmount();
