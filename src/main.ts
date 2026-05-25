@@ -129,6 +129,7 @@ function buildAppLayer(deps: AppDeps): void {
   bridge = new WorkletBridgeCtor(deps.paramStore, deps.workletNode.port);
   app.start();
   app.bindUI(panel.scenes);
+  app.bindCameraUI(panel.camera);
   if (initialBootstrap) {
     bridge.bootstrap();
     initialBootstrap = false;

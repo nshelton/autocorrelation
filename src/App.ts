@@ -13,8 +13,12 @@ import { COMPONENTS } from "./render/components";
 import type { ParamStore } from "./params/ParamStore";
 import type { WebGPURenderer } from "three/webgpu";
 import type { CameraPose } from "./render/CameraRig";
+import type { FolderApi } from "tweakpane";
 
 const CAMERA_POSE_KEY = "autocorrelation.camera.pose";
+
+// Order MUST match optionLabels in cameraSchemas.ts (`camera.preset`).
+const CAMERA_PRESET_NAMES = ["front", "side", "spectrum", "rms", "buffer-acf", "rms-acf"] as const;
 
 function loadCameraPose(): CameraPose | null {
   const raw = localStorage.getItem(CAMERA_POSE_KEY);
@@ -63,6 +67,7 @@ export class App {
   private resizeHandler: () => void = () => {};
   private components!: ComponentManager;
   private post!: PostProcessing;
+  private cameraUnsub: (() => void) | null = null;
 
   constructor(private deps: AppDeps) {}
 
@@ -191,6 +196,43 @@ export class App {
     this.components.bindUI(parent);
   }
 
+  bindCameraUI(folder: FolderApi): void {
+    const store = this.deps.paramStore;
+    const camera = this.rig.camera;
+
+    // FOV: live-write to camera + projection update.
+    const fovBinding = { fov: store.get("camera.fov") as number };
+    folder
+      .addBinding(fovBinding, "fov", { label: "FOV", min: 20, max: 120, step: 1 })
+      .on("change", (e: { value: number }) => store.set("camera.fov", e.value));
+
+    // Preset: dropdown -> rig.goTo. Stored as integer index.
+    const presetBinding = { preset: store.get("camera.preset") as number };
+    folder
+      .addBinding(presetBinding, "preset", {
+        label: "Preset",
+        options: Object.fromEntries(CAMERA_PRESET_NAMES.map((name, i) => [name, i])),
+      })
+      .on("change", (e: { value: number }) => store.set("camera.preset", e.value));
+
+    // Subscribe so persisted-on-load values and external writes apply.
+    this.cameraUnsub = store.subscribe((key, value) => {
+      if (key === "camera.fov" && typeof value === "number") {
+        camera.fov = value;
+        camera.updateProjectionMatrix();
+        fovBinding.fov = value;
+      } else if (key === "camera.preset" && typeof value === "number") {
+        const name = CAMERA_PRESET_NAMES[value];
+        if (name) void this.rig.goTo(name, { duration: 0.8 });
+        presetBinding.preset = value;
+      }
+    });
+
+    // Apply current persisted values once on bind so reload restores state.
+    camera.fov = store.get("camera.fov") as number;
+    camera.updateProjectionMatrix();
+  }
+
   dispose(): void {
     if (this.rafHandle !== null) {
       cancelAnimationFrame(this.rafHandle);
@@ -201,6 +243,8 @@ export class App {
     this.components?.dispose();
     this.rig?.dispose();
     this.fps.unmount();
+    this.cameraUnsub?.();
+    this.cameraUnsub = null;
     this.deps.workletNode.port.onmessage = null;
   }
 }
