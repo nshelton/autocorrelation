@@ -125,9 +125,9 @@ async function buildPageDeps(
 
 function buildAppLayer(deps: AppDeps): void {
   app = new AppCtor(deps);
-  panel = new ParamPanelCtor(deps.paramStore);
+  app.start();                                          // constructs modulator
+  panel = new ParamPanelCtor(deps.paramStore, app.modulator);
   bridge = new WorkletBridgeCtor(deps.paramStore, deps.workletNode.port);
-  app.start();
   app.bindUI(panel.scenes);
   app.bindCameraUI(panel.camera);
   app.bindPostUI(panel.post);
