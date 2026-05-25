@@ -40,4 +40,16 @@ export interface ComponentClass {
   // For each key whose paramKinds entry is "discrete", the allowed values.
   // Must be present when paramKinds[key] === "discrete".
   paramDiscreteOptions?: Record<string, number[]>;
+  // Optional human-readable labels for discrete options, parallel to
+  // paramDiscreteOptions[key]. When absent, the dropdown shows String(value).
+  // Useful for keys whose numeric values are uninformative (e.g. mode flags).
+  paramDiscreteLabels?: Record<string, string[]>;
+  // Optional extra buttons rendered in the component's tweakpane folder, after
+  // the per-component "Reset to defaults" button. Each onClick gets the param
+  // store; ComponentManager calls folder.refresh() after the handler returns
+  // so any param mutations land in the UI.
+  paramButtons?: Array<{
+    title: string;
+    onClick: (paramStore: ParamStore) => void;
+  }>;
 }

@@ -38,14 +38,14 @@ export class ParticleView implements Component {
     numParticles: { min: 0, max: 0, step: 0 }, // ignored — discrete kind below
     timescale: { min: 0, max: 3, step: 0.01 },
     lifetime: { min: 1, max: 10, step: 0.1 },
-    noiseScale: { min: 0.1, max: 5.0, step: 0.05 },
+    noiseScale: { min: 0.01, max: 1.0, step: 0.05 },
     noiseStrength: { min: 0, max: 20, step: 0.1 },
     restitution: { min: 0, max: 1, step: 0.01 },
     damping: { min: 0, max: 2, step: 0.01 },
-    attractorStrength: { min: 0, max: 50, step: 0.1 },
+    attractorStrength: { min: 0, max: 100, step: 0.1 },
     attractorRadius: { min: 0.05, max: 1.0, step: 0.01 },
     spawnRadius: { min: 0.1, max: 3.0, step: 0.05 },
-    swirlStrength: { min: 0, max: 20, step: 0.1 },
+    swirlStrength: { min: 0, max: 5, step: 0.1 },
   };
   static paramDefaults = {
     numParticles: 2000,
@@ -369,9 +369,7 @@ export class ParticleView implements Component {
         const dy = ATTRACTOR_POSITION.y - t.y;
         const dz = ATTRACTOR_POSITION.z - t.z;
         const distSq = dx * dx + dy * dy + dz * dz;
-        const dist = Math.sqrt(distSq);
- 
-        const k = attractorStrength / (dist * dist);
+        const k = attractorStrength / Math.max(distSq, attractorRadius * attractorRadius);
         ax = dx * k;
         ay = dy * k;
         az = dz * k;
@@ -402,9 +400,9 @@ export class ParticleView implements Component {
 
       body.setLinvel(
         {
-          x: vTargetX + radialX * vRadialMag + ax * dt + this.curlOut[0] * noiseStrength * dt,
-          y: v.y + ay * dt + this.curlOut[1] * noiseStrength * dt,
-          z: vTargetZ + radialZ * vRadialMag + az * dt + this.curlOut[2] * noiseStrength * dt,
+          x: ax  + vTargetX + this.curlOut[0] * noiseStrength * dt,
+          y: ay  + this.curlOut[1] * noiseStrength * dt,
+          z: az + vTargetZ + this.curlOut[2] * noiseStrength * dt,
         },
         true,
       );

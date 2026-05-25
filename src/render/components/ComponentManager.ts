@@ -118,6 +118,16 @@ export class ComponentManager {
         });
       }
 
+      if (slot.cls.paramButtons) {
+        for (const btn of slot.cls.paramButtons) {
+          const b = folder.addButton({ title: btn.title });
+          b.on("click", () => {
+            btn.onClick(paramStore);
+            folder.refresh();
+          });
+        }
+      }
+
       if (!slot.paramsBag) continue;
       // Slider/dropdown bindings are not pushed into paneTeardowns
       // explicitly; tweakpane's folder.dispose() cascades to child
@@ -133,8 +143,11 @@ export class ComponentManager {
         let binding;
         if (kind === "discrete") {
           const options = slot.cls.paramDiscreteOptions?.[k] ?? [];
+          const labels = slot.cls.paramDiscreteLabels?.[k];
           binding = folder.addBinding(slot.paramsBag, k, {
-            options: Object.fromEntries(options.map((v) => [String(v), v])),
+            options: Object.fromEntries(
+              options.map((v, i) => [labels?.[i] ?? String(v), v]),
+            ),
           });
         } else {
           const opts = slot.cls.paramOpts?.[k];
