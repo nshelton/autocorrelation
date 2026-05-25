@@ -49,8 +49,11 @@ export class Modulator {
       if (!this.bindings.delete(key)) return;
       this.persist();
       // Snap consumer state back to the slider value.
-      const base = this.store.get(key);
-      if (typeof base === "number") this.store.notify(key, base);
+      const schema = this.store.schemaFor(key);
+      if (schema) {
+        const base = this.store.get(key);
+        if (typeof base === "number") this.store.notify(key, base);
+      }
       for (const fn of this.uiSubs) fn(key);
       return;
     }
@@ -71,14 +74,14 @@ export class Modulator {
       const src = MOD_SOURCES[b.source];
       if (!src) continue;
       const buf = this.features.get(src.buffer);
-      const base = this.store.get(key) as number;
       const v = src.read(buf);
-      // No signal (empty buffer returns 0 via latest(), NaN from beat pulses):
-      // snap to base rather than lerp(min,max,0) or lerp(min,max,NaN).
-      const hasSignal = buf.length > 0 && Number.isFinite(v);
+      const base = this.store.get(key) as number;
+      if (buf.length === 0 || !Number.isFinite(v)) {
+        this.store.notify(key, base);
+        continue;
+      }
       const target = schema.min + (schema.max - schema.min) * v;
-      const eff = hasSignal ? base + (target - base) * b.depth : base;
-      this.store.notify(key, eff);
+      this.store.notify(key, base + (target - base) * b.depth);
     }
   }
 
@@ -87,6 +90,8 @@ export class Modulator {
     return () => this.uiSubs.delete(fn);
   }
 
+  // Bindings intentionally kept — they persist in localStorage and reload
+  // on the next constructor call (used by HMR teardown/reconstruct).
   dispose(): void {
     this.uiSubs.clear();
   }
