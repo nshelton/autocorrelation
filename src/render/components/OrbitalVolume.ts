@@ -2,9 +2,10 @@ import { Mesh, BoxGeometry, BackSide, NormalBlending } from "three";
 import { MeshBasicNodeMaterial } from "three/webgpu";
 import {
   Fn, vec3, vec4, float, int, uniform, uniformArray, positionWorld,
-  cameraPosition, Loop, If, max, min, exp, normalize,
+  cameraPosition, Loop, Break, If, max, min, exp, normalize,
 } from "three/tsl";
 import { evalPsi } from "../orbital/psi";
+import { SH_COUNT } from "../orbital/sh-basis";
 import type { Component, ComponentDeps } from "./Component";
 
 // Discrete option sets.
@@ -18,10 +19,7 @@ const SHADOW_STEPS_OPTIONS = [0, 4, 8, 16, 24] as const;
 const MAX_VOLUME_STEPS = 128;
 const MAX_SHADOW_STEPS = 24;
 
-// SH coefficient layout — MUST match sh-basis.ts SH_COUNT (16). Duplicated
-// here as a constant so we can build the uniform array; not re-exported
-// because callers don't need it.
-const SH_COUNT = 16;
+// SH coefficient labels — order MUST match sh-basis.ts (16 entries, l=0..3).
 const SH_LABELS = [
   "c_0_0",
   "c_1_-1", "c_1_0", "c_1_1",
@@ -29,9 +27,17 @@ const SH_LABELS = [
   "c_3_-3", "c_3_-2", "c_3_-1", "c_3_0", "c_3_1", "c_3_2", "c_3_3",
 ];
 
-// Hardcoded light direction. Same axis as the cubes' lambert in
+// Precomputed full keys for the SH coefs in the OrbitalCloud namespace.
+// Building these once at module load avoids 16 template-literal allocations
+// per frame inside update().
+const SHARED_SH_KEYS = SH_LABELS.map((k) => `orbitalCloud.${k}`);
+
+// Hardcoded light direction (normalized). Same axis as the cubes' lambert in
 // OrbitalCloud.ts. Promoting to a shared param is out of scope for v1.
-const LIGHT_DIR = vec3(0.408, 0.866, 0.306);
+const LIGHT_DIR = (() => {
+  const m = Math.hypot(0.408, 0.866, 0.306);
+  return vec3(0.408 / m, 0.866 / m, 0.306 / m);
+})();
 
 // Matplotlib coolwarm endpoints — same colormap as OrbitalCloud cubes/splats
 // so volume + particle views read as the same orbital, just rendered
@@ -96,8 +102,7 @@ export class OrbitalVolume implements Component {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const shCoefs = uniformArray(new Float32Array(SH_COUNT) as unknown as any[], "float");
     for (let i = 0; i < SH_COUNT; i++) {
-      const v = this.paramStore.get(`orbitalCloud.${SH_LABELS[i]}`);
-      shCoefs.array[i] = typeof v === "number" ? v : 0;
+      shCoefs.array[i] = this.readSharedKey(SHARED_SH_KEYS[i]);
     }
 
     const nU = uniform(this.readShared("n", 2));
@@ -150,6 +155,19 @@ export class OrbitalVolume implements Component {
     }
   }
 
+  // Same guard for prebuilt full keys (the SH coef loop hits this 16× per
+  // frame; precomputed keys + a single try/catch keeps the hot path lean).
+  // Returns 0 when the key is missing so a single absent SH term reads as
+  // a zero coefficient, not a crash.
+  private readSharedKey(fullKey: string): number {
+    try {
+      const v = this.paramStore.get(fullKey);
+      return typeof v === "number" ? v : 0;
+    } catch {
+      return 0;
+    }
+  }
+
   // Fragment shader body.
   //
   // Strategy:
@@ -172,7 +190,6 @@ export class OrbitalVolume implements Component {
       const rayOrigin = cameraPosition;
       const rayDir = normalize(positionWorld.sub(cameraPosition));
 
-      // Slab intersection with [-R, R]^3.
       const invDir = vec3(1, 1, 1).div(rayDir);
       const t1 = vec3(R.negate()).sub(rayOrigin).mul(invDir);
       const t2 = vec3(R).sub(rayOrigin).mul(invDir);
@@ -190,52 +207,56 @@ export class OrbitalVolume implements Component {
       const accumAlpha = float(0).toVar();
       const tCurr = tNear.toVar();
 
-      // Compile-time loop bound is MAX_VOLUME_STEPS; the body gates on the
-      // runtime `volumeSteps` uniform and on accumAlpha < 0.99 so the step
-      // count can change live without a material rebuild.
+      // Compile-time bound is MAX_VOLUME_STEPS; a real Break() triggers on
+      // either reaching the runtime `volumeSteps` count or alpha saturation,
+      // so the GPU exits the loop early instead of running 128 no-op
+      // iterations. Live step-count changes still work because the gate is
+      // driven by a uniform, not a literal.
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       Loop(int(MAX_VOLUME_STEPS), ({ i }: { i: any }) => {
-        If(i.lessThan(u.volumeSteps).and(accumAlpha.lessThan(float(0.99))), () => {
-          const p = rayOrigin.add(rayDir.mul(tCurr));
-          const psi = evalPsi(p, u.shCoefs, u.n, u.radialScale);
-
-          const dens = psi.mul(psi).mul(u.density).min(float(1)).max(float(0));
-          const stepAlpha = float(1).sub(exp(dens.mul(dt).negate()));
-
-          // Hot-cold sample color (algebraic-sigmoid normalization). Matches
-          // OrbitalCloud's diverging colormap.
-          const xCol = psi.mul(u.colorScale);
-          const tNorm = xCol.div(xCol.abs().add(float(1)));
-          const tPos = tNorm.max(float(0));
-          const tNeg = tNorm.min(float(0)).abs();
-          const sampleColor = MID
-            .add(WARM.sub(MID).mul(tPos))
-            .add(COOL.sub(MID).mul(tNeg))
-            .toVar();
-
-          // Self-shadow: march from p along LIGHT_DIR, accumulate optical
-          // depth. shadowSteps == 0 falls through with no darkening.
-          If(u.shadowSteps.greaterThan(int(0)), () => {
-            const shadowDt = R.div(float(u.shadowSteps).max(float(1)));
-            const shadowDens = float(0).toVar();
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            Loop(int(MAX_SHADOW_STEPS), ({ i: j }: { i: any }) => {
-              If(j.lessThan(u.shadowSteps), () => {
-                const q = p.add(LIGHT_DIR.mul(shadowDt.mul(float(j).add(float(1)))));
-                const psiS = evalPsi(q, u.shCoefs, u.n, u.radialScale);
-                shadowDens.addAssign(psiS.mul(psiS).mul(u.density).mul(shadowDt));
-              });
-            });
-            const transmittance = exp(shadowDens.negate());
-            // 60% shadowed / 40% ambient floor. Volume integration darkens
-            // further on its own, so the ambient base is generous.
-            sampleColor.assign(sampleColor.mul(transmittance.mul(float(0.6)).add(float(0.4))));
-          });
-
-          accumColor.addAssign(sampleColor.mul(stepAlpha).mul(float(1).sub(accumAlpha)));
-          accumAlpha.addAssign(stepAlpha.mul(float(1).sub(accumAlpha)));
-          tCurr.addAssign(dt);
+        If(i.greaterThanEqual(u.volumeSteps).or(accumAlpha.greaterThanEqual(float(0.99))), () => {
+          Break();
         });
+        const p = rayOrigin.add(rayDir.mul(tCurr));
+        const psi = evalPsi(p, u.shCoefs, u.n, u.radialScale);
+
+        const dens = psi.mul(psi).mul(u.density).min(float(1)).max(float(0));
+        const stepAlpha = float(1).sub(exp(dens.mul(dt).negate()));
+
+        // Hot-cold sample color (algebraic-sigmoid normalization). Matches
+        // OrbitalCloud's diverging colormap.
+        const xCol = psi.mul(u.colorScale);
+        const tNorm = xCol.div(xCol.abs().add(float(1)));
+        const tPos = tNorm.max(float(0));
+        const tNeg = tNorm.min(float(0)).abs();
+        const sampleColor = MID
+          .add(WARM.sub(MID).mul(tPos))
+          .add(COOL.sub(MID).mul(tNeg))
+          .toVar();
+
+        // Self-shadow: march from p along LIGHT_DIR, accumulate optical
+        // depth. shadowSteps == 0 falls through with no darkening.
+        If(u.shadowSteps.greaterThan(int(0)), () => {
+          const shadowDt = R.div(float(u.shadowSteps).max(float(1)));
+          const shadowDens = float(0).toVar();
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          Loop(int(MAX_SHADOW_STEPS), ({ i: j }: { i: any }) => {
+            If(j.greaterThanEqual(u.shadowSteps), () => {
+              Break();
+            });
+            const q = p.add(LIGHT_DIR.mul(shadowDt.mul(float(j).add(float(1)))));
+            const psiS = evalPsi(q, u.shCoefs, u.n, u.radialScale);
+            shadowDens.addAssign(psiS.mul(psiS).mul(u.density).mul(shadowDt));
+          });
+          const transmittance = exp(shadowDens.negate());
+          // 60% shadowed / 40% ambient floor. Volume integration darkens
+          // further on its own, so the ambient base is generous.
+          sampleColor.assign(sampleColor.mul(transmittance.mul(float(0.6)).add(float(0.4))));
+        });
+
+        accumColor.addAssign(sampleColor.mul(stepAlpha).mul(float(1).sub(accumAlpha)));
+        accumAlpha.addAssign(stepAlpha.mul(float(1).sub(accumAlpha)));
+        tCurr.addAssign(dt);
       });
 
       return vec4(accumColor, accumAlpha);
@@ -247,8 +268,7 @@ export class OrbitalVolume implements Component {
     const u = this.uniforms;
 
     for (let i = 0; i < SH_COUNT; i++) {
-      const v = this.paramStore.get(`orbitalCloud.${SH_LABELS[i]}`);
-      u.shCoefs.array[i] = typeof v === "number" ? v : 0;
+      u.shCoefs.array[i] = this.readSharedKey(SHARED_SH_KEYS[i]);
     }
     u.n.value = this.readShared("n", 2);
     u.radialScale.value = this.readShared("radialScale", 1.0);
