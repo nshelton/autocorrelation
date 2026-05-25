@@ -196,7 +196,7 @@ export class App {
   }
 
   bindUI(parent: import("tweakpane").FolderApi): void {
-    this.components.bindUI(parent);
+    this.components.bindUI(parent, this.modulator);
   }
 
   bindPostUI(folder: FolderApi): void {
