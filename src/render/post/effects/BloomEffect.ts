@@ -1,4 +1,6 @@
-import { bloom } from "three/addons/tsl/display/BloomNode.js";
+// @ts-expect-error - local copy of three's BloomNode addon (PostProcessingUtils
+// import path patched to three/webgpu), no .d.ts
+import { bloom } from "../BloomNode.js";
 import type { ShaderNodeObject } from "three/tsl";
 import type { Node } from "three/webgpu";
 import type { FolderApi } from "tweakpane";
