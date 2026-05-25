@@ -130,6 +130,7 @@ function buildAppLayer(deps: AppDeps): void {
   app.start();
   app.bindUI(panel.scenes);
   app.bindCameraUI(panel.camera);
+  app.bindPostUI(panel.post);
   if (initialBootstrap) {
     bridge.bootstrap();
     initialBootstrap = false;

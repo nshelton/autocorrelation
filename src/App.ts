@@ -1,10 +1,8 @@
 import { Vector3 } from "three";
-import { PostProcessing } from "three/webgpu";
-import { pass, mrt, output, transformedNormalView } from "three/tsl";
-// @ts-expect-error - local copy of three's GTAONode example, no .d.ts
-import { ao } from "./render/GTAONode.js";
 import { createSceneAndCamera } from "./render/Scene";
 import { CameraRig } from "./render/CameraRig";
+import { PostStack } from "./render/post/PostStack";
+import { POST_EFFECTS } from "./render/post";
 import { FeatureStore } from "./store/FeatureStore";
 import { FpsOverlay } from "./ui/Stats";
 import { ComponentManager } from "./render/components/ComponentManager";
@@ -66,7 +64,7 @@ export class App {
   private keydownHandler: (e: KeyboardEvent) => void = () => {};
   private resizeHandler: () => void = () => {};
   private components!: ComponentManager;
-  private post!: PostProcessing;
+  private postStack!: PostStack;
   private cameraUnsub: (() => void) | null = null;
 
   constructor(private deps: AppDeps) {}
@@ -88,20 +86,8 @@ export class App {
     );
     this.components.start();
 
-    // Post-processing: scene pass with MRT (color + view-space normal) → GTAO → multiply.
-    const scenePass = pass(scene, camera);
-    scenePass.setMRT(
-      mrt({
-        output,
-        normal: transformedNormalView,
-      }),
-    );
-    const sceneColor = scenePass.getTextureNode("output");
-    const sceneNormal = scenePass.getTextureNode("normal");
-    const sceneDepth = scenePass.getTextureNode("depth");
-    const aoNode = ao(sceneDepth, sceneNormal, camera);
-    this.post = new PostProcessing(renderer);
-    this.post.outputNode = sceneColor.mul(aoNode);
+    this.postStack = new PostStack(renderer, scene, camera, paramStore, POST_EFFECTS);
+    this.postStack.build();
 
     this.rig = new CameraRig(camera, renderer.domElement);
     this.rig.addPreset("front", {
@@ -185,7 +171,7 @@ export class App {
       this.last = now;
       this.rig.update(dt);
       this.components.update();
-      void this.post.renderAsync();
+      void this.postStack.renderAsync();
       this.fps.end();
       this.rafHandle = requestAnimationFrame(loop);
     };
@@ -194,6 +180,10 @@ export class App {
 
   bindUI(parent: import("tweakpane").FolderApi): void {
     this.components.bindUI(parent);
+  }
+
+  bindPostUI(folder: FolderApi): void {
+    this.postStack.bindUI(folder);
   }
 
   bindCameraUI(folder: FolderApi): void {
@@ -241,6 +231,7 @@ export class App {
     window.removeEventListener("keydown", this.keydownHandler);
     window.removeEventListener("resize", this.resizeHandler);
     this.components?.dispose();
+    this.postStack?.dispose();
     this.rig?.dispose();
     this.fps.unmount();
     this.cameraUnsub?.();
