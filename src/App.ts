@@ -1,4 +1,4 @@
-import { Vector3 } from "three";
+import { DirectionalLight, Scene, Vector3 } from "three";
 import { createSceneAndCamera } from "./render/Scene";
 import { CameraRig } from "./render/CameraRig";
 import { PostStack } from "./render/post/PostStack";
@@ -66,6 +66,8 @@ export class App {
   private components!: ComponentManager;
   private postStack!: PostStack;
   private cameraUnsub: (() => void) | null = null;
+  private directionalLight!: DirectionalLight;
+  private scene!: Scene;
 
   constructor(private deps: AppDeps) {}
 
@@ -73,6 +75,16 @@ export class App {
     const { renderer, workletNode, paramStore, audioContext } = this.deps;
 
     const { scene, camera } = createSceneAndCamera();
+    this.scene = scene;
+
+    // Direction matches OrbitalCloud's previous hardcoded lightDir so when
+    // its cube/splat modes eventually consume this uniform their look stays
+    // continuous. Toggle adds/removes from scene in the bindCameraUI handler.
+    this.directionalLight = new DirectionalLight(0xffffff, 1.0);
+    this.directionalLight.position.set(4.08, 8.66, 3.06);
+    if (paramStore.get("light.directional.enabled") as boolean) {
+      scene.add(this.directionalLight);
+    }
 
     this.components = new ComponentManager(
       {
@@ -205,6 +217,14 @@ export class App {
       })
       .on("change", (e: { value: number }) => store.set("camera.preset", e.value));
 
+    // Directional light toggle. Lit materials are not in the scene yet, so
+    // visible impact is currently nil — wired now so future lit materials
+    // (OrbitalCloud cube/splat modes are candidates) pick up the same source.
+    const lightBinding = { enabled: store.get("light.directional.enabled") as boolean };
+    folder
+      .addBinding(lightBinding, "enabled", { label: "Light" })
+      .on("change", (e: { value: boolean }) => store.set("light.directional.enabled", e.value));
+
     // Subscribe so persisted-on-load values and external writes apply.
     this.cameraUnsub = store.subscribe((key, value) => {
       if (key === "camera.fov" && typeof value === "number") {
@@ -215,6 +235,10 @@ export class App {
         const name = CAMERA_PRESET_NAMES[value];
         if (name) void this.rig.goTo(name, { duration: 0.8 });
         presetBinding.preset = value;
+      } else if (key === "light.directional.enabled" && typeof value === "boolean") {
+        if (value) this.scene.add(this.directionalLight);
+        else this.scene.remove(this.directionalLight);
+        lightBinding.enabled = value;
       }
     });
 
