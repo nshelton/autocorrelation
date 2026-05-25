@@ -156,7 +156,11 @@ const onStart = async (factory: SourceProvider): Promise<void> => {
   try {
     if (!paramStore) {
       paramStore = new ParamStore();
+      const { postSchemas } = await import("./params/postSchemas");
+      const { cameraSchemas } = await import("./params/cameraSchemas");
       for (const s of analysisSchemas) paramStore.register(s);
+      for (const s of postSchemas) paramStore.register(s);
+      for (const s of cameraSchemas) paramStore.register(s);
     }
     sourceProvider = wrapAsReusable(factory);
     pageDeps = await buildPageDeps(sourceProvider, paramStore);
