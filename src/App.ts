@@ -18,6 +18,9 @@ const CAMERA_POSE_KEY = "autocorrelation.camera.pose";
 // Order MUST match optionLabels in cameraSchemas.ts (`camera.preset`).
 const CAMERA_PRESET_NAMES = ["front", "side", "spectrum", "rms", "buffer-acf", "rms-acf"] as const;
 
+// `camera.rotate` slider is 0..10; map to deg/s for the orbit (max → 180 deg/s).
+const ROTATE_DEG_PER_UNIT = 18;
+
 function loadCameraPose(): CameraPose | null {
   const raw = localStorage.getItem(CAMERA_POSE_KEY);
   if (!raw) return null;
@@ -217,6 +220,12 @@ export class App {
       })
       .on("change", (e: { value: number }) => store.set("camera.preset", e.value));
 
+    // Rotate: turntable auto-orbit. 0 = off; slider value is the orbit speed.
+    const rotateBinding = { rotate: store.get("camera.rotate") as number };
+    folder
+      .addBinding(rotateBinding, "rotate", { label: "Rotate", min: 0, max: 5, step: 0.1 })
+      .on("change", (e: { value: number }) => store.set("camera.rotate", e.value));
+
     // Directional light toggle. Lit materials are not in the scene yet, so
     // visible impact is currently nil — wired now so future lit materials
     // (OrbitalCloud cube/splat modes are candidates) pick up the same source.
@@ -235,6 +244,9 @@ export class App {
         const name = CAMERA_PRESET_NAMES[value];
         if (name) void this.rig.goTo(name, { duration: 0.8 });
         presetBinding.preset = value;
+      } else if (key === "camera.rotate" && typeof value === "number") {
+        this.rig.setAutorotate(value * ROTATE_DEG_PER_UNIT);
+        rotateBinding.rotate = value;
       } else if (key === "light.directional.enabled" && typeof value === "boolean") {
         if (value) this.scene.add(this.directionalLight);
         else this.scene.remove(this.directionalLight);
@@ -245,6 +257,7 @@ export class App {
     // Apply current persisted values once on bind so reload restores state.
     camera.fov = store.get("camera.fov") as number;
     camera.updateProjectionMatrix();
+    this.rig.setAutorotate((store.get("camera.rotate") as number) * ROTATE_DEG_PER_UNIT);
   }
 
   dispose(): void {

@@ -89,6 +89,15 @@ export class CameraRig {
     this.controls.enabled = fn === null;
   }
 
+  setAutorotate(degPerSec: number): void {
+    // Use OrbitControls' native autoRotate so mouse drag still works and the
+    // spin only pauses while the user is actively dragging (state !== NONE).
+    // At update(dt) the orbit advances 2π/60·autoRotateSpeed rad/s, so
+    // autoRotateSpeed = degPerSec / 6.
+    this.controls.autoRotate = degPerSec !== 0;
+    this.controls.autoRotateSpeed = degPerSec / 6;
+  }
+
   update(dt: number): void {
     if (this.tween) {
       this.tween.elapsed += dt;
@@ -117,7 +126,10 @@ export class CameraRig {
       return;
     }
 
-    this.controls.update();
+    // Pass dt so native autoRotate is frame-rate independent. Keep currentTarget
+    // synced from controls (drag/pan moves it) so getPose/saved pose stay accurate.
+    this.controls.update(dt);
+    this.currentTarget.copy(this.controls.target);
   }
 
   dispose(): void {
