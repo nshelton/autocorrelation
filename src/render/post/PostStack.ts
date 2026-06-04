@@ -56,7 +56,13 @@ export class PostStack {
 
   build(): void {
     const enabled = this.effects.filter((e) => e.enabled);
-    const needsNormal = enabled.some((e) => e.needs.normal);
+    // MRT layout is keyed on the STATIC effect set, not the live enabled state.
+    // Toggling an effect must not change the scene-pass attachment count: the
+    // WebGPU backend caches each scene material's pipeline for the layout it
+    // first compiled against, and does NOT recompile when the MRT shrinks. If we
+    // dropped the normal target when AO is disabled, the cached 2-target
+    // pipelines would mismatch the 1-target pass and the whole scene goes black.
+    const needsNormal = this.effects.some((e) => e.needs.normal);
 
     const scenePass = pass(this.scene, this.camera);
     scenePass.setMRT(

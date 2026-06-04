@@ -57,6 +57,7 @@ function makeDeps(): ComponentDeps {
     renderer: {
       computeAsync: () => Promise.resolve(),
     } as unknown as import("three/webgpu").WebGPURenderer,
+    camera: {} as unknown as import("three").PerspectiveCamera,
   };
 }
 

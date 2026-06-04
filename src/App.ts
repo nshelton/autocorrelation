@@ -5,6 +5,7 @@ import { PostStack } from "./render/post/PostStack";
 import { buildPostEffects } from "./render/post";
 import { FeatureStore } from "./store/FeatureStore";
 import { FpsOverlay } from "./ui/Stats";
+import { PerfOverlay } from "./ui/PerfOverlay";
 import { ComponentManager } from "./render/components/ComponentManager";
 import { COMPONENTS } from "./render/components";
 
@@ -63,6 +64,7 @@ export class App {
   private store = new FeatureStore();
   private last = 0;
   private fps = new FpsOverlay();
+  private perf = new PerfOverlay();
   private rafHandle: number | null = null;
   private keydownHandler: (e: KeyboardEvent) => void = () => {};
   private resizeHandler: () => void = () => {};
@@ -96,6 +98,7 @@ export class App {
         paramStore,
         audioContext,
         renderer,
+        camera,
       },
       COMPONENTS,
     );
@@ -140,6 +143,7 @@ export class App {
     });
 
     this.fps.mount();
+    this.perf.mount();
 
     let toggled = false;
     const presetKeys: Record<string, string> = {
@@ -157,6 +161,10 @@ export class App {
       const preset = presetKeys[e.key];
       if (preset) {
         savePoseAfter(this.rig.goTo(preset, { duration: 0.8 }));
+        return;
+      }
+      if (e.key === "p" || e.key === "P") {
+        this.perf.toggle();
         return;
       }
       if (e.key === " ") {
@@ -184,9 +192,35 @@ export class App {
       this.fps.begin();
       const dt = this.last === 0 ? 0 : (now - this.last) / 1000;
       this.last = now;
+
+      // three only resets renderer.info inside its own setAnimationLoop; we drive
+      // our own RAF, so info.reset() never runs on its own. Without it, drawCalls
+      // grow unbounded and the GPU-timestamp accumulator never frame-aligns
+      // (previousFrameCalls stays 0 → the per-frame batch boundary is wrong, and
+      // the reported timestamp is meaningless). Read last frame's settled counters
+      // first, then reset to open a fresh frame's accounting.
+      const r = renderer.info.render;
+      this.perf.sampleGpu(r.timestamp, r.drawCalls, r.triangles);
+      renderer.info.reset();
+
+      const t0 = performance.now();
       this.rig.update(dt);
+      const t1 = performance.now();
       this.components.update();
+      const t2 = performance.now();
       void this.postStack.renderAsync();
+      const t3 = performance.now();
+
+      const dsp = this.store.get("dspPerf");
+      this.perf.sample({
+        cameraMs: t1 - t0,
+        componentsMs: t2 - t1,
+        submitMs: t3 - t2,
+        analysisMs: dsp.length > 0 ? dsp[0] : NaN,
+        analysisHz: dsp.length > 1 ? dsp[1] : NaN,
+        now,
+      });
+
       this.fps.end();
       this.rafHandle = requestAnimationFrame(loop);
     };
@@ -271,6 +305,7 @@ export class App {
     this.postStack?.dispose();
     this.rig?.dispose();
     this.fps.unmount();
+    this.perf.unmount();
     this.cameraUnsub?.();
     this.cameraUnsub = null;
     this.deps.workletNode.port.onmessage = null;

@@ -8,7 +8,9 @@ import { WebGPURenderer } from "three/webgpu";
  * once per page, and the renderer lives until the page is torn down.
  */
 export async function createRenderer(canvas: HTMLCanvasElement): Promise<WebGPURenderer> {
-  const renderer = new WebGPURenderer({ canvas, antialias: true });
+  // trackTimestamp enables GPU timestamp queries (renderer.info.render.timestamp).
+  // Self-disables if the adapter lacks the timestamp-query feature.
+  const renderer = new WebGPURenderer({ canvas, antialias: true, trackTimestamp: true });
   await renderer.init();
   renderer.setPixelRatio(window.devicePixelRatio);
   renderer.setSize(window.innerWidth, window.innerHeight, false);

@@ -1,4 +1,4 @@
-import type { Scene } from "three";
+import type { PerspectiveCamera, Scene } from "three";
 import type { WebGPURenderer } from "three/webgpu";
 import type { FeatureStore } from "../../store/FeatureStore";
 import type { ParamStore } from "../../params/ParamStore";
@@ -10,9 +10,14 @@ export interface ComponentDeps {
   store: FeatureStore;
   paramStore: ParamStore;
   audioContext: AudioContext;
-  // Required for components that dispatch WebGPU compute (e.g. OrbitalCloud).
-  // Existing components ignore it.
+  // Required for components that dispatch WebGPU compute (e.g. OrbitalCloud)
+  // or render to an offscreen target (e.g. OrbitalVolume). Existing
+  // components ignore it.
   renderer: WebGPURenderer;
+  // Main scene camera. Components that render to their own offscreen target
+  // (OrbitalVolume) clone it to mirror the main view. Existing components
+  // ignore it.
+  camera: PerspectiveCamera;
 }
 
 // A component is a class with update() + dispose(). update() takes no args;

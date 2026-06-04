@@ -1,11 +1,18 @@
-import { Mesh, BoxGeometry, EdgesGeometry, LineSegments, BackSide, NormalBlending } from "three";
-import { exp, Loop, MeshBasicNodeMaterial, LineBasicNodeMaterial } from "three/webgpu";
+import {
+  Mesh, BoxGeometry, EdgesGeometry, LineSegments, BackSide, NormalBlending,
+  PerspectiveCamera, RenderTarget, Vector2, Color, Matrix4,
+} from "three";
+import {
+  exp, Loop, MeshBasicNodeMaterial, LineBasicNodeMaterial, QuadMesh,
+} from "three/webgpu";
 import {
   Fn, vec3, vec4, float, uniform, uniformArray, positionWorld,
-  cameraPosition, normalize, max, min,
+  cameraPosition, normalize, max, min, mix, fract, texture, screenUV,
+  screenCoordinate,
 } from "three/tsl";
 import { evalPsi } from "../orbital/psi";
 import { SH_COUNT } from "../orbital/sh-basis";
+import { MID, LIGHT_DIR } from "../orbital/colormap";
 import type { Component, ComponentDeps } from "./Component";
 
 // Discrete option sets (kept around so the static schema and the existing
@@ -21,11 +28,8 @@ const SH_LABELS = [
   "c_3_-3", "c_3_-2", "c_3_-1", "c_3_0", "c_3_1", "c_3_2", "c_3_3",
 ];
 const SHARED_SH_KEYS = SH_LABELS.map((k) => `orbitalCloud.${k}`);
-
-// Matplotlib coolwarm endpoints — same colormap as OrbitalCloud.
-const COOL = vec3(0.230, 0.299, 0.754);
-const MID  = vec3(0.865, 0.865, 0.865);
-const WARM = vec3(0.706, 0.016, 0.150);
+const GREEN = /*@__PURE__*/ vec3(0.230, 0.99, 0.14);
+const RED = /*@__PURE__*/ vec3(0.706, 0.016, 0.950);
 
 function buildParamOpts(): Record<string, { min: number; max: number; step?: number }> {
   return {
@@ -68,11 +72,63 @@ export class OrbitalVolume implements Component {
   private params: Record<string, number>;
   private scene: ComponentDeps["scene"];
   private paramStore: ComponentDeps["paramStore"];
+  private renderer: ComponentDeps["renderer"];
+  private camera: ComponentDeps["camera"];
 
+  // Volume mesh — on layer 1, only renders into the half-res RT (NOT into
+  // the main scenePass). Holds the ray-march material.
   private mesh: Mesh | null = null;
   private material: MeshBasicNodeMaterial | null = null;
+
+  // Presenter mesh — on layer 0, rendered by the main scenePass. Its
+  // material samples the RT at screenUV, so the visible "volume" you see
+  // in the scene is the bilinear-upsampled half-res ray-march output. Cost
+  // per fragment is one texture lookup.
+  private presenter: Mesh | null = null;
+  private presenterMaterial: MeshBasicNodeMaterial | null = null;
+
+  // Wireframe outline — child of the presenter so it shows up in the main
+  // scene at full res (crisp), not at half-res via the RT.
   private outline: LineSegments | null = null;
   private outlineMaterial: LineBasicNodeMaterial | null = null;
+
+  // Half-res render target + a clone of the main camera with layers.set(1)
+  // so only the volume mesh renders into it.
+  private rt: RenderTarget | null = null;
+  private rtCamera: PerspectiveCamera | null = null;
+  private rtSize: Vector2 = new Vector2(0, 0);
+
+  // Full-res ping-pong accumulator. Three's WebGPU rejects ConstantColor
+  // blend factors as "Blend factor not supported" (silently → black
+  // pipeline), so we do the running-mean blend in the shader instead:
+  //   accum = mix(prev_accum, sample, α)  with α = 1/(N+1)
+  // Each frame samples one RT and writes to the other; the next frame
+  // swaps roles. Presenter samples whichever was most recently written.
+  // First frame after dirty has α=1 → ignores prev → fully overwrites.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private accumA: RenderTarget | null = null;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private accumB: RenderTarget | null = null;
+  private accumQuad: QuadMesh | null = null;
+  private accumMaterial: MeshBasicNodeMaterial | null = null;
+  // TextureNode whose .value is swapped each frame between accumA.texture
+  // and accumB.texture — drives which target the quad shader reads as "prev".
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private accumPrevTex: any = null;
+  // Same trick for the presenter — points at whichever RT was just written.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private presenterTex: any = null;
+  // alpha = 1/(N+1) for the running mean. Updated each frame.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private accumAlphaU: any = null;
+  private accumFrame = 0;
+  private accumDirty = true;
+  // Tracks the main camera's matrixWorld from last frame so update() can
+  // detect view changes and reset the accumulator.
+  private lastCameraMatrix: Matrix4 = new Matrix4();
+  // Subscriber unhook for ParamStore dirty detection.
+  private storeUnsub: (() => void) | null = null;
+
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   private uniforms: any = null;
   private disposed = false;
@@ -80,6 +136,8 @@ export class OrbitalVolume implements Component {
   constructor(deps: ComponentDeps, params: Record<string, number>) {
     this.scene = deps.scene;
     this.paramStore = deps.paramStore;
+    this.renderer = deps.renderer;
+    this.camera = deps.camera;
     this.params = params;
     this.init();
   }
@@ -104,6 +162,43 @@ export class OrbitalVolume implements Component {
 
     const geom = new BoxGeometry(1, 1, 1);
 
+    // ---- Half-res RT + ping-pong full-res accumulators + clone camera ----
+    this.rt = new RenderTarget(2, 2);          // sized by resizeRT()
+    this.accumA = new RenderTarget(2, 2);
+    this.accumB = new RenderTarget(2, 2);
+    this.resizeRT();
+
+    this.rtCamera = this.camera.clone();
+    this.rtCamera.layers.set(1);
+
+    // ---- Accumulator fullscreen-quad ----
+    // Shader: mix(prev_accum, low_res_sample, α). Both texture nodes are
+    // bound to specific Texture instances at material creation; we swap
+    // accumPrevTex.value each frame to point at whichever RT holds the
+    // previous running mean. Replaces CustomBlending entirely.
+    this.accumAlphaU = uniform(1);
+    this.accumPrevTex = texture(this.accumA.texture, screenUV);
+    const sampleTex = texture(this.rt.texture, screenUV);
+    const accumMat = new MeshBasicNodeMaterial();
+    accumMat.colorNode = mix(this.accumPrevTex, sampleTex, this.accumAlphaU);
+    accumMat.transparent = false;
+    accumMat.depthTest = false;
+    accumMat.depthWrite = false;
+    this.accumMaterial = accumMat;
+    this.accumQuad = new QuadMesh(accumMat);
+
+    // ---- Dirty subscription ----
+    // Any change to an orbital-shape param (shared from orbitalCloud.* or
+    // our own orbitalVolume.*) flips the accumulator dirty flag so the next
+    // frame restarts the running mean from scratch. Camera changes are
+    // detected by matrix compare in update(); they don't need a subscriber.
+    this.storeUnsub = this.paramStore.subscribe((key: string) => {
+      if (key.startsWith("orbitalCloud.") || key.startsWith("orbitalVolume.")) {
+        this.accumDirty = true;
+      }
+    });
+
+    // ---- Volume mesh — on layer 1, ray-marches into the RT ----
     const mat = new MeshBasicNodeMaterial();
     mat.side = BackSide;
     mat.transparent = true;
@@ -114,22 +209,83 @@ export class OrbitalVolume implements Component {
     const mesh = new Mesh(geom, mat);
     mesh.scale.setScalar(this.params.boundsRadius * 2);
     mesh.frustumCulled = false;
+    mesh.layers.set(1);   // not rendered by main camera
     this.scene.add(mesh);
 
-    // Wireframe outline — 1px white edges of the same unit cube. Added as a
-    // child of the volume mesh so it inherits scale automatically (one
-    // transform to update, in update()).
+    // ---- Presenter mesh — on layer 0, samples the RT at full res ----
+    // Same cube geometry + scale as the volume mesh, but its fragment shader
+    // is just a texture lookup → cheap. The visible volume in the scene is
+    // the bilinear-upsampled half-res output.
+    const presenterMat = new MeshBasicNodeMaterial();
+    presenterMat.side = BackSide;
+    presenterMat.transparent = true;
+    presenterMat.depthWrite = false;
+    presenterMat.blending = NormalBlending;
+    // Presenter samples whichever ping-pong accumulator was most recently
+    // written. presenterTex.value gets swapped to point at the active RT
+    // each frame in update(). Initial binding is accumB because frame 0
+    // writes to accumB (we read accumA's initial zeros, blend with α=1 to
+    // discard them, output to accumB).
+    this.presenterTex = texture(this.accumB.texture, screenUV);
+    presenterMat.colorNode = this.presenterTex;
+    // Opt out of GTAO darkening — same trick as before. setupNormal returns
+    // a forward-facing view-space normal so the depth/normal mismatch at our
+    // pixels (we don't write depth) doesn't cause GTAO to compute spurious
+    // occlusion. See the spec'd comment from earlier work.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (presenterMat as any).setupNormal = () => vec3(0, 0, 1);
+
+    const presenter = new Mesh(geom, presenterMat);
+    presenter.scale.setScalar(this.params.boundsRadius * 2);
+    presenter.frustumCulled = false;
+    // No layers.set() — stays on default layer 0, rendered by main camera.
+    this.scene.add(presenter);
+
+    // ---- Wireframe outline — child of presenter so it renders at full res ----
     const edgeGeom = new EdgesGeometry(geom);
     const lineMat = new LineBasicNodeMaterial();
     lineMat.colorNode = vec4(1, 1, 1, 1);
     const outline = new LineSegments(edgeGeom, lineMat);
     outline.frustumCulled = false;
-    mesh.add(outline);
+    presenter.add(outline);
 
     this.mesh = mesh;
     this.material = mat;
+    this.presenter = presenter;
+    this.presenterMaterial = presenterMat;
     this.outline = outline;
     this.outlineMaterial = lineMat;
+  }
+
+  // Resize the low-res RT to canvas × pixelRatio × renderScale, and the
+  // accumulator to canvas × pixelRatio (full res). Called on init and each
+  // frame from update() (no-op if size hasn't changed). Renderer's
+  // pixelRatio handles DPI scaling.
+  //
+  // A resize invalidates the accumulator history (different pixel
+  // correspondences), so flip dirty.
+  private static readonly RENDER_SCALE = 0.25;
+  private static readonly CLEAR_COLOR = /*@__PURE__*/ new Color(0, 0, 0);
+  private resizeRT(): void {
+    if (!this.rt || !this.accumA || !this.accumB) return;
+    const sz = this.renderer.getSize(this.rtSize);
+    const pr = this.renderer.getPixelRatio();
+    const lowW = Math.max(1, Math.floor(sz.width * pr * OrbitalVolume.RENDER_SCALE));
+    const lowH = Math.max(1, Math.floor(sz.height * pr * OrbitalVolume.RENDER_SCALE));
+    const fullW = Math.max(1, Math.floor(sz.width * pr));
+    const fullH = Math.max(1, Math.floor(sz.height * pr));
+    if (this.rt.width !== lowW || this.rt.height !== lowH) {
+      this.rt.setSize(lowW, lowH);
+      this.accumDirty = true;
+    }
+    if (this.accumA.width !== fullW || this.accumA.height !== fullH) {
+      this.accumA.setSize(fullW, fullH);
+      this.accumDirty = true;
+    }
+    if (this.accumB.width !== fullW || this.accumB.height !== fullH) {
+      this.accumB.setSize(fullW, fullH);
+      this.accumDirty = true;
+    }
   }
 
   private readShared(localKey: string, fallback: number): number {
@@ -149,6 +305,8 @@ export class OrbitalVolume implements Component {
       return 0;
     }
   }
+
+
 
   private buildColorNode(): any {
 
@@ -179,17 +337,37 @@ export class OrbitalVolume implements Component {
         const dens = psi.mul(psi).mul(u.density).min(float(1)).max(float(0));
         const stepAlpha = float(1).sub(exp(dens.mul(dt).negate()));
 
-      //   // Hot-cold sample color (algebraic-sigmoid normalization).
+        // Hot-cold sample color (algebraic-sigmoid normalization).
         const xCol = psi.mul(u.colorScale);
         const tNorm = xCol.div(xCol.abs().add(float(1)));
         const tPos = tNorm.max(float(0));
         const tNeg = tNorm.min(float(0)).abs();
         const sampleColor = MID
-          .add(WARM.sub(MID).mul(tPos))
-          .add(COOL.sub(MID).mul(tNeg));
+          .add(GREEN.sub(MID).mul(tPos))
+          .add(RED.sub(MID).mul(tNeg));
 
-      //   // Front-to-back composite (premultiplied alpha).
-        accumColor.addAssign(sampleColor.mul(stepAlpha).mul(float(1).sub(accumAlpha)));
+
+        // Shadow march from pos along LIGHT_DIR. Fixed 8 iterations with a
+        // fixed shadowDt of 0.2; shadowSteps slider is currently a no-op.
+        const shadowDt = float(0.2);
+        const shadowDens = float(0).toVar();
+        let shadowPos = pos.toVar();
+        const shadowStep = LIGHT_DIR.mul(shadowDt);
+
+        Loop(8, () => {
+
+          shadowPos.addAssign(shadowStep);
+          const psiS = evalPsi(shadowPos, u.shCoefs, u.n, u.radialScale);
+          shadowDens.addAssign(psiS.mul(psiS).mul(u.density).mul(shadowDt));
+        });
+
+        // Transmittance with a 40% ambient floor so back-lit fragments don't
+        // crush to near-zero.
+        const transmittance = exp(shadowDens.negate());
+        const lit = transmittance.mul(float(0.6)).add(float(0.4));
+
+        // Front-to-back composite (premultiplied alpha).
+        accumColor.addAssign(sampleColor.mul(lit).mul(stepAlpha).mul(float(1).sub(accumAlpha)));
         accumAlpha.addAssign(stepAlpha.mul(float(1).sub(accumAlpha)));
 
         pos.addAssign(step);
@@ -214,8 +392,85 @@ export class OrbitalVolume implements Component {
     u.boundsRadius.value = this.params.boundsRadius;
     u.volumeSteps.value = Math.round(this.params.volumeSteps);
 
-    if (this.mesh) this.mesh.scale.setScalar(this.params.boundsRadius * 2);
+    const scale = this.params.boundsRadius * 2;
+    if (this.mesh) this.mesh.scale.setScalar(scale);
+    if (this.presenter) this.presenter.scale.setScalar(scale);
+
+    // ---- Per-frame accumulator dance ----
+    //   1. resizeRT() — handles canvas resize (flips dirty if changed)
+    //   2. Detect camera changes — also flips dirty
+    //   3. If dirty: reset accumFrame so the next render runs at α=1 and
+    //      fully overwrites the accumulator's stale contents
+    //   4. Sync rtCamera, render volume to low-res RT (one ray-march pass)
+    //   5. Update blendColor to α = 1/(N+1), then render the quad into the
+    //      accumulator (one fullscreen sample-and-blend)
+    //   6. Increment accumFrame
+    if (!this.rt || !this.rtCamera || !this.accumA || !this.accumB || !this.accumQuad ||
+        !this.accumMaterial || !this.accumPrevTex || !this.presenterTex || !this.accumAlphaU) {
+      return;
+    }
+
+    this.resizeRT();
+
+    if (!this.lastCameraMatrix.equals(this.camera.matrixWorld)) {
+      this.accumDirty = true;
+      this.lastCameraMatrix.copy(this.camera.matrixWorld);
+    }
+    if (this.accumDirty) {
+      this.accumFrame = 0;
+      this.accumDirty = false;
+    }
+
+    this.rtCamera.copy(this.camera);
+    this.rtCamera.layers.set(1);   // .copy() clobbers the layer mask
+
+    // setClearColor is a RENDERER-GLOBAL setter. If we don't restore it the
+    // main scene's clear color (from Scene.ts) gets overwritten and every
+    // frame after ours clears to (0,0,0,0) → entire app goes black. Save
+    // and restore around our own renders.
+    const prevClearColor = OrbitalVolume._scratchColor;
+    // getClearColor's strict signature expects a Color4 (rgba) — the runtime
+    // implementation just writes r/g/b into the target. Cast to bypass.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    this.renderer.getClearColor(prevClearColor as any);
+    const prevClearAlpha = this.renderer.getClearAlpha();
+
+    // Stage 1: render volume into the low-res RT.
+    const prevTarget = this.renderer.getRenderTarget();
+    this.renderer.setRenderTarget(this.rt);
+    this.renderer.setClearColor(OrbitalVolume.CLEAR_COLOR, 0);
+    this.renderer.clear();
+    void this.renderer.renderAsync(this.scene, this.rtCamera);
+
+    // Stage 2: ping-pong shader blend. Pick read (prev) + write (curr) based
+    // on frame parity, point the accumulator material's TextureNode at prev,
+    // render the quad into curr. mix(prev, sample, α) with α=1/(N+1) does
+    // the running mean in-shader. First frame after dirty: α=1, output =
+    // sample (prev's stale contents are ignored).
+    const aOnEven = (this.accumFrame & 1) === 0;
+    const readRT = aOnEven ? this.accumA : this.accumB;
+    const writeRT = aOnEven ? this.accumB : this.accumA;
+
+    this.accumAlphaU.value = 1 / (this.accumFrame + 1);
+    this.accumPrevTex.value = readRT.texture;
+
+    this.renderer.setRenderTarget(writeRT);
+    void this.accumQuad.renderAsync(this.renderer);
+
+    // Presenter samples the JUST-WRITTEN buffer.
+    this.presenterTex.value = writeRT.texture;
+
+    this.accumFrame += 1;
+
+    // Restore renderer-global state for the main scenePass.
+    this.renderer.setRenderTarget(prevTarget);
+    this.renderer.setClearColor(prevClearColor, prevClearAlpha);
   }
+
+  // Scratch Color used by update() to read out the renderer's previous clear
+  // color before mutating it. Module-level static so we don't allocate per
+  // frame.
+  private static readonly _scratchColor = /*@__PURE__*/ new Color();
 
   dispose(): void {
     if (this.disposed) return;
@@ -226,6 +481,12 @@ export class OrbitalVolume implements Component {
       this.outline = null;
       this.outlineMaterial = null;
     }
+    if (this.presenter) {
+      this.scene.remove(this.presenter);
+      this.presenterMaterial?.dispose();
+      this.presenter = null;
+      this.presenterMaterial = null;
+    }
     if (this.mesh) {
       this.scene.remove(this.mesh);
       this.mesh.geometry.dispose();
@@ -233,5 +494,28 @@ export class OrbitalVolume implements Component {
       this.mesh = null;
       this.material = null;
     }
+    if (this.rt) {
+      this.rt.dispose();
+      this.rt = null;
+    }
+    if (this.accumA) {
+      this.accumA.dispose();
+      this.accumA = null;
+    }
+    if (this.accumB) {
+      this.accumB.dispose();
+      this.accumB = null;
+    }
+    if (this.accumMaterial) {
+      this.accumMaterial.dispose();
+      this.accumMaterial = null;
+    }
+    this.accumQuad = null;
+    this.accumPrevTex = null;
+    this.presenterTex = null;
+    this.accumAlphaU = null;
+    this.rtCamera = null;
+    this.storeUnsub?.();
+    this.storeUnsub = null;
   }
 }
