@@ -2,6 +2,7 @@ import type { PerspectiveCamera, Scene } from "three";
 import type { ShaderNodeObject } from "three/tsl";
 import type { Node } from "three/webgpu";
 import type { ParamStore } from "../../params/ParamStore";
+import type { Modulator } from "../../params/Modulator";
 import type { FolderApi } from "tweakpane";
 
 // Context handed to every effect's build() — the scene-pass texture nodes.
@@ -29,7 +30,7 @@ export interface PostEffect {
   registerParams(store: ParamStore, requestRebuild: () => void): void;
 
   // Add UI widgets into the effect's sub-folder under "Post".
-  bindUI(folder: FolderApi, store: ParamStore): void;
+  bindUI(folder: FolderApi, store: ParamStore, modulator: Modulator): void;
 
   dispose(): void;
 }

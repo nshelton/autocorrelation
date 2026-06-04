@@ -6,6 +6,8 @@ import type { Node } from "three/webgpu";
 import type { FolderApi } from "tweakpane";
 import type { PostEffect, PassCtx } from "../PostEffect";
 import type { ParamStore } from "../../../params/ParamStore";
+import type { Modulator } from "../../../params/Modulator";
+import { bindParam } from "../../../params/bindParam";
 
 // Wraps three's TSL bloom(node, strength, radius, threshold). The three
 // args become uniforms on the returned BloomNode; hot updates write
@@ -44,25 +46,17 @@ export class BloomEffect implements PostEffect {
     return input.add(node);
   }
 
-  bindUI(folder: FolderApi, store: ParamStore): void {
-    const b = {
-      enabled:   store.get("post.bloom.enabled")   as boolean,
-      strength:  store.get("post.bloom.strength")  as number,
-      radius:    store.get("post.bloom.radius")    as number,
-      threshold: store.get("post.bloom.threshold") as number,
-    };
-    folder
-      .addBinding(b, "enabled", { label: "Enabled" })
-      .on("change", (e: { value: boolean }) => store.set("post.bloom.enabled", e.value));
-    folder
-      .addBinding(b, "strength", { label: "Strength", min: 0, max: 3, step: 0.01 })
-      .on("change", (e: { value: number }) => store.set("post.bloom.strength", e.value));
-    folder
-      .addBinding(b, "radius", { label: "Radius", min: 0, max: 1, step: 0.01 })
-      .on("change", (e: { value: number }) => store.set("post.bloom.radius", e.value));
-    folder
-      .addBinding(b, "threshold", { label: "Threshold", min: 0, max: 2, step: 0.01 })
-      .on("change", (e: { value: number }) => store.set("post.bloom.threshold", e.value));
+  bindUI(folder: FolderApi, store: ParamStore, modulator: Modulator): void {
+    for (const key of [
+      "post.bloom.enabled",
+      "post.bloom.strength",
+      "post.bloom.radius",
+      "post.bloom.threshold",
+    ]) {
+      const schema = store.schemaFor(key);
+      if (!schema) throw new Error(`BloomEffect.bindUI: schema ${key} missing`);
+      bindParam(folder, store, modulator, schema);
+    }
   }
 
   dispose(): void {

@@ -9,6 +9,8 @@ import { PerfOverlay } from "./ui/PerfOverlay";
 import { ComponentManager } from "./render/components/ComponentManager";
 import { COMPONENTS } from "./render/components";
 
+import { Modulator } from "./params/Modulator";
+import { bindParam } from "./params/bindParam";
 import type { ParamStore } from "./params/ParamStore";
 import type { WebGPURenderer } from "three/webgpu";
 import type { CameraPose } from "./render/CameraRig";
@@ -70,6 +72,7 @@ export class App {
   private resizeHandler: () => void = () => {};
   private components!: ComponentManager;
   private postStack!: PostStack;
+  public modulator!: Modulator;
   private cameraUnsub: (() => void) | null = null;
   private directionalLight!: DirectionalLight;
   private scene!: Scene;
@@ -102,6 +105,7 @@ export class App {
       },
       COMPONENTS,
     );
+    this.modulator = new Modulator(paramStore, this.store);
     this.components.start();
 
     this.postStack = new PostStack(renderer, scene, camera, paramStore, buildPostEffects(renderer));
@@ -206,6 +210,7 @@ export class App {
       const t0 = performance.now();
       this.rig.update(dt);
       const t1 = performance.now();
+      this.modulator.tick();
       this.components.update();
       const t2 = performance.now();
       void this.postStack.renderAsync();
@@ -228,67 +233,49 @@ export class App {
   }
 
   bindUI(parent: import("tweakpane").FolderApi): void {
-    this.components.bindUI(parent);
+    this.components.bindUI(parent, this.modulator);
   }
 
   bindPostUI(folder: FolderApi): void {
-    this.postStack.bindUI(folder);
+    this.postStack.bindUI(folder, this.modulator);
   }
 
   bindCameraUI(folder: FolderApi): void {
     const store = this.deps.paramStore;
     const camera = this.rig.camera;
 
-    // FOV: live-write to camera + projection update.
-    const fovBinding = { fov: store.get("camera.fov") as number };
-    folder
-      .addBinding(fovBinding, "fov", { label: "FOV", min: 20, max: 120, step: 1 })
-      .on("change", (e: { value: number }) => store.set("camera.fov", e.value));
+    const fovSchema = store.schemaFor("camera.fov");
+    const presetSchema = store.schemaFor("camera.preset");
+    const lightSchema = store.schemaFor("light.directional.enabled");
+    if (!fovSchema || !presetSchema || !lightSchema) {
+      throw new Error("bindCameraUI: required schemas missing");
+    }
+    const rotateSchema = store.schemaFor("camera.rotate");
+    if (!rotateSchema) throw new Error("bindCameraUI: camera.rotate schema missing");
+    bindParam(folder, store, this.modulator, fovSchema);
+    bindParam(folder, store, this.modulator, presetSchema);
+    bindParam(folder, store, this.modulator, rotateSchema);
+    bindParam(folder, store, this.modulator, lightSchema);
 
-    // Preset: dropdown -> rig.goTo. Stored as integer index.
-    const presetBinding = { preset: store.get("camera.preset") as number };
-    folder
-      .addBinding(presetBinding, "preset", {
-        label: "Preset",
-        options: Object.fromEntries(CAMERA_PRESET_NAMES.map((name, i) => [name, i])),
-      })
-      .on("change", (e: { value: number }) => store.set("camera.preset", e.value));
-
-    // Rotate: turntable auto-orbit. 0 = off; slider value is the orbit speed.
-    const rotateBinding = { rotate: store.get("camera.rotate") as number };
-    folder
-      .addBinding(rotateBinding, "rotate", { label: "Rotate", min: 0, max: 5, step: 0.1 })
-      .on("change", (e: { value: number }) => store.set("camera.rotate", e.value));
-
-    // Directional light toggle. Lit materials are not in the scene yet, so
-    // visible impact is currently nil — wired now so future lit materials
-    // (OrbitalCloud cube/splat modes are candidates) pick up the same source.
-    const lightBinding = { enabled: store.get("light.directional.enabled") as boolean };
-    folder
-      .addBinding(lightBinding, "enabled", { label: "Light" })
-      .on("change", (e: { value: boolean }) => store.set("light.directional.enabled", e.value));
-
-    // Subscribe so persisted-on-load values and external writes apply.
-    this.cameraUnsub = store.subscribe((key, value) => {
+    // Side-effects subscriber. Continuous modulatable keys (camera.fov,
+    // camera.rotate) write through on every notify so the modulator can
+    // drive them. preset (discrete) and light (boolean) are not
+    // modulatable; gated on source==="user" defensively.
+    this.cameraUnsub = store.subscribe((key, value, source) => {
       if (key === "camera.fov" && typeof value === "number") {
         camera.fov = value;
         camera.updateProjectionMatrix();
-        fovBinding.fov = value;
-      } else if (key === "camera.preset" && typeof value === "number") {
+      } else if (key === "camera.preset" && typeof value === "number" && source === "user") {
         const name = CAMERA_PRESET_NAMES[value];
         if (name) void this.rig.goTo(name, { duration: 0.8 });
-        presetBinding.preset = value;
       } else if (key === "camera.rotate" && typeof value === "number") {
         this.rig.setAutorotate(value * ROTATE_DEG_PER_UNIT);
-        rotateBinding.rotate = value;
-      } else if (key === "light.directional.enabled" && typeof value === "boolean") {
+      } else if (key === "light.directional.enabled" && typeof value === "boolean" && source === "user") {
         if (value) this.scene.add(this.directionalLight);
         else this.scene.remove(this.directionalLight);
-        lightBinding.enabled = value;
       }
     });
 
-    // Apply current persisted values once on bind so reload restores state.
     camera.fov = store.get("camera.fov") as number;
     camera.updateProjectionMatrix();
     this.rig.setAutorotate((store.get("camera.rotate") as number) * ROTATE_DEG_PER_UNIT);
@@ -302,6 +289,7 @@ export class App {
     window.removeEventListener("keydown", this.keydownHandler);
     window.removeEventListener("resize", this.resizeHandler);
     this.components?.dispose();
+    this.modulator?.dispose();
     this.postStack?.dispose();
     this.rig?.dispose();
     this.fps.unmount();

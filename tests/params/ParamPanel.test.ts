@@ -1,6 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { ParamStore } from "../../src/params/ParamStore";
 import { ParamPanel } from "../../src/params/ParamPanel";
+import { Modulator } from "../../src/params/Modulator";
+import { FeatureStore } from "../../src/store/FeatureStore";
 
 describe("ParamPanel", () => {
   let container: HTMLElement;
@@ -46,7 +48,8 @@ describe("ParamPanel", () => {
       reconfig: false,
     });
 
-    const panel = new ParamPanel(store, container);
+    const modulator = new Modulator(store, new FeatureStore());
+    const panel = new ParamPanel(store, modulator, container);
 
     // The DSP folder should have only 1 binding (dsp.alpha), not 3 (which would
     // include the two component-namespaced params). We verify by checking if
@@ -83,7 +86,8 @@ describe("ParamPanel", () => {
       reconfig: false,
     });
 
-    const panel = new ParamPanel(store, container);
+    const modulator = new Modulator(store, new FeatureStore());
+    const panel = new ParamPanel(store, modulator, container);
     // Should not throw / should not corrupt bindings.
     store.set("components.boxView.enabled", false);
     expect(store.get("components.boxView.enabled")).toBe(false);

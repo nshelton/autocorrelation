@@ -5,6 +5,7 @@ import type { WebGPURenderer } from "three/webgpu";
 import type { ParamStore } from "../../params/ParamStore";
 import type { FolderApi } from "tweakpane";
 import type { PostEffect, PassCtx } from "./PostEffect";
+import type { Modulator } from "../../params/Modulator";
 
 // Owns a single PostProcessing instance plus an ordered list of effects.
 // Subscribes to ParamStore: any `post.*.enabled` change reads each effect's
@@ -89,10 +90,10 @@ export class PostStack {
     this.post.needsUpdate = true;
   }
 
-  bindUI(folder: FolderApi): void {
+  bindUI(folder: FolderApi, modulator: Modulator): void {
     for (const effect of this.effects) {
       const sub = folder.addFolder({ title: effect.label, expanded: false });
-      effect.bindUI(sub, this.store);
+      effect.bindUI(sub, this.store, modulator);
     }
   }
 

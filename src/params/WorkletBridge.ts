@@ -19,7 +19,10 @@ export class WorkletBridge {
     private store: ParamStore,
     private port: MessagePort,
   ) {
-    this.unsubscribe = store.subscribe((key) => this.handleChange(key));
+    this.unsubscribe = store.subscribe((key, _value, source) => {
+      if (source !== "user") return;
+      this.handleChange(key);
+    });
   }
 
   dispose(): void {

@@ -1,5 +1,7 @@
 import type { FolderApi } from "tweakpane";
 import type { Component, ComponentClass, ComponentDeps } from "./Component";
+import { Modulator } from "../../params/Modulator";
+import { bindParam } from "../../params/bindParam";
 
 // Per-component runtime state. paramsBag is null for components that don't
 // declare static paramDefaults. The bag is allocated once per page lifetime
@@ -72,7 +74,7 @@ export class ComponentManager {
   // Add one tweakpane folder per component: enable checkbox first, then
   // (if applicable) one slider per param bound to the stable bag. Must
   // be called AFTER start() — slots are populated there.
-  bindUI(parent: FolderApi): void {
+  bindUI(parent: FolderApi, modulator: Modulator): void {
     const { paramStore } = this.deps;
 
     for (const slot of this.slots) {
@@ -139,27 +141,9 @@ export class ComponentManager {
       ]);
       for (const k of allKeys) {
         const fullKey = `${slot.cls.paramPrefix ?? slot.cls.id}.${k}`;
-        const kind = slot.cls.paramKinds?.[k] ?? "continuous";
-        let binding;
-        if (kind === "discrete") {
-          const options = slot.cls.paramDiscreteOptions?.[k] ?? [];
-          const labels = slot.cls.paramDiscreteLabels?.[k];
-          binding = folder.addBinding(slot.paramsBag, k, {
-            options: Object.fromEntries(
-              options.map((v, i) => [labels?.[i] ?? String(v), v]),
-            ),
-          });
-        } else {
-          const opts = slot.cls.paramOpts?.[k];
-          if (!opts) continue;
-          binding = folder.addBinding(slot.paramsBag, k, {
-            ...opts,
-            step: opts.step ?? (opts.max - opts.min) / 100,
-          });
-        }
-        binding.on("change", (e: { value: number }) => {
-          paramStore.set(fullKey, e.value);
-        });
+        const schema = paramStore.schemaFor(fullKey);
+        if (!schema) continue;
+        bindParam(folder, paramStore, modulator, schema);
       }
     }
   }

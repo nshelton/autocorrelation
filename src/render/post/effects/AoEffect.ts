@@ -6,6 +6,8 @@ import type { FolderApi } from "tweakpane";
 import { ao } from "../GTAONode.js";
 import type { PostEffect, PassCtx } from "../PostEffect";
 import type { ParamStore } from "../../../params/ParamStore";
+import type { Modulator } from "../../../params/Modulator";
+import { bindParam } from "../../../params/bindParam";
 
 export class AoEffect implements PostEffect {
   readonly id = "ao";
@@ -47,21 +49,16 @@ export class AoEffect implements PostEffect {
     return input.mul(factor);
   }
 
-  bindUI(folder: FolderApi, store: ParamStore): void {
-    const b = {
-      enabled: store.get("post.ao.enabled") as boolean,
-      radius: store.get("post.ao.radius") as number,
-      intensity: store.get("post.ao.intensity") as number,
-    };
-    folder
-      .addBinding(b, "enabled", { label: "Enabled" })
-      .on("change", (e: { value: boolean }) => store.set("post.ao.enabled", e.value));
-    folder
-      .addBinding(b, "radius", { label: "Radius", min: 0.05, max: 2.0, step: 0.05 })
-      .on("change", (e: { value: number }) => store.set("post.ao.radius", e.value));
-    folder
-      .addBinding(b, "intensity", { label: "Intensity", min: 0, max: 2, step: 0.05 })
-      .on("change", (e: { value: number }) => store.set("post.ao.intensity", e.value));
+  bindUI(folder: FolderApi, store: ParamStore, modulator: Modulator): void {
+    for (const key of [
+      "post.ao.enabled",
+      "post.ao.radius",
+      "post.ao.intensity",
+    ]) {
+      const schema = store.schemaFor(key);
+      if (!schema) throw new Error(`AoEffect.bindUI: schema ${key} missing`);
+      bindParam(folder, store, modulator, schema);
+    }
   }
 
   dispose(): void {
