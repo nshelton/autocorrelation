@@ -28,6 +28,6 @@ export async function createRenderer(canvas: HTMLCanvasElement): Promise<WebGPUR
  */
 export function createSceneAndCamera(): { scene: ThreeScene; camera: PerspectiveCamera } {
   const scene = new ThreeScene();
-  const camera = new PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 100);
+  const camera = new PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
   return { scene, camera };
 }

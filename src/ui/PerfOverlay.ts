@@ -74,7 +74,8 @@ export class PerfOverlay {
     }
   }
 
-  // From the renderAsync().then() — GPU values land a frame or two late.
+  // Read once per frame from renderer.info.render — GPU timestamp lags a frame
+  // or two (async readback) and stays 0 when timestamp queries are unsupported.
   sampleGpu(ms: number, drawCalls: number, triangles: number): void {
     if (ms > 0) this.gpuMs = ema(this.gpuMs, ms);
     this.drawCalls = ema(this.drawCalls, drawCalls);
@@ -91,14 +92,13 @@ export class PerfOverlay {
 
   private render(): void {
     const ms = (v: number) => (Number.isNaN(v) ? "  — " : v.toFixed(2).padStart(5));
-    const gpu = Number.isNaN(this.gpuMs) ? "  — " : this.gpuMs.toFixed(2).padStart(5);
     const draws = Number.isNaN(this.drawCalls) ? "—" : Math.round(this.drawCalls).toString();
     const tris = Number.isNaN(this.triangles) ? "—" : `${(this.triangles / 1000).toFixed(1)}k`;
     const cpuTotal = this.cameraMs + this.componentsMs + this.submitMs;
     const hz = Number.isNaN(this.analysisHz) ? "—" : this.analysisHz.toFixed(1);
 
     this.el.textContent =
-      `GPU ${gpu} ms   draws ${draws}  tris ${tris}\n` +
+      `GPU ${ms(this.gpuMs)} ms   draws ${draws}  tris ${tris}\n` +
       `CPU ${ms(cpuTotal)} ms   cam ${ms(this.cameraMs)} cmp ${ms(this.componentsMs)} sub ${ms(this.submitMs)}\n` +
       `DSP ${ms(this.analysisMs)} ms @ ${hz} Hz`;
   }

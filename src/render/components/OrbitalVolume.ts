@@ -1,6 +1,6 @@
 import {
   Mesh, BoxGeometry, EdgesGeometry, LineSegments, BackSide, NormalBlending,
-  PerspectiveCamera, RenderTarget, Vector2, Color, Matrix4,
+  PerspectiveCamera, RenderTarget, Vector2, Color,
 } from "three";
 import {
   exp, Loop, MeshBasicNodeMaterial, LineBasicNodeMaterial, QuadMesh,
@@ -12,7 +12,7 @@ import {
 } from "three/tsl";
 import { evalPsi } from "../orbital/psi";
 import { SH_COUNT } from "../orbital/sh-basis";
-import { MID, LIGHT_DIR } from "../orbital/colormap";
+import { LIGHT_DIR } from "../orbital/colormap";
 import type { Component, ComponentDeps } from "./Component";
 
 // Discrete option sets (kept around so the static schema and the existing
@@ -30,6 +30,26 @@ const SH_LABELS = [
 const SHARED_SH_KEYS = SH_LABELS.map((k) => `orbitalCloud.${k}`);
 const GREEN = /*@__PURE__*/ vec3(0.230, 0.99, 0.14);
 const RED = /*@__PURE__*/ vec3(0.706, 0.016, 0.950);
+const BLACK = /*@__PURE__*/ vec3(0, 0, 0);
+
+// Halton(2, 3) sequence — the standard TAA / TAAU sub-pixel jitter offsets,
+// centered to [-0.5, 0.5]. 16 samples; the camera projection cycles through
+// them so successive frames sample different positions within each pixel.
+// Low-discrepancy = quasi-blue-noise = good spatial spread without clumps.
+const HALTON_LEN = 16;
+const HALTON_JITTER = /*@__PURE__*/ (() => {
+  const halton = (i: number, b: number): number => {
+    let r = 0, f = 1 / b, idx = i;
+    while (idx > 0) { r += f * (idx % b); idx = Math.floor(idx / b); f /= b; }
+    return r;
+  };
+  const arr = new Float32Array(HALTON_LEN * 2);
+  for (let i = 0; i < HALTON_LEN; i++) {
+    arr[i * 2]     = halton(i + 1, 2) - 0.5;
+    arr[i * 2 + 1] = halton(i + 1, 3) - 0.5;
+  }
+  return arr;
+})();
 
 function buildParamOpts(): Record<string, { min: number; max: number; step?: number }> {
   return {
@@ -37,6 +57,12 @@ function buildParamOpts(): Record<string, { min: number; max: number; step?: num
     shadowSteps:  { min: 0, max: 0, step: 0 },
     density:      { min: 0.1, max: 500, step: 0.1 },
     boundsRadius: { min: 1, max: 20, step: 0.1 },
+    // Accumulator blend weight — direct α for the shader-side mix.
+    // 1.0 → no blending (always show current frame, no smear).
+    // 0.5 → 50/50 with previous frame.
+    // 0.05 → heavy persistence-of-vision smear.
+    // 0.01 → nearly frozen, slow ghost trails.
+    accumBlend:   { min: 0.01, max: 1.0, step: 0.01 },
   };
 }
 
@@ -46,14 +72,16 @@ function buildParamDefaults(): Record<string, number> {
     shadowSteps:  0,
     density:      50,
     boundsRadius: 8,
+    accumBlend:   0.1,
   };
 }
 
-// BASELINE SHADER: render the view ray direction as RGB on the cube's
-// back face. No loops, no per-fragment evalPsi, no integration. The full
-// volumetric ray-marcher repeatedly crashed the machine while we sorted
-// out the TSL Loop/If/Break issue; this baseline keeps the component
-// instantiable + verifiable while we figure that out.
+// Renders a hydrogen-orbital ψ field as a volumetric ray-march, with
+// per-frame sub-pixel Halton jitter on the camera + IGN ray-start jitter
+// in the shader, accumulated via a shader-side EMA across two ping-pong
+// full-res render targets. Reads the orbital shape from `orbitalCloud.*`
+// params so toggling between this and the particle view shows the same
+// orbital.
 export class OrbitalVolume implements Component {
   static id = "orbitalVolume";
   static label = "Orbital Volume";
@@ -100,14 +128,11 @@ export class OrbitalVolume implements Component {
 
   // Full-res ping-pong accumulator. Three's WebGPU rejects ConstantColor
   // blend factors as "Blend factor not supported" (silently → black
-  // pipeline), so we do the running-mean blend in the shader instead:
-  //   accum = mix(prev_accum, sample, α)  with α = 1/(N+1)
+  // pipeline), so we do the EMA blend in the shader instead:
+  //   accum = mix(prev_accum, sample, accumBlend)
   // Each frame samples one RT and writes to the other; the next frame
   // swaps roles. Presenter samples whichever was most recently written.
-  // First frame after dirty has α=1 → ignores prev → fully overwrites.
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   private accumA: RenderTarget | null = null;
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   private accumB: RenderTarget | null = null;
   private accumQuad: QuadMesh | null = null;
   private accumMaterial: MeshBasicNodeMaterial | null = null;
@@ -118,16 +143,12 @@ export class OrbitalVolume implements Component {
   // Same trick for the presenter — points at whichever RT was just written.
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   private presenterTex: any = null;
-  // alpha = 1/(N+1) for the running mean. Updated each frame.
+  // EMA blend weight (= params.accumBlend). Updated each frame.
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   private accumAlphaU: any = null;
+  // Increments once per frame; drives Halton table index for camera jitter
+  // and the shader's temporal jitter increment.
   private accumFrame = 0;
-  private accumDirty = true;
-  // Tracks the main camera's matrixWorld from last frame so update() can
-  // detect view changes and reset the accumulator.
-  private lastCameraMatrix: Matrix4 = new Matrix4();
-  // Subscriber unhook for ParamStore dirty detection.
-  private storeUnsub: (() => void) | null = null;
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   private uniforms: any = null;
@@ -158,6 +179,10 @@ export class OrbitalVolume implements Component {
       // Int uniform; passed directly as the Loop bound so the WGSL for-loop
       // gets a real `i < uniforms.volumeSteps` test.
       volumeSteps:  uniform(Math.round(this.params.volumeSteps), "int"),
+      // Per-frame counter for IGN-based ray-start jitter. Animated by
+      // accumFrame so the noise pattern shifts each frame; the accumulator
+      // averages them out.
+      accumFrameU:  uniform(0),
     };
 
     const geom = new BoxGeometry(1, 1, 1);
@@ -186,17 +211,6 @@ export class OrbitalVolume implements Component {
     accumMat.depthWrite = false;
     this.accumMaterial = accumMat;
     this.accumQuad = new QuadMesh(accumMat);
-
-    // ---- Dirty subscription ----
-    // Any change to an orbital-shape param (shared from orbitalCloud.* or
-    // our own orbitalVolume.*) flips the accumulator dirty flag so the next
-    // frame restarts the running mean from scratch. Camera changes are
-    // detected by matrix compare in update(); they don't need a subscriber.
-    this.storeUnsub = this.paramStore.subscribe((key: string) => {
-      if (key.startsWith("orbitalCloud.") || key.startsWith("orbitalVolume.")) {
-        this.accumDirty = true;
-      }
-    });
 
     // ---- Volume mesh — on layer 1, ray-marches into the RT ----
     const mat = new MeshBasicNodeMaterial();
@@ -244,7 +258,7 @@ export class OrbitalVolume implements Component {
     // ---- Wireframe outline — child of presenter so it renders at full res ----
     const edgeGeom = new EdgesGeometry(geom);
     const lineMat = new LineBasicNodeMaterial();
-    lineMat.colorNode = vec4(1, 1, 1, 1);
+    lineMat.colorNode = vec4(0.1, 0.1, 0.1, 0.1);
     const outline = new LineSegments(edgeGeom, lineMat);
     outline.frustumCulled = false;
     presenter.add(outline);
@@ -258,12 +272,9 @@ export class OrbitalVolume implements Component {
   }
 
   // Resize the low-res RT to canvas × pixelRatio × renderScale, and the
-  // accumulator to canvas × pixelRatio (full res). Called on init and each
-  // frame from update() (no-op if size hasn't changed). Renderer's
-  // pixelRatio handles DPI scaling.
-  //
-  // A resize invalidates the accumulator history (different pixel
-  // correspondences), so flip dirty.
+  // accumulator pair to canvas × pixelRatio (full res). Called on init and
+  // each frame from update() (no-op if size hasn't changed). The EMA will
+  // quickly fade any garbage left over from the previous size.
   private static readonly RENDER_SCALE = 0.25;
   private static readonly CLEAR_COLOR = /*@__PURE__*/ new Color(0, 0, 0);
   private resizeRT(): void {
@@ -274,18 +285,9 @@ export class OrbitalVolume implements Component {
     const lowH = Math.max(1, Math.floor(sz.height * pr * OrbitalVolume.RENDER_SCALE));
     const fullW = Math.max(1, Math.floor(sz.width * pr));
     const fullH = Math.max(1, Math.floor(sz.height * pr));
-    if (this.rt.width !== lowW || this.rt.height !== lowH) {
-      this.rt.setSize(lowW, lowH);
-      this.accumDirty = true;
-    }
-    if (this.accumA.width !== fullW || this.accumA.height !== fullH) {
-      this.accumA.setSize(fullW, fullH);
-      this.accumDirty = true;
-    }
-    if (this.accumB.width !== fullW || this.accumB.height !== fullH) {
-      this.accumB.setSize(fullW, fullH);
-      this.accumDirty = true;
-    }
+    if (this.rt.width !== lowW || this.rt.height !== lowH) this.rt.setSize(lowW, lowH);
+    if (this.accumA.width !== fullW || this.accumA.height !== fullH) this.accumA.setSize(fullW, fullH);
+    if (this.accumB.width !== fullW || this.accumB.height !== fullH) this.accumB.setSize(fullW, fullH);
   }
 
   private readShared(localKey: string, fallback: number): number {
@@ -306,10 +308,8 @@ export class OrbitalVolume implements Component {
     }
   }
 
-
-
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   private buildColorNode(): any {
-
     const u = this.uniforms;
     return (Fn as any)(() => {
       const R = u.boundsRadius;
@@ -327,7 +327,21 @@ export class OrbitalVolume implements Component {
 
       const dt = (tFar.sub(tNear)).div(float(32));
       const step = dt.mul(rayDir);
-      let pos = rayOrigin.add(rayDir.mul(tNear)).toVar();
+
+      // Per-pixel, per-frame ray-start jitter. Interleaved Gradient Noise
+      // (Jimenez 2014) gives a cheap blue-noise-like spatial pattern; the
+      // golden-ratio temporal increment shifts the pattern each frame so
+      // every pixel cycles through different sub-step offsets. The
+      // accumulator's running mean integrates these → no step-count banding.
+      const sx = screenCoordinate.x;
+      const sy = screenCoordinate.y;
+      const ign = fract(
+        float(52.9829189).mul(
+          fract(float(0.06711056).mul(sx).add(float(0.00583715).mul(sy)))
+        )
+      );
+      const jitter = fract(ign.add(u.accumFrameU.mul(float(0.61803398875))));
+      let pos = rayOrigin.add(rayDir.mul(tNear.add(dt.mul(jitter)))).toVar();
       let accumColor = vec3(0).toVar();
       let accumAlpha = float(0).toVar();
 
@@ -335,44 +349,45 @@ export class OrbitalVolume implements Component {
         const psi = evalPsi(pos, u.shCoefs, u.n, u.radialScale);
 
         const dens = psi.mul(psi).mul(u.density).min(float(1)).max(float(0));
-        const stepAlpha = float(1).sub(exp(dens.mul(dt).negate()));
+        if (dens.greaterThan(float(0.01))) {
+            const stepAlpha = float(1).sub(exp(dens.mul(dt).negate()));
 
-        // Hot-cold sample color (algebraic-sigmoid normalization).
-        const xCol = psi.mul(u.colorScale);
-        const tNorm = xCol.div(xCol.abs().add(float(1)));
-        const tPos = tNorm.max(float(0));
-        const tNeg = tNorm.min(float(0)).abs();
-        const sampleColor = MID
-          .add(GREEN.sub(MID).mul(tPos))
-          .add(RED.sub(MID).mul(tNeg));
+            // Hot-cold sample color (algebraic-sigmoid normalization).
+            const xCol = psi.mul(u.colorScale);
+            const tNorm = xCol.div(xCol.abs().add(float(1)));
+            const tPos = tNorm.max(float(0));
+            const tNeg = tNorm.min(float(0)).abs();
+            const sampleColor = BLACK
+              .add(GREEN.sub(BLACK).mul(tPos))
+              .add(RED.sub(BLACK).mul(tNeg));
 
+            // Shadow march from pos along LIGHT_DIR. Fixed 8 iterations with a
+            // fixed shadowDt of 0.2; shadowSteps slider is currently a no-op.
+            const shadowDt = float(0.5);
+            const shadowDens = float(0).toVar();
+            let shadowPos = pos.toVar();
+            const shadowStep = LIGHT_DIR.mul(shadowDt);
 
-        // Shadow march from pos along LIGHT_DIR. Fixed 8 iterations with a
-        // fixed shadowDt of 0.2; shadowSteps slider is currently a no-op.
-        const shadowDt = float(0.2);
-        const shadowDens = float(0).toVar();
-        let shadowPos = pos.toVar();
-        const shadowStep = LIGHT_DIR.mul(shadowDt);
+            Loop(16, () => {
 
-        Loop(8, () => {
+              shadowPos.addAssign(shadowStep);
+              const psiS = evalPsi(shadowPos, u.shCoefs, u.n, u.radialScale);
+              shadowDens.addAssign(psiS.mul(psiS).mul(u.density).mul(shadowDt));
+            });
 
-          shadowPos.addAssign(shadowStep);
-          const psiS = evalPsi(shadowPos, u.shCoefs, u.n, u.radialScale);
-          shadowDens.addAssign(psiS.mul(psiS).mul(u.density).mul(shadowDt));
-        });
+            // Transmittance with a 40% ambient floor so back-lit fragments don't
+            // crush to near-zero.
+            const transmittance = exp(shadowDens.negate());
+            const lit = transmittance.mul(float(0.8)).add(float(0.2));
 
-        // Transmittance with a 40% ambient floor so back-lit fragments don't
-        // crush to near-zero.
-        const transmittance = exp(shadowDens.negate());
-        const lit = transmittance.mul(float(0.6)).add(float(0.4));
+            // Front-to-back composite (premultiplied alpha).
+            accumColor.addAssign(sampleColor.mul(lit).mul(stepAlpha).mul(float(1).sub(accumAlpha)));
+            accumAlpha.addAssign(stepAlpha.mul(float(1).sub(accumAlpha)));
 
-        // Front-to-back composite (premultiplied alpha).
-        accumColor.addAssign(sampleColor.mul(lit).mul(stepAlpha).mul(float(1).sub(accumAlpha)));
-        accumAlpha.addAssign(stepAlpha.mul(float(1).sub(accumAlpha)));
-
+        }
+     
         pos.addAssign(step);
       });
-
 
       return vec4(accumColor, accumAlpha);
     })();
@@ -397,14 +412,14 @@ export class OrbitalVolume implements Component {
     if (this.presenter) this.presenter.scale.setScalar(scale);
 
     // ---- Per-frame accumulator dance ----
-    //   1. resizeRT() — handles canvas resize (flips dirty if changed)
-    //   2. Detect camera changes — also flips dirty
-    //   3. If dirty: reset accumFrame so the next render runs at α=1 and
-    //      fully overwrites the accumulator's stale contents
-    //   4. Sync rtCamera, render volume to low-res RT (one ray-march pass)
-    //   5. Update blendColor to α = 1/(N+1), then render the quad into the
-    //      accumulator (one fullscreen sample-and-blend)
-    //   6. Increment accumFrame
+    //   1. resizeRT(): handle canvas resize (RTs reallocate; EMA fades any
+    //      garbage in a few frames)
+    //   2. Sync rtCamera + apply sub-pixel Halton jitter to the projection
+    //   3. Render volume into the low-res RT
+    //   4. Swap ping-pong roles, point accumPrevTex at the read RT, render
+    //      the quad into the write RT — shader does mix(prev, sample, blend)
+    //   5. Point presenterTex at the write RT so main scene shows freshest
+    //   6. Increment accumFrame (drives Halton index + temporal noise)
     if (!this.rt || !this.rtCamera || !this.accumA || !this.accumB || !this.accumQuad ||
         !this.accumMaterial || !this.accumPrevTex || !this.presenterTex || !this.accumAlphaU) {
       return;
@@ -412,17 +427,23 @@ export class OrbitalVolume implements Component {
 
     this.resizeRT();
 
-    if (!this.lastCameraMatrix.equals(this.camera.matrixWorld)) {
-      this.accumDirty = true;
-      this.lastCameraMatrix.copy(this.camera.matrixWorld);
-    }
-    if (this.accumDirty) {
-      this.accumFrame = 0;
-      this.accumDirty = false;
-    }
-
     this.rtCamera.copy(this.camera);
     this.rtCamera.layers.set(1);   // .copy() clobbers the layer mask
+
+    // Sub-pixel camera jitter — Halton(2, 3) offset in [-0.5, 0.5]² applied
+    // to the projection matrix's (cx, cy) translation. NDC unit = 2/W, so
+    // jx · (2/lowResW) shifts the camera by jx low-res-pixels. Over
+    // HALTON_LEN frames the accumulator sees the volume from a range of
+    // sub-pixel positions → quasi-supersampled image.
+    const idx = (this.accumFrame % HALTON_LEN) * 2;
+    const jx = HALTON_JITTER[idx];
+    const jy = HALTON_JITTER[idx + 1];
+    const proj = this.rtCamera.projectionMatrix.elements;
+    proj[8]  += jx * (2 / this.rt.width);
+    proj[9]  += jy * (2 / this.rt.height);
+
+    // Drive the shader's per-frame jitter increment.
+    u.accumFrameU.value = this.accumFrame;
 
     // setClearColor is a RENDERER-GLOBAL setter. If we don't restore it the
     // main scene's clear color (from Scene.ts) gets overwritten and every
@@ -444,14 +465,12 @@ export class OrbitalVolume implements Component {
 
     // Stage 2: ping-pong shader blend. Pick read (prev) + write (curr) based
     // on frame parity, point the accumulator material's TextureNode at prev,
-    // render the quad into curr. mix(prev, sample, α) with α=1/(N+1) does
-    // the running mean in-shader. First frame after dirty: α=1, output =
-    // sample (prev's stale contents are ignored).
+    // render the quad into curr. Shader does mix(prev, sample, accumBlend).
     const aOnEven = (this.accumFrame & 1) === 0;
     const readRT = aOnEven ? this.accumA : this.accumB;
     const writeRT = aOnEven ? this.accumB : this.accumA;
 
-    this.accumAlphaU.value = 1 / (this.accumFrame + 1);
+    this.accumAlphaU.value = this.params.accumBlend;
     this.accumPrevTex.value = readRT.texture;
 
     this.renderer.setRenderTarget(writeRT);
@@ -515,7 +534,5 @@ export class OrbitalVolume implements Component {
     this.presenterTex = null;
     this.accumAlphaU = null;
     this.rtCamera = null;
-    this.storeUnsub?.();
-    this.storeUnsub = null;
   }
 }
