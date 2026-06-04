@@ -1,6 +1,6 @@
 import {
   Mesh, BoxGeometry, EdgesGeometry, LineSegments, BackSide, NormalBlending,
-  PerspectiveCamera, RenderTarget, Vector2, Color,
+  PerspectiveCamera, RenderTarget, Vector2, Color, HalfFloatType,
 } from "three";
 import {
   exp, Loop, MeshBasicNodeMaterial, LineBasicNodeMaterial, QuadMesh,
@@ -188,9 +188,13 @@ export class OrbitalVolume implements Component {
     const geom = new BoxGeometry(1, 1, 1);
 
     // ---- Half-res RT + ping-pong full-res accumulators + clone camera ----
-    this.rt = new RenderTarget(2, 2);          // sized by resizeRT()
-    this.accumA = new RenderTarget(2, 2);
-    this.accumB = new RenderTarget(2, 2);
+    // HalfFloat (RGBA16F) — 8-bit RGB banded badly under the HDR post stack,
+    // and the EMA accumulator amplifies quantization (residuals < 1/255
+    // round to zero and the running mean snaps to step values).
+    const rtOpts = { type: HalfFloatType };
+    this.rt = new RenderTarget(2, 2, rtOpts);  // sized by resizeRT()
+    this.accumA = new RenderTarget(2, 2, rtOpts);
+    this.accumB = new RenderTarget(2, 2, rtOpts);
     this.resizeRT();
 
     this.rtCamera = this.camera.clone();
