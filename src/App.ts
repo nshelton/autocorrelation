@@ -8,6 +8,7 @@ import { FpsOverlay } from "./ui/Stats";
 import { PerfOverlay } from "./ui/PerfOverlay";
 import { ComponentManager } from "./render/components/ComponentManager";
 import { COMPONENTS } from "./render/components";
+import { shTween } from "./render/orbital/ShTween";
 
 import { Modulator } from "./params/Modulator";
 import { bindParam } from "./params/bindParam";
@@ -23,6 +24,8 @@ const CAMERA_PRESET_NAMES = ["front", "side", "spectrum", "rms", "buffer-acf", "
 
 // `camera.rotate` slider is 0..10; map to deg/s for the orbit (max → 180 deg/s).
 const ROTATE_DEG_PER_UNIT = 18;
+
+const DEG2RAD = Math.PI / 180;
 
 function loadCameraPose(): CameraPose | null {
   const raw = localStorage.getItem(CAMERA_POSE_KEY);
@@ -210,6 +213,7 @@ export class App {
       const t0 = performance.now();
       this.rig.update(dt);
       const t1 = performance.now();
+      shTween.tick(dt, this.deps.paramStore);
       this.modulator.tick();
       this.components.update();
       const t2 = performance.now();
@@ -257,6 +261,26 @@ export class App {
     bindParam(folder, store, this.modulator, rotateSchema);
     bindParam(folder, store, this.modulator, lightSchema);
 
+    const swimKeys = [
+      "camera.swim.enabled",
+      "camera.swim.posRoughness",
+      "camera.swim.posAmplitude",
+      "camera.swim.rotRoughness",
+      "camera.swim.rotAmplitude",
+    ];
+    for (const key of swimKeys) {
+      const schema = store.schemaFor(key);
+      if (!schema) throw new Error(`bindCameraUI: ${key} schema missing`);
+      bindParam(folder, store, this.modulator, schema);
+    }
+    const applySwim = () => this.rig.setSwim({
+      enabled:      store.get("camera.swim.enabled") as boolean,
+      posRoughness: store.get("camera.swim.posRoughness") as number,
+      posAmplitude: store.get("camera.swim.posAmplitude") as number,
+      rotRoughness: store.get("camera.swim.rotRoughness") as number,
+      rotAmplitude: (store.get("camera.swim.rotAmplitude") as number) * DEG2RAD,
+    });
+
     // Side-effects subscriber. Continuous modulatable keys (camera.fov,
     // camera.rotate) write through on every notify so the modulator can
     // drive them. preset (discrete) and light (boolean) are not
@@ -270,6 +294,8 @@ export class App {
         if (name) void this.rig.goTo(name, { duration: 0.8 });
       } else if (key === "camera.rotate" && typeof value === "number") {
         this.rig.setAutorotate(value * ROTATE_DEG_PER_UNIT);
+      } else if (key.startsWith("camera.swim.")) {
+        applySwim();
       } else if (key === "light.directional.enabled" && typeof value === "boolean" && source === "user") {
         if (value) this.scene.add(this.directionalLight);
         else this.scene.remove(this.directionalLight);
@@ -279,6 +305,7 @@ export class App {
     camera.fov = store.get("camera.fov") as number;
     camera.updateProjectionMatrix();
     this.rig.setAutorotate((store.get("camera.rotate") as number) * ROTATE_DEG_PER_UNIT);
+    applySwim();
   }
 
   dispose(): void {

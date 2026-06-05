@@ -12,6 +12,7 @@ import {
   dot, max,
 } from "three/tsl";
 import { evalPsi } from "../orbital/psi";
+import { shTween } from "../orbital/ShTween";
 import type { Component, ComponentDeps } from "./Component";
 import type { ParamStore } from "../../params/ParamStore";
 
@@ -61,6 +62,9 @@ function buildParamOpts(): Record<string, { min: number; max: number; step?: num
   opts.boundaryRadius = { min: 1, max: 20, step: 0.1 };
   opts.lifetime       = { min: 0.5, max: 30, step: 0.1 };
   opts.colorScale     = { min: 0.1, max: 200, step: 0.1 };
+  // Seconds the "Randomize SH" button takes to lerp the SH coefficients to
+  // their new values. 0 = instant.
+  opts.shTweenSecs    = { min: 0, max: 5, step: 0.05 };
   return opts;
 }
 
@@ -83,6 +87,7 @@ function buildParamDefaults(): Record<string, number> {
   d.boundaryRadius = 8.0;
   d.lifetime       = 5.0;
   d.colorScale     = 10.0;
+  d.shTweenSecs    = 1.0;
   return d;
 }
 
@@ -106,24 +111,26 @@ export class OrbitalCloud implements Component {
     renderMode: ["Points", "Splats", "Cubes"],
     n: ["1 (1s)", "2 (2s/2p)", "3 (3s/3p/3d)", "4 (4s/4p/4d/4f)"],
   };
-  // Each c_l_m: p=1/16 to be non-zero; if non-zero, 50/50 ±1. All-zero falls
-  // back to c_0_0=1 (pure 1s — most common natural state anyway).
+  // Randomize to a guaranteed-anisotropic orbital. Index 0 (c_0_0) is the
+  // isotropic term — on its own it renders as a featureless sphere, so we
+  // force it off and switch on 3..6 of the l>=1 terms (indices 1..15) at ±1.
+  // That always leaves real angular structure (lobes/nodes), never a sphere.
   static paramButtons = [
     {
       title: "Randomize SH",
       onClick: (store: ParamStore) => {
-        const vals: Record<string, number> = {};
-        let any = false;
-        for (const k of SH_LABELS) {
-          if (Math.random() < 1 / 16) {
-            vals[k] = Math.random() < 0.5 ? -1 : 1;
-            any = true;
-          } else {
-            vals[k] = 0;
-          }
+        const targets = new Array(SH_LABELS.length).fill(0) as number[];
+        const aniso = Array.from({ length: SH_LABELS.length - 1 }, (_, i) => i + 1);
+        const k = 3 + Math.floor(Math.random() * 4);  // 3..6 active terms
+        for (let i = 0; i < k; i++) {
+          // Partial Fisher-Yates: pick a distinct anisotropic index each step.
+          const j = i + Math.floor(Math.random() * (aniso.length - i));
+          [aniso[i], aniso[j]] = [aniso[j], aniso[i]];
+          targets[aniso[i]] = Math.random() < 0.5 ? -1 : 1;
         }
-        if (!any) vals.c_0_0 = 1;
-        for (const k of SH_LABELS) store.set(`orbitalCloud.${k}`, vals[k]);
+        const keys = SH_LABELS.map((kk) => `orbitalCloud.${kk}`);
+        const secs = store.get("orbitalCloud.shTweenSecs") as number;
+        shTween.start(store, keys, targets, secs);
       },
     },
   ];

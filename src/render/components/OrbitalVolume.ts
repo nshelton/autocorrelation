@@ -1,9 +1,12 @@
 import {
   Mesh, BoxGeometry, EdgesGeometry, LineSegments, BackSide, NormalBlending,
   PerspectiveCamera, RenderTarget, Vector2, Color, HalfFloatType,
+  AdditiveBlending,
 } from "three";
 import {
   exp, Loop, MeshBasicNodeMaterial, LineBasicNodeMaterial, QuadMesh,
+  sin,
+  cos,
 } from "three/webgpu";
 import {
   Fn, vec3, vec4, float, uniform, uniformArray, positionWorld,
@@ -28,8 +31,12 @@ const SH_LABELS = [
   "c_3_-3", "c_3_-2", "c_3_-1", "c_3_0", "c_3_1", "c_3_2", "c_3_3",
 ];
 const SHARED_SH_KEYS = SH_LABELS.map((k) => `orbitalCloud.${k}`);
-const GREEN = /*@__PURE__*/ vec3(0.230, 0.99, 0.14);
-const RED = /*@__PURE__*/ vec3(0.706, 0.016, 0.950);
+// const POS_COLOR = /*@__PURE__*/ vec3(0.230, 0.99, 0.14);
+// const NEG_COLOR = /*@__PURE__*/ vec3(0.206, 0.66, 0.950);
+
+const POS_COLOR = /*@__PURE__*/ vec3(0.3, 1, 0);
+const NEG_COLOR = /*@__PURE__*/ vec3(0,0.5,1);
+
 const BLACK = /*@__PURE__*/ vec3(0, 0, 0);
 
 // Halton(2, 3) sequence — the standard TAA / TAAU sub-pixel jitter offsets,
@@ -57,12 +64,11 @@ function buildParamOpts(): Record<string, { min: number; max: number; step?: num
     shadowSteps:  { min: 0, max: 0, step: 0 },
     density:      { min: 0.1, max: 500, step: 0.1 },
     boundsRadius: { min: 1, max: 20, step: 0.1 },
-    // Accumulator blend weight — direct α for the shader-side mix.
-    // 1.0 → no blending (always show current frame, no smear).
-    // 0.5 → 50/50 with previous frame.
-    // 0.05 → heavy persistence-of-vision smear.
-    // 0.01 → nearly frozen, slow ghost trails.
+    noiseAmount:  { min: 0, max: 1, step: 0.01 },
     accumBlend:   { min: 0.01, max: 1.0, step: 0.01 },
+    // Cutting plane along x: maps to worldX in [-R, R]. Only worldX <= sliceX
+    // is marched. 1.0 = full cube, 0.5 = center cross-section, 0 = empty.
+    slice:        { min: 0, max: 1.0, step: 0.01 },
   };
 }
 
@@ -71,8 +77,10 @@ function buildParamDefaults(): Record<string, number> {
     volumeSteps:  8,
     shadowSteps:  0,
     density:      50,
+    noiseAmount:  0,
     boundsRadius: 8,
     accumBlend:   0.1,
+    slice:        1.0,
   };
 }
 
@@ -176,6 +184,7 @@ export class OrbitalVolume implements Component {
       colorScale:   uniform(this.readShared("colorScale", 10.0)),
       density:      uniform(this.params.density),
       boundsRadius: uniform(this.params.boundsRadius),
+      slice:        uniform(this.params.slice),
       // Int uniform; passed directly as the Loop bound so the WGSL for-loop
       // gets a real `i < uniforms.volumeSteps` test.
       volumeSteps:  uniform(Math.round(this.params.volumeSteps), "int"),
@@ -183,6 +192,7 @@ export class OrbitalVolume implements Component {
       // accumFrame so the noise pattern shifts each frame; the accumulator
       // averages them out.
       accumFrameU:  uniform(0),
+      noiseAmount:  uniform(this.params.noise_amount),
     };
 
     const geom = new BoxGeometry(1, 1, 1);
@@ -262,7 +272,12 @@ export class OrbitalVolume implements Component {
     // ---- Wireframe outline — child of presenter so it renders at full res ----
     const edgeGeom = new EdgesGeometry(geom);
     const lineMat = new LineBasicNodeMaterial();
-    lineMat.colorNode = vec4(0.1, 0.1, 0.1, 0.1);
+    // Additive: rgb is the per-pixel light deposited, alpha=1 keeps full contribution.
+    // Putting dimness in rgb (not alpha) avoids double-dimming; overlaps stack toward white.
+    lineMat.colorNode = vec4(0.05, 0.05, 0.05, 1.0);
+    lineMat.transparent = true;
+    lineMat.depthWrite = false;
+    lineMat.blending = AdditiveBlending;
     const outline = new LineSegments(edgeGeom, lineMat);
     outline.frustumCulled = false;
     presenter.add(outline);
@@ -320,10 +335,13 @@ export class OrbitalVolume implements Component {
       const rayOrigin = cameraPosition;
       const rayDir = normalize(positionWorld.sub(cameraPosition));
 
-      // Slab intersect against [-R, R]^3.
+      // Slab intersect against [-R, R]^3, with the +x face pulled in to the
+      // cutting plane sliceX = mix(-R, R, slice) so only worldX <= sliceX is
+      // marched. slice=1 → sliceX=R (no cut); slice=0.5 → sliceX=0 (center).
+      const sliceX = mix(R.negate(), R, u.slice);
       const invDir = vec3(1, 1, 1).div(rayDir);
-      const t1 = vec3(R.negate()).sub(rayOrigin).mul(invDir);
-      const t2 = vec3(R).sub(rayOrigin).mul(invDir);
+      const t1 = vec3(R.negate(), R.negate(), R.negate()).sub(rayOrigin).mul(invDir);
+      const t2 = vec3(sliceX, R, R).sub(rayOrigin).mul(invDir);
       const tMin = vec3(min(t1.x, t2.x), min(t1.y, t2.y), min(t1.z, t2.z));
       const tMax = vec3(max(t1.x, t2.x), max(t1.y, t2.y), max(t1.z, t2.z));
       const tNear = max(max(max(tMin.x, tMin.y), tMin.z), float(0));
@@ -349,10 +367,21 @@ export class OrbitalVolume implements Component {
       let accumColor = vec3(0).toVar();
       let accumAlpha = float(0).toVar();
 
-      Loop(32, () => {
-        const psi = evalPsi(pos, u.shCoefs, u.n, u.radialScale);
+      const noiseScale = 0.2;
 
-        const dens = psi.mul(psi).mul(u.density).min(float(1)).max(float(0));
+      Loop(32, () => {
+        const pos_distort = pos.add(
+          vec3(
+            exp(sin(pos.y.mul(noiseScale)).add(cos(pos.z.mul(noiseScale)))).sub(float(1)),
+            exp(sin(pos.z.mul(noiseScale)).add(cos(pos.x.mul(noiseScale)))).sub(float(1)),
+            exp(sin(pos.x.mul(noiseScale)).add(cos(pos.y.mul(noiseScale)))).sub(float(1)),
+          ).mul(float(u.noiseAmount))
+        );
+
+        const psi = evalPsi(pos_distort, u.shCoefs, u.n, u.radialScale);
+
+        const dens = psi.mul(psi).mul(u.density).min(float(1)).max(float(0)).pow(float(3.));
+
         if (dens.greaterThan(float(0.01))) {
             const stepAlpha = float(1).sub(exp(dens.mul(dt).negate()));
 
@@ -362,12 +391,12 @@ export class OrbitalVolume implements Component {
             const tPos = tNorm.max(float(0));
             const tNeg = tNorm.min(float(0)).abs();
             const sampleColor = BLACK
-              .add(GREEN.sub(BLACK).mul(tPos))
-              .add(RED.sub(BLACK).mul(tNeg));
+              .add(POS_COLOR.sub(BLACK).mul(tPos))
+              .add(NEG_COLOR.sub(BLACK).mul(tNeg));
 
             // Shadow march from pos along LIGHT_DIR. Fixed 8 iterations with a
             // fixed shadowDt of 0.2; shadowSteps slider is currently a no-op.
-            const shadowDt = float(0.5);
+            const shadowDt = float(4);
             const shadowDens = float(0).toVar();
             let shadowPos = pos.toVar();
             const shadowStep = LIGHT_DIR.mul(shadowDt);
@@ -408,7 +437,9 @@ export class OrbitalVolume implements Component {
     u.radialScale.value = this.readShared("radialScale", 1.0);
     u.colorScale.value = this.readShared("colorScale", 10.0);
     u.density.value = this.params.density;
+    u.noiseAmount.value = this.params.noiseAmount;
     u.boundsRadius.value = this.params.boundsRadius;
+    u.slice.value = this.params.slice;
     u.volumeSteps.value = Math.round(this.params.volumeSteps);
 
     const scale = this.params.boundsRadius * 2;

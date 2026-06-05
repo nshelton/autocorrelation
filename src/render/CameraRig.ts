@@ -14,6 +14,33 @@ export interface GoToOptions {
 
 export type ProceduralController = (dt: number, camera: PerspectiveCamera) => void;
 
+export interface SwimConfig {
+  enabled: boolean;
+  posRoughness: number;   // time rate of the position wander (rad/s base freq)
+  posAmplitude: number;   // world units
+  rotRoughness: number;   // time rate of the orientation wander
+  rotAmplitude: number;   // radians (App converts from degrees)
+}
+
+const SWIM_OFF: SwimConfig = {
+  enabled: false, posRoughness: 0, posAmplitude: 0, rotRoughness: 0, rotAmplitude: 0,
+};
+
+// Smooth fractional-brownian noise in ~[-1, 1]: three octaves of sine, summed
+// and normalized. `phase` decorrelates channels so each axis wanders on its
+// own. Non-integer octave ratio keeps the octaves from phase-aligning into an
+// obvious beat. Stateless — depends only on (t, phase).
+function swimNoise(t: number, phase: number): number {
+  let v = 0, amp = 1, freq = 1, norm = 0;
+  for (let o = 0; o < 3; o++) {
+    v += amp * Math.sin(t * freq + phase * (o + 1) * 1.7);
+    norm += amp;
+    amp *= 0.5;
+    freq *= 2.07;
+  }
+  return v / norm;
+}
+
 interface ActiveTween {
   from: CameraPose;
   to: CameraPose;
@@ -32,6 +59,15 @@ export class CameraRig {
   private currentTarget = new Vector3();
   private tween: ActiveTween | null = null;
   private procedural: ProceduralController | null = null;
+
+  // Additive "swim" wander layered on top of the base pose each frame.
+  // swimPos holds the offset applied last frame so we can strip it before the
+  // base update runs — OrbitControls reads camera.position as ground truth, so
+  // a leaked offset would corrupt the orbit. Rotation needs no strip: every
+  // base path (controls/tween/procedural) rewrites the quaternion fresh.
+  private swim: SwimConfig = SWIM_OFF;
+  private swimTime = 0;
+  private swimPos = new Vector3();
 
   constructor(camera: PerspectiveCamera, domElement: HTMLElement) {
     this.camera = camera;
@@ -89,6 +125,10 @@ export class CameraRig {
     this.controls.enabled = fn === null;
   }
 
+  setSwim(cfg: SwimConfig): void {
+    this.swim = cfg;
+  }
+
   setAutorotate(degPerSec: number): void {
     // Use OrbitControls' native autoRotate so mouse drag still works and the
     // spin only pauses while the user is actively dragging (state !== NONE).
@@ -99,6 +139,36 @@ export class CameraRig {
   }
 
   update(dt: number): void {
+    // Strip last frame's additive position swim so the base update (and any
+    // state derived from camera.position) sees the clean pose.
+    this.camera.position.sub(this.swimPos);
+    this.swimPos.set(0, 0, 0);
+    this.updateBase(dt);
+    this.applySwim(dt);
+  }
+
+  // Additive wander on top of the base pose. Position is offset by swimPos
+  // (stripped next frame); orientation is tilted in place (regenerated next
+  // frame by the base update, so it can't accumulate).
+  private applySwim(dt: number): void {
+    if (!this.swim.enabled) return;
+    this.swimTime += dt;
+    const a = this.swim.posAmplitude;
+    if (a > 0) {
+      const t = this.swimTime * this.swim.posRoughness;
+      this.swimPos.set(swimNoise(t, 0), swimNoise(t, 2.4), swimNoise(t, 4.8)).multiplyScalar(a);
+      this.camera.position.add(this.swimPos);
+    }
+    const ra = this.swim.rotAmplitude;
+    if (ra > 0) {
+      const t = this.swimTime * this.swim.rotRoughness;
+      this.camera.rotateX(swimNoise(t, 7.2) * ra);
+      this.camera.rotateY(swimNoise(t, 9.6) * ra);
+      this.camera.rotateZ(swimNoise(t, 12.0) * ra);
+    }
+  }
+
+  private updateBase(dt: number): void {
     if (this.tween) {
       this.tween.elapsed += dt;
       const raw = Math.min(1, this.tween.elapsed / this.tween.duration);
@@ -138,7 +208,9 @@ export class CameraRig {
 
   getPose(): CameraPose {
     return {
-      position: this.camera.position.clone(),
+      // Subtract the live swim offset so a saved/persisted pose is the base
+      // pose, not a wandered one.
+      position: this.camera.position.clone().sub(this.swimPos),
       target: this.currentTarget.clone(),
       fov: this.camera.fov,
     };

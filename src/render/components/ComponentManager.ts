@@ -1,7 +1,7 @@
 import type { FolderApi } from "tweakpane";
 import type { Component, ComponentClass, ComponentDeps } from "./Component";
 import { Modulator } from "../../params/Modulator";
-import { bindParam } from "../../params/bindParam";
+import { bindParam, bindTrigger } from "../../params/bindParam";
 
 // Per-component runtime state. paramsBag is null for components that don't
 // declare static paramDefaults. The bag is allocated once per page lifetime
@@ -121,12 +121,19 @@ export class ComponentManager {
       }
 
       if (slot.cls.paramButtons) {
+        const btnPrefix = slot.cls.paramPrefix ?? slot.cls.id;
         for (const btn of slot.cls.paramButtons) {
           const b = folder.addButton({ title: btn.title });
-          b.on("click", () => {
+          const fire = () => {
             btn.onClick(paramStore);
             folder.refresh();
-          });
+          };
+          b.on("click", fire);
+          // Same action is reachable from audio: register it under a stable
+          // key and add the trigger UI (source + threshold + level graph).
+          const triggerKey = `${btnPrefix}.button.${btn.title.replace(/\s+/g, "")}`;
+          modulator.registerTriggerCallback(triggerKey, fire);
+          bindTrigger(folder, modulator, triggerKey);
         }
       }
 
