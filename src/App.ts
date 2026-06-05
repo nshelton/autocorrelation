@@ -174,6 +174,11 @@ export class App {
         this.perf.toggle();
         return;
       }
+      if (e.key === "h" || e.key === "H") {
+        // Hide/show the whole GUI (panel + overlays carry the .gui-el class).
+        document.body.classList.toggle("gui-hidden");
+        return;
+      }
       if (e.key === " ") {
         toggled = !toggled;
         savePoseAfter(this.rig.goTo(toggled ? "side" : "front", { duration: 0.8 }));

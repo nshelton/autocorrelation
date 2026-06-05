@@ -42,17 +42,20 @@ export class PerfOverlay {
     el.style.cssText = [
       "position:fixed",
       "top:4rem",
-      "left:1rem",
+      "right:1rem",
       "margin:0",
       "padding:4px 8px",
       "font:11px/1.4 ui-monospace,Menlo,Consolas,monospace",
       "color:#cfe",
-      "background:rgba(0,0,0,0.55)",
-      "border-radius:3px",
+      // Transparent background; text-shadow keeps it legible over the canvas.
+      "background:transparent",
+      "text-shadow:0 0 3px #000,0 0 3px #000",
+      "text-align:right",
       "z-index:10",
       "pointer-events:none",
       "white-space:pre",
     ].join(";");
+    el.classList.add("gui-el");
     this.el = el;
   }
 

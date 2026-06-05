@@ -8,21 +8,28 @@ const TRIGGER_STORAGE_KEY = "autocorrelation.triggers.v1";
 
 export interface ModBinding {
   source: string;
-  depth: number;
-  // Power curve applied to the 0..1 source value before the depth lerp:
-  // v^power. >1 emphasizes peaks (crushes lows), <1 lifts lows. Optional for
-  // back-compat with bindings persisted before this existed; treated as 1.
+  // Output range in param units: the smoothed + power-curved 0..1 signal maps
+  // into [lo, hi]. Optional — default to the param's full [min, max]. Old
+  // persisted bindings used `depth`; it's ignored, lo/hi fall back to the range.
+  lo?: number;
+  hi?: number;
+  // Power curve applied to the 0..1 source value before mapping into [lo,hi]:
+  // v^power. >1 emphasizes peaks (crushes lows), <1 lifts lows. Optional; 1.
   power?: number;
   // Cheap per-tick EMA on the source before the power curve: 0 = none,
   // →1 = heavy. alpha = 1 - smoothing (clamped > 0). Optional; treated as 0.
   smoothing?: number;
 }
 
-// A button trigger: fire the button's action once when `source` rises across
-// `threshold` (rising edge), re-arming only after it drops back below.
+// A button trigger: fire the button's action once when the smoothed + power-
+// curved `source` rises across `threshold` (rising edge), re-arming only after
+// it drops back below. power/smoothing filter the source the same way as
+// continuous modulation (see ModBinding); optional, treated as 1 / 0.
 export interface TriggerBinding {
   source: string;
   threshold: number;
+  power?: number;
+  smoothing?: number;
 }
 
 type SourceDescriptor = {
@@ -49,6 +56,7 @@ function beatSin(i: number): (b: Float32Array) => number {
 
 // Curated audio sources. UI dropdown + persistence use these string keys.
 export const MOD_SOURCES: Record<string, SourceDescriptor> = {
+  "rms.total": { buffer: "rms",    read: latest },
   "rms.low":  { buffer: "rmsLow",  read: latest },
   "rms.mid":  { buffer: "rmsMid",  read: latest },
   "rms.high": { buffer: "rmsHigh", read: latest },
@@ -139,10 +147,15 @@ export class Modulator {
     if (binding === null) {
       if (!this.triggers.delete(key)) return;
       this.triggerArmed.delete(key);
+      this.smoothed.delete(key);
+      this.processed.delete(key);
       this.persistTriggers();
       for (const fn of this.uiSubs) fn(key);
       return;
     }
+    // Reseed the EMA only when the source changes (not on threshold/power/
+    // smoothing tweaks), matching setBinding.
+    if (this.triggers.get(key)?.source !== binding.source) this.smoothed.delete(key);
     this.triggers.set(key, { ...binding });
     this.triggerArmed.delete(key);   // re-seed arm state on the next sample
     this.persistTriggers();
@@ -170,48 +183,48 @@ export class Modulator {
   }
 
   // The smoothed + power-curved signal (0..1) currently driving a key's
-  // modulation — what the continuous mod graph displays. 0 when unmodulated.
+  // modulation or trigger — what the mod/trigger graph displays. 0 when unset.
   processedValue(key: string): number {
     return this.processed.get(key) ?? 0;
+  }
+
+  // EMA-smooth (alpha = 1 - smoothing) then apply the power curve to a source,
+  // updating the per-key smoothing + processed state. Returns the 0..1 signal.
+  // Shared by continuous modulation and button triggers so both filter the
+  // input identically.
+  private processSource(key: string, source: string, power: number, smoothing: number): number {
+    const v = Math.max(0, this.readSource(source));
+    const alpha = Math.max(1e-3, 1 - smoothing);
+    const prev = this.smoothed.get(key);
+    const sm = prev === undefined ? v : prev + alpha * (v - prev);
+    this.smoothed.set(key, sm);
+    const curved = Math.pow(sm, power);
+    this.processed.set(key, curved);
+    return curved;
   }
 
   tick(): void {
     for (const [key, b] of this.bindings) {
       const schema = this.store.schemaFor(key);
       if (!schema || schema.kind !== "continuous") continue;
-      const src = MOD_SOURCES[b.source];
-      if (!src) continue;
-      const buf = this.features.get(src.buffer);
-      const raw = src.read(buf);
-      const base = this.store.get(key) as number;
-      const hasData = buf.length > 0 && Number.isFinite(raw);
-      // EMA-smooth the (non-negative) source. During no-data the input decays
-      // toward 0 so the graph falls, but the param still rests at base below.
-      const v = hasData ? Math.max(0, raw) : 0;
-      const alpha = Math.max(1e-3, 1 - (b.smoothing ?? 0));
-      const prev = this.smoothed.get(key);
-      const sm = prev === undefined ? v : prev + alpha * (v - prev);
-      this.smoothed.set(key, sm);
-      // Power curve on the smoothed value → the 0..1 signal driving modulation.
-      const curved = Math.pow(sm, b.power ?? 1);
-      this.processed.set(key, curved);
-
-      if (!hasData) {
-        this.store.notify(key, base);
-        this.emitValue(key, base);
-        continue;
-      }
-      const target = schema.min + (schema.max - schema.min) * curved;
-      const out = base + (target - base) * b.depth;
+      if (!MOD_SOURCES[b.source]) continue;
+      const curved = this.processSource(key, b.source, b.power ?? 1, b.smoothing ?? 0);
+      // Map the 0..1 signal into [lo, hi] (param units; default to full range).
+      // During silence curved decays to 0, so the param settles at lo.
+      const lo = b.lo ?? schema.min;
+      const hi = b.hi ?? schema.max;
+      const out = lo + (hi - lo) * curved;
       this.store.notify(key, out);
       this.emitValue(key, out);
     }
 
-    // Button triggers: fire on a rising edge across threshold, re-arm on fall.
+    // Button triggers: fire on a rising edge across threshold (of the same
+    // smoothed + power-curved signal), re-arm on fall. processSource runs
+    // before the callback check so the trigger graph updates regardless.
     for (const [key, t] of this.triggers) {
+      const v = this.processSource(key, t.source, t.power ?? 1, t.smoothing ?? 0);
       const cb = this.triggerCallbacks.get(key);
       if (!cb) continue;
-      const v = this.readSource(t.source);
       const armed = this.triggerArmed.get(key);
       if (armed === undefined) {
         // First sample: just set the initial arm state, never fire on load.
@@ -270,14 +283,20 @@ export class Modulator {
     for (const [key, val] of Object.entries(parsed as Record<string, unknown>)) {
       if (!val || typeof val !== "object") continue;
       const candidate = val as {
-        source?: unknown; depth?: unknown; power?: unknown; smoothing?: unknown;
+        source?: unknown; lo?: unknown; hi?: unknown; power?: unknown; smoothing?: unknown;
       };
       if (typeof candidate.source !== "string") continue;
-      if (typeof candidate.depth !== "number") continue;
       const source = LEGACY_SOURCE_ALIASES[candidate.source] ?? candidate.source;
       if (!(source in MOD_SOURCES)) continue;
-      if (!this.store.schemaFor(key)) continue;
-      const binding: ModBinding = { source, depth: candidate.depth };
+      // NOTE: do NOT drop bindings whose param schema isn't registered yet —
+      // component-param schemas register after the Modulator is constructed, so
+      // dropping here loses them on a full page reload. tick() guards on the
+      // schema being a registered continuous param, so an unknown key is just
+      // inactive until its schema arrives. (Old bindings carried `depth`; it's
+      // ignored — lo/hi fall back to the param's full range.)
+      const binding: ModBinding = { source };
+      if (typeof candidate.lo === "number") binding.lo = candidate.lo;
+      if (typeof candidate.hi === "number") binding.hi = candidate.hi;
       if (typeof candidate.power === "number") binding.power = candidate.power;
       if (typeof candidate.smoothing === "number") binding.smoothing = candidate.smoothing;
       this.bindings.set(key, binding);
@@ -309,12 +328,17 @@ export class Modulator {
     if (!parsed || typeof parsed !== "object") return;
     for (const [key, val] of Object.entries(parsed as Record<string, unknown>)) {
       if (!val || typeof val !== "object") continue;
-      const candidate = val as { source?: unknown; threshold?: unknown };
+      const candidate = val as {
+        source?: unknown; threshold?: unknown; power?: unknown; smoothing?: unknown;
+      };
       if (typeof candidate.source !== "string") continue;
       if (typeof candidate.threshold !== "number") continue;
       const source = LEGACY_SOURCE_ALIASES[candidate.source] ?? candidate.source;
       if (!(source in MOD_SOURCES)) continue;
-      this.triggers.set(key, { source, threshold: candidate.threshold });
+      const binding: TriggerBinding = { source, threshold: candidate.threshold };
+      if (typeof candidate.power === "number") binding.power = candidate.power;
+      if (typeof candidate.smoothing === "number") binding.smoothing = candidate.smoothing;
+      this.triggers.set(key, binding);
     }
   }
 

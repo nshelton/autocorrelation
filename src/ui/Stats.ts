@@ -16,9 +16,12 @@ export class FpsOverlay {
     const dom = this.stats.dom;
     dom.style.position = "fixed";
     dom.style.top = "1rem";
-    dom.style.right = "auto";
-    dom.style.left = "1rem";
+    dom.style.left = "auto";
+    dom.style.right = "1rem";
     dom.style.zIndex = "10";
+    // stats.js draws its panel on a <canvas>, so its dark backdrop can't be made
+    // transparent — but it fades/hides with the rest of the GUI via .gui-el.
+    dom.classList.add("gui-el");
     parent.appendChild(dom);
   }
 

@@ -3,6 +3,8 @@ import { BoxView } from "./BoxView";
 import { ParticleView } from "./ParticleView";
 import { OrbitalCloud } from "./OrbitalCloud";
 import { OrbitalVolume } from "./OrbitalVolume";
+import { Spawner } from "./Spawner";
+import { Grid } from "./Grid";
 import type { ComponentClass } from "./Component";
 
 // Order = render order in the scene (insertion order). Also drives the
@@ -13,4 +15,6 @@ export const COMPONENTS: readonly ComponentClass[] = [
   ParticleView as unknown as ComponentClass,
   OrbitalCloud as unknown as ComponentClass,
   OrbitalVolume as unknown as ComponentClass,
+  Spawner as unknown as ComponentClass,
+  Grid as unknown as ComponentClass,
 ];

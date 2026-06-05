@@ -1,7 +1,7 @@
 import type { FolderApi } from "tweakpane";
 import type { Component, ComponentClass, ComponentDeps } from "./Component";
 import { Modulator } from "../../params/Modulator";
-import { bindParam, bindTrigger } from "../../params/bindParam";
+import { bindParam, bindTrigger, type ParamProxyRegistry } from "../../params/bindParam";
 
 // Per-component runtime state. paramsBag is null for components that don't
 // declare static paramDefaults. The bag is allocated once per page lifetime
@@ -124,16 +124,18 @@ export class ComponentManager {
         const btnPrefix = slot.cls.paramPrefix ?? slot.cls.id;
         for (const btn of slot.cls.paramButtons) {
           const b = folder.addButton({ title: btn.title });
+          // Same action is reachable from audio: register it under a stable key
+          // and inject the trigger UI. bindTrigger returns a flash() that pulses
+          // the button white so audio-driven fires are visible.
+          const triggerKey = `${btnPrefix}.button.${btn.title.replace(/\s+/g, "")}`;
+          const flash = bindTrigger(b, modulator, triggerKey);
           const fire = () => {
+            flash();
             btn.onClick(paramStore);
             folder.refresh();
           };
           b.on("click", fire);
-          // Same action is reachable from audio: register it under a stable
-          // key and add the trigger UI (source + threshold + level graph).
-          const triggerKey = `${btnPrefix}.button.${btn.title.replace(/\s+/g, "")}`;
           modulator.registerTriggerCallback(triggerKey, fire);
-          bindTrigger(folder, modulator, triggerKey);
         }
       }
 
@@ -146,12 +148,26 @@ export class ComponentManager {
         ...Object.keys(slot.cls.paramOpts ?? {}),
         ...Object.keys(slot.cls.paramDefaults ?? {}),
       ]);
+      // Collect per-key "re-pull proxy from store" callbacks so programmatic
+      // store writes (e.g. the SH tween behind "Randomize SH", or "Reset to
+      // defaults") snap the sliders to the new values instead of going stale.
+      const proxies: ParamProxyRegistry = new Map();
       for (const k of allKeys) {
         const fullKey = `${slot.cls.paramPrefix ?? slot.cls.id}.${k}`;
         const schema = paramStore.schemaFor(fullKey);
         if (!schema) continue;
-        bindParam(folder, paramStore, modulator, schema);
+        bindParam(folder, paramStore, modulator, schema, proxies);
       }
+      // Gated on source==='user' so per-frame modulator notifies don't jitter
+      // the UI; matches ParamPanel's dsp.* slider refresh.
+      const refreshUnsub = paramStore.subscribe((key, _value, source) => {
+        if (source !== "user") return;
+        const refresh = proxies.get(key);
+        if (!refresh) return;
+        refresh();
+        folder.refresh();
+      });
+      this.paneTeardowns.push({ dispose: refreshUnsub });
     }
   }
 
@@ -208,6 +224,7 @@ export class ComponentManager {
           reconfig: false,
           default: def,
           options,
+          optionLabels: cls.paramDiscreteLabels?.[k],
         });
       } else {
         const opts = cls.paramOpts?.[k];

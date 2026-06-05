@@ -60,8 +60,9 @@ describe("ParamPanel", () => {
     // Tweakpane creates a control per binding, so 1 dsp.alpha binding should
     // produce 1 control (plus the reset button). Component params should not be here.
     const controls = container.querySelectorAll("input, select");
-    // 1 control for dsp.alpha (slider)
-    expect(controls.length).toBe(1);
+    // 2 controls: dsp.alpha (slider) + the System "gui transparency" slider.
+    // The two component-namespaced params must NOT render here (else it'd be 4).
+    expect(controls.length).toBe(2);
 
     panel.dispose();
   });

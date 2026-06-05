@@ -19,6 +19,81 @@
                 height: 100vh;
                 display: block;
             }
+            /* GUI fade (driven by System > gui transparency) and hide toggle
+               (press 'h'). All GUI roots carry the .gui-el class. */
+            :root {
+                --gui-opacity: 1;
+                /* Monochrome controls: retint knobs / slider fills / inputs /
+                   buttons to the neutral label color (the default cool blue-gray
+                   fill stuck out against the transparent panel). */
+                --tp-label-foreground-color: #cccccc;
+                --tp-input-foreground-color: #cccccc;
+                --tp-button-foreground-color: #cccccc;
+                --tp-monitor-foreground-color: #cccccc;
+                --tp-groove-foreground-color: rgba(204, 204, 204, 0.25);
+                --tp-input-background-color: rgba(204, 204, 204, 0.1);
+                --tp-input-background-color-hover: rgba(204, 204, 204, 0.18);
+                --tp-input-background-color-active: rgba(204, 204, 204, 0.25);
+                --tp-input-background-color-focus: rgba(204, 204, 204, 0.22);
+                --tp-button-background-color: rgba(204, 204, 204, 0.1);
+                --tp-button-background-color-hover: rgba(204, 204, 204, 0.18);
+                --tp-button-background-color-active: rgba(204, 204, 204, 0.3);
+                --tp-button-background-color-focus: rgba(204, 204, 204, 0.22);
+                /* Section outlines: folder title bars carry the faint container
+                   background at all times (not just on hover) so every section
+                   stays visually grouped. */
+                --tp-container-background-color: rgba(204, 204, 204, 0.1);
+                --tp-container-background-color-hover: rgba(204, 204, 204, 0.16);
+                --tp-container-background-color-active: rgba(204, 204, 204, 0.22);
+                --tp-container-background-color-focus: rgba(204, 204, 204, 0.18);
+            }
+            .gui-el {
+                opacity: var(--gui-opacity, 1);
+                transition: opacity 0.1s;
+            }
+            body.gui-hidden .gui-el {
+                display: none !important;
+            }
+            /* Sliders only (rows containing .tp-sldtxtv): full-width slider with
+               the label laid across on top instead of wrapping in a narrow left
+               column. Label is click-through so the slider stays draggable.
+               Dropdowns / checkboxes / buttons keep the normal two-column
+               layout. !important because tweakpane injects its CSS at runtime. */
+            .tp-lblv:has(.tp-sldtxtv),
+            .tp-lblv:has(.tp-grlv) {
+                position: relative !important;
+            }
+            .tp-lblv:has(.tp-sldtxtv) .tp-lblv_v,
+            .tp-lblv:has(.tp-grlv) .tp-lblv_v {
+                width: 100% !important;
+                /* nudge the slider bar / graph down so it only partially overlaps
+                   the label sitting at the top of the row */
+                padding-top: 8px;
+            }
+            .tp-lblv:has(.tp-sldtxtv) .tp-lblv_l,
+            .tp-lblv:has(.tp-grlv) .tp-lblv_l {
+                position: absolute !important;
+                left: 8px;
+                right: 8px;
+                top: 0;
+                bottom: auto;
+                display: flex !important;
+                align-items: flex-start;
+                white-space: nowrap !important;
+                overflow: hidden;
+                pointer-events: none !important;
+                opacity: 0.9 !important;
+                z-index: 1;
+            }
+            /* Dropdowns: give the value cell half the row so the label has room
+               (the default fixed value width cramped long titles into 2 lines).
+               min-width:0 lets it actually hold 50% instead of being pushed wider
+               by the <select>'s min-content (which overflowed the column). */
+            .tp-lblv:has(.tp-lstv) .tp-lblv_v {
+                width: 50% !important;
+                min-width: 0 !important;
+                overflow: hidden;
+            }
         </style>
     </head>
     <body>

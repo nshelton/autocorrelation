@@ -46,51 +46,52 @@ describe("Modulator", () => {
     expect(spy).not.toHaveBeenCalled();
   });
 
-  it("tick() with depth=0 fires notify(key, base)", () => {
+  it("tick maps the source into [lo, hi]", () => {
     const { store, features, mod } = setup();
-    features.set("rmsLow", new Float32Array([0, 0.8]));
-    mod.setBinding("camera.fov", { source: "rms.low", depth: 0 });
+    features.set("rmsLow", new Float32Array([0, 0.5]));
+    mod.setBinding("camera.fov", { source: "rms.low", lo: 60, hi: 100 });
     const spy = vi.fn();
     store.subscribe(spy);
     mod.tick();
-    expect(spy).toHaveBeenCalledWith("camera.fov", 60, "modulator");
+    // 60 + (100-60)*0.5 = 80
+    expect(spy).toHaveBeenCalledWith("camera.fov", 80, "modulator");
   });
 
-  it("tick() with depth=1 fires notify(key, lerp(min,max,src))", () => {
+  it("lo/hi default to the param's full [min,max] when omitted", () => {
     const { store, features, mod } = setup();
     features.set("rmsLow", new Float32Array([0, 0.25]));
-    mod.setBinding("camera.fov", { source: "rms.low", depth: 1 });
+    mod.setBinding("camera.fov", { source: "rms.low" });
     const spy = vi.fn();
     store.subscribe(spy);
     mod.tick();
-    // lerp(20, 120, 0.25) = 45
+    // default lo=20, hi=120 → 20 + (120-20)*0.25 = 45
     expect(spy).toHaveBeenCalledWith("camera.fov", 45, "modulator");
   });
 
-  it("tick() with NaN source fires notify(key, base)", () => {
+  it("tick() with NaN source settles at lo (signal reads 0)", () => {
     const { store, features, mod } = setup();
     features.set("beatPulses", new Float32Array([NaN, NaN, NaN, NaN]));
-    mod.setBinding("post.bloom.strength", { source: "beat.1x saw", depth: 1 });
+    mod.setBinding("post.bloom.strength", { source: "beat.1x saw", lo: 0.5, hi: 3 });
     const spy = vi.fn();
     store.subscribe(spy);
     mod.tick();
     expect(spy).toHaveBeenCalledWith("post.bloom.strength", 0.5, "modulator");
   });
 
-  it("tick() with empty source buffer fires notify(key, base)", () => {
+  it("tick() with empty source buffer settles at lo", () => {
     const { store, mod } = setup();
-    mod.setBinding("camera.fov", { source: "rms.low", depth: 1 });
+    mod.setBinding("camera.fov", { source: "rms.low", lo: 20, hi: 120 });
     const spy = vi.fn();
     store.subscribe(spy);
     mod.tick();
-    expect(spy).toHaveBeenCalledWith("camera.fov", 60, "modulator");
+    expect(spy).toHaveBeenCalledWith("camera.fov", 20, "modulator");
   });
 
   it("beat saw sources read indexed slot of beatPulses", () => {
     const { store, features, mod } = setup();
     const buf = new Float32Array([0.1, 0.4, 0.7, 1.0]);
     features.set("beatPulses", buf);
-    mod.setBinding("camera.fov", { source: "beat.4x saw", depth: 1 });
+    mod.setBinding("camera.fov", { source: "beat.4x saw", lo: 20, hi: 120 });
     const spy = vi.fn();
     store.subscribe(spy);
     mod.tick();
@@ -104,7 +105,7 @@ describe("Modulator", () => {
     // phase 0.25 → sin(π/2)=1 → mapped to 1.0 (peak of the cycle)
     const buf = new Float32Array([0.1, 0.25, 0.7, 1.0]);
     features.set("beatPulses", buf);
-    mod.setBinding("camera.fov", { source: "beat.2x sin", depth: 1 });
+    mod.setBinding("camera.fov", { source: "beat.2x sin", lo: 20, hi: 120 });
     const spy = vi.fn();
     store.subscribe(spy);
     mod.tick();
@@ -113,10 +114,10 @@ describe("Modulator", () => {
     expect(spy).toHaveBeenCalledWith("camera.fov", expected, "modulator");
   });
 
-  it("power curve shapes the source before the depth lerp", () => {
+  it("power curve shapes the source before the range map", () => {
     const { store, features, mod } = setup();
     features.set("rmsLow", new Float32Array([0, 0.5]));
-    mod.setBinding("camera.fov", { source: "rms.low", depth: 1, power: 2 });
+    mod.setBinding("camera.fov", { source: "rms.low", lo: 20, hi: 120, power: 2 });
     const spy = vi.fn();
     store.subscribe(spy);
     mod.tick();
@@ -127,7 +128,7 @@ describe("Modulator", () => {
   it("missing power defaults to 1 (linear)", () => {
     const { store, features, mod } = setup();
     features.set("rmsLow", new Float32Array([0, 0.5]));
-    mod.setBinding("camera.fov", { source: "rms.low", depth: 1 });
+    mod.setBinding("camera.fov", { source: "rms.low", lo: 20, hi: 120 });
     const spy = vi.fn();
     store.subscribe(spy);
     mod.tick();
@@ -146,13 +147,14 @@ describe("Modulator", () => {
       JSON.stringify({ "camera.fov": { source: "beat.1x", depth: 0.5 } }),
     );
     const mod = new Modulator(store, new FeatureStore());
-    expect(mod.getBinding("camera.fov")).toEqual({ source: "beat.1x saw", depth: 0.5 });
+    // depth is no longer part of a binding — it's ignored on load.
+    expect(mod.getBinding("camera.fov")).toEqual({ source: "beat.1x saw" });
   });
 
   it("setBinding(key, null) removes binding and fires one notify(key, base)", () => {
     const { store, features, mod } = setup();
     features.set("rmsLow", new Float32Array([1.0]));
-    mod.setBinding("camera.fov", { source: "rms.low", depth: 1 });
+    mod.setBinding("camera.fov", { source: "rms.low", lo: 20, hi: 120 });
     const spy = vi.fn();
     store.subscribe(spy);
     mod.setBinding("camera.fov", null);
@@ -164,9 +166,9 @@ describe("Modulator", () => {
 
   it("persists bindings across instances", () => {
     const { store, features, mod } = setup();
-    mod.setBinding("camera.fov", { source: "rms.high", depth: 0.42 });
+    mod.setBinding("camera.fov", { source: "rms.high", lo: 30, hi: 90 });
     const mod2 = new Modulator(store, features);
-    expect(mod2.getBinding("camera.fov")).toEqual({ source: "rms.high", depth: 0.42 });
+    expect(mod2.getBinding("camera.fov")).toEqual({ source: "rms.high", lo: 30, hi: 90 });
   });
 
   it("drops persisted binding with unknown source on load", () => {
@@ -181,30 +183,34 @@ describe("Modulator", () => {
     expect(mod.getBinding("camera.fov")).toBeNull();
   });
 
-  it("drops persisted binding with unknown paramKey on load", () => {
+  it("keeps persisted bindings for keys not yet registered (schema may register later)", () => {
+    // Component param schemas (orbital*, etc.) register in components.start(),
+    // AFTER the Modulator is constructed. load() must NOT drop their bindings or
+    // every component-param modulation is lost on a full page reload. tick()
+    // already skips bindings whose schema isn't a registered continuous param,
+    // so an unregistered-key binding is simply inactive until its schema arrives.
     localStorage.setItem(
       "autocorrelation.modulation.v1",
-      JSON.stringify({ "nonexistent.key": { source: "rms.low", depth: 1 } }),
+      JSON.stringify({ "orbitalCloud.density": { source: "rms.low", lo: 0.2, hi: 0.8 } }),
     );
     const store = new ParamStore();
-    store.register(FOV);
-    const features = new FeatureStore();
-    const mod = new Modulator(store, features);
-    expect(mod.getBinding("nonexistent.key")).toBeNull();
+    store.register(FOV); // orbitalCloud.density intentionally NOT registered yet
+    const mod = new Modulator(store, new FeatureStore());
+    expect(mod.getBinding("orbitalCloud.density")).toEqual({ source: "rms.low", lo: 0.2, hi: 0.8 });
   });
 
   it("subscribe() fires on setBinding changes", () => {
     const { mod } = setup();
     const spy = vi.fn();
     mod.subscribe(spy);
-    mod.setBinding("camera.fov", { source: "rms.low", depth: 1 });
+    mod.setBinding("camera.fov", { source: "rms.low", lo: 20, hi: 120 });
     expect(spy).toHaveBeenCalledWith("camera.fov");
   });
 
   it("subscribeValue broadcasts the live modulated value each tick", () => {
     const { features, mod } = setup();
     features.set("rmsLow", new Float32Array([0, 0.25]));
-    mod.setBinding("camera.fov", { source: "rms.low", depth: 1 });
+    mod.setBinding("camera.fov", { source: "rms.low", lo: 20, hi: 120 });
     const spy = vi.fn();
     mod.subscribeValue(spy);
     mod.tick();
@@ -215,7 +221,7 @@ describe("Modulator", () => {
   it("subscribeValue gets the base value back when modulation is removed", () => {
     const { features, mod } = setup();
     features.set("rmsLow", new Float32Array([1.0]));
-    mod.setBinding("camera.fov", { source: "rms.low", depth: 1 });
+    mod.setBinding("camera.fov", { source: "rms.low", lo: 20, hi: 120 });
     const spy = vi.fn();
     mod.subscribeValue(spy);
     mod.setBinding("camera.fov", null);
@@ -224,7 +230,7 @@ describe("Modulator", () => {
 
   it("smoothing applies a cheap EMA to the source", () => {
     const { features, mod } = setup();
-    mod.setBinding("camera.fov", { source: "rms.low", depth: 1, smoothing: 0.5 });
+    mod.setBinding("camera.fov", { source: "rms.low", lo: 20, hi: 120, smoothing: 0.5 });
     const spy = vi.fn();
     mod.subscribeValue(spy);
     features.set("rmsLow", new Float32Array([0]));
@@ -236,7 +242,7 @@ describe("Modulator", () => {
 
   it("processedValue exposes the smoothed+power signal in 0..1", () => {
     const { features, mod } = setup();
-    mod.setBinding("camera.fov", { source: "rms.low", depth: 1, power: 2 });
+    mod.setBinding("camera.fov", { source: "rms.low", lo: 20, hi: 120, power: 2 });
     features.set("rmsLow", new Float32Array([0.5]));
     mod.tick();
     // smoothing default 0 → sm=0.5; power 2 → 0.25
@@ -251,7 +257,7 @@ describe("Modulator", () => {
   it("missing smoothing defaults to none (raw passes through)", () => {
     const { features, mod } = setup();
     features.set("rmsLow", new Float32Array([0.25]));
-    mod.setBinding("camera.fov", { source: "rms.low", depth: 1 });
+    mod.setBinding("camera.fov", { source: "rms.low", lo: 20, hi: 120 });
     const spy = vi.fn();
     mod.subscribeValue(spy);
     mod.tick();
@@ -262,6 +268,12 @@ describe("Modulator", () => {
   // ---- triggers ----
 
   const TRIG = "orbitalCloud.button.RandomizeSH";
+
+  it("rms.total reads the total-rms buffer", () => {
+    const { features, mod } = setup();
+    features.set("rms", new Float32Array([0.2, 0.6]));
+    expect(mod.readSource("rms.total")).toBeCloseTo(0.6);
+  });
 
   it("readSource returns finite source value, NaN/unknown → 0", () => {
     const { features, mod } = setup();
@@ -325,6 +337,41 @@ describe("Modulator", () => {
     mod.tick();
     features.set("rmsLow", new Float32Array([0.9]));
     expect(() => mod.tick()).not.toThrow();   // no callback → no-op, no crash
+  });
+
+  it("trigger smoothing delays the threshold crossing", () => {
+    const { features, mod } = setup();
+    const fire = vi.fn();
+    mod.registerTriggerCallback(TRIG, fire);
+    mod.setTrigger(TRIG, { source: "rms.low", threshold: 0.6, smoothing: 0.5 });
+    features.set("rmsLow", new Float32Array([0]));
+    mod.tick();                       // seed EMA at 0
+    features.set("rmsLow", new Float32Array([1]));
+    mod.tick();                       // sm = 0.5 < 0.6 → no fire yet (smoothed)
+    expect(fire).not.toHaveBeenCalled();
+    mod.tick();                       // sm = 0.75 >= 0.6 → fire
+    expect(fire).toHaveBeenCalledTimes(1);
+  });
+
+  it("trigger power curves the source before the threshold", () => {
+    const { features, mod } = setup();
+    const fire = vi.fn();
+    mod.registerTriggerCallback(TRIG, fire);
+    // 0.6 would cross threshold 0.5 raw, but 0.6^2 = 0.36 does not.
+    mod.setTrigger(TRIG, { source: "rms.low", threshold: 0.5, power: 2 });
+    features.set("rmsLow", new Float32Array([0]));
+    mod.tick();                       // seed/arm
+    features.set("rmsLow", new Float32Array([0.6]));
+    mod.tick();                       // 0.36 < 0.5 → no fire
+    expect(fire).not.toHaveBeenCalled();
+  });
+
+  it("processedValue reflects a trigger's smoothed+power signal", () => {
+    const { features, mod } = setup();
+    mod.setTrigger(TRIG, { source: "rms.low", threshold: 0.5, power: 2 });
+    features.set("rmsLow", new Float32Array([0.5]));
+    mod.tick();                       // processSource runs even without a callback
+    expect(mod.processedValue(TRIG)).toBeCloseTo(0.25); // 0.5^2
   });
 
   it("triggers persist across instances under their own key", () => {
