@@ -2,6 +2,15 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+> **This repo now has two modes.** Most of this document describes the original
+> **audio-analysis** visualizer (mic/tab → DSP → Three.js). The app now **boots by
+> default into synth mode** — a synthesizer / sequencer / mini-DAW documented
+> separately in **[SEQUENCER.md](SEQUENCER.md)**; append `?mode=analysis` to the URL
+> for the analysis visualizer described below. Both modes share the one
+> `crates/dsp` wasm build: analysis is the `Dsp` export, synth is the `Sequencer`
+> export. When working on synth-mode code (`src/sequencer/`, `src/audio/synth-*`,
+> `crates/dsp/src/{synth,sequencer}.rs`), read SEQUENCER.md first.
+
 ## Commands
 
 - `npm run dev` — Vite dev server on port 5173.
@@ -14,6 +23,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Architecture
 
+> This section documents **analysis mode** (the `Dsp` export + Three.js
+> visualizer). For **synth mode** (the `Sequencer` export, the `synth-worklet`,
+> and the custom sequencer UI under `src/sequencer/`) see [SEQUENCER.md](SEQUENCER.md).
+
 Real-time audio visualizer. Audio flows: **source → AudioWorklet (Rust/WASM DSP) → main thread FeatureStore → Three.js WebGPU renderers**. All DSP runs off the main thread; rendering and feature storage stay on it.
 
 ### Audio path (`src/audio/` + `crates/dsp/`)
@@ -24,9 +37,12 @@ Real-time audio visualizer. Audio flows: **source → AudioWorklet (Rust/WASM DS
 
 ### DSP crate layout (`crates/dsp/src/`)
 
-Five modules. Each pipeline stage owns its state struct; `lib.rs` is a thin orchestrator.
+The **analysis** modules below each own a state struct; `lib.rs` is a thin
+orchestrator. The crate also contains the **synth-mode** modules `synth.rs` and
+`sequencer.rs` (the `Sequencer` wasm export) — documented in
+[SEQUENCER.md](SEQUENCER.md), not here. `lib.rs` exports both `Dsp` and `Sequencer`.
 
-- **`lib.rs`** — `Dsp` struct (the wasm-bindgen surface), short `process()` that sequences the stages, plus integration tests.
+- **`lib.rs`** — `Dsp` struct (the analysis wasm-bindgen surface), short `process()` that sequences the stages, plus integration tests.
 - **`buffers.rs`** — `Buffers` struct: 16 named output `Vec<f32>` fields with **camelCase Rust field names** (`bufferAcf`, `rmsLow`, `onsetAcfEnhanced`, `dspPerf`, etc., via `#[allow(non_snake_case)]`) so the Rust field, the registry-lookup match arm, the worklet message field, and the FeatureStore key are all the same string. `Buffers::get(name) -> Option<&[f32]>` and `Buffers::descriptors() -> Vec<(&'static str, usize)>` are the only string-keyed entry points; stages use direct field access. `dspPerf` is diagnostic data — `[totalMs, freqHz]` EMAs from `crates/dsp/src/perf.rs`, not a visual time-series signal. Sub-ms effective resolution is recovered by EMA smoothing because the underlying `now_us()` source (browser `performance.now()` or `Date.now()`) is typically 1 ms quantized inside `AudioWorkletGlobalScope`.
 - **`spectrum.rs`** — `SpectrumState`: Hann-windowed real FFT (`realfft`), magnitude → dBFS → normalized [0,1] → temporally smoothed (α derived from `dsp.smoothingTauSecs`). `mag_scale = 2/sum(hann)` so a unit-amplitude sine peaks at ~1.0. Bin 0 (DC) dropped from output. Same FFT also produces low/mid/high-band RMS via Parseval-correct band-energy summation. Returns `(low_rms, mid_rms, high_rms, flux)` per call where `flux` is the spectral-flux onset signal.
 - **`acf.rs`** — `AcfState`: generalized autocorrelation (Percival & Tzanetakis 2014 §II-B.2, `|X|^0.5` magnitude compression) on the onset history → smoothes along the lag axis with a Gaussian kernel (σ in lag bins, configurable via `dsp.acfSmoothingSigma`) → harmonic-enhanced ACF (sum of acf[τ] + acf[2τ] + acf[4τ]). Smoothing happens **before** harmonic enhancement so the enhanced output inherits the lag-axis broadening. Module also hosts the free functions `compute_gen_acf`, `compute_harmonic_enhanced`, `autocorrelate` (time-domain, used for `bufferAcf`), `bin_for_hz`.

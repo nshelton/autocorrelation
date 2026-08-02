@@ -48,7 +48,6 @@ export class BeatGridMarkers {
 
     const period = beatGrid[0];
     const phase = beatGrid[1];
-    const score = beatGrid[2] ?? 1;
     const lineCount = this.requiredLineCount(period, rmsHistoryLength);
 
     if (lineCount > this.maxLines) this.createLines(lineCount);

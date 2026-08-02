@@ -351,7 +351,6 @@ export class ParticleView implements Component {
       // Curl noise as a velocity impulse — same pattern BoxView uses for
       // its spring force. Additive on linvel; cheap and stable.
       this.curlNoise(t.x, t.y, t.z, this.curlOut);
-      const v = body.linvel();
 
       // Attractor as a velocity impulse (NOT addForce). Two reasons:
       // (1) addForce divides by rapier's auto-computed mass — a 4cm
@@ -380,23 +379,13 @@ export class ParticleView implements Component {
       // swirlStrength (rad/s). Target velocity at point p is:
       //     v_target = cross((0,1,0), p - attractor) * swirlStrength
       //              = (dz, 0, -dx) * swirlStrength
-      // We split the existing XZ velocity into tangential + radial, replace
-      // the tangential component with the swirl target, and leave the radial
-      // component free for the attractor pull. orbitalInit writes initial
-      // velocity using the same formula so spawn is consistent with the field.
+      // setLinvel overwrites velocity each frame with attractor + swirl target +
+      // curl. orbitalInit seeds initial velocity with the same swirl formula so
+      // spawn is consistent with the field.
       const swDx = t.x - ATTRACTOR_POSITION.x;
       const swDz = t.z - ATTRACTOR_POSITION.z;
       const vTargetX = swDz * swirlStrength;
       const vTargetZ = -swDx * swirlStrength;
-      // Radial unit vector in the XZ plane (degenerate at the axis → no radial).
-      const r2xz = swDx * swDx + swDz * swDz;
-      let radialX = 0, radialZ = 0, vRadialMag = 0;
-      if (r2xz > 1e-12) {
-        const rxz = Math.sqrt(r2xz);
-        radialX = swDx / rxz;
-        radialZ = swDz / rxz;
-        vRadialMag = v.x * radialX + v.z * radialZ;
-      }
 
       body.setLinvel(
         {

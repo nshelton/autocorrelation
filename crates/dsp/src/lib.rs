@@ -4,8 +4,11 @@ mod acf;
 mod autogain;
 mod beat;
 mod buffers;
+mod drums;
 mod perf;
+mod sequencer;
 mod spectrum;
+mod synth;
 
 use crate::acf::AcfState;
 use crate::autogain::AutoGain;

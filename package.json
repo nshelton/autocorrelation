@@ -24,6 +24,7 @@
   },
   "dependencies": {
     "@dimforge/rapier3d-compat": "^0.19.3",
+    "@tonejs/midi": "^2.0.28",
     "@types/three": "^0.170.0",
     "simplex-noise": "^4.0.3",
     "stats.js": "^0.17.0",
