@@ -4,6 +4,8 @@ import type { Node } from "three/webgpu";
 import type { FolderApi } from "tweakpane";
 import type { PostEffect, PassCtx } from "../PostEffect";
 import type { ParamStore } from "../../../params/ParamStore";
+import type { Modulator } from "../../../params/Modulator";
+import type { ParamProxyRegistry } from "../../../params/bindParam";
 
 // Film grain via Interleaved Gradient Noise (Jorge Jimenez, COD: Advanced
 // Warfare). IGN is a single-hash formula that produces a noise pattern
@@ -51,7 +53,12 @@ export class GrainEffect implements PostEffect {
     })() as ShaderNodeObject<Node>;
   }
 
-  bindUI(folder: FolderApi, store: ParamStore): void {
+  bindUI(
+    folder: FolderApi,
+    store: ParamStore,
+    _modulator: Modulator,
+    proxies: ParamProxyRegistry,
+  ): void {
     const b = {
       enabled: store.get("post.grain.enabled") as boolean,
       strength: store.get("post.grain.strength") as number,
@@ -66,6 +73,11 @@ export class GrainEffect implements PostEffect {
     folder
       .addBinding(b, "scale", { label: "Scale", min: 0.1, max: 4.0, step: 0.05 })
       .on("change", (e: { value: number }) => store.set("post.grain.scale", e.value));
+    // The widgets bind `b`, which only ever moves on user input — re-pull it so
+    // programmatic writes (preset load, reset) show up in the panel.
+    proxies.set("post.grain.enabled", () => { b.enabled = store.get("post.grain.enabled") as boolean; });
+    proxies.set("post.grain.strength", () => { b.strength = store.get("post.grain.strength") as number; });
+    proxies.set("post.grain.scale", () => { b.scale = store.get("post.grain.scale") as number; });
   }
 
   dispose(): void {

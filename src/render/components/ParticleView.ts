@@ -18,6 +18,7 @@ import {
 } from "three/tsl";
 import RAPIER from "@dimforge/rapier3d-compat";
 import { createCurlNoise } from "../curl-noise";
+import { getPhysicsWorld } from "./physics";
 import type { Component, ComponentDeps } from "./Component";
 
 const MAX_PARTICLES = 10000;
@@ -36,7 +37,6 @@ export class ParticleView implements Component {
   static paramPrefix = "particleView";
   static paramOpts = {
     numParticles: { min: 0, max: 0, step: 0 }, // ignored — discrete kind below
-    timescale: { min: 0, max: 3, step: 0.01 },
     lifetime: { min: 1, max: 10, step: 0.1 },
     noiseScale: { min: 0.01, max: 1.0, step: 0.05 },
     noiseStrength: { min: 0, max: 20, step: 0.1 },
@@ -49,7 +49,6 @@ export class ParticleView implements Component {
   };
   static paramDefaults = {
     numParticles: 2000,
-    timescale: 1.0,
     lifetime: 3,
     noiseScale: 1.5,
     noiseStrength: 2,
@@ -76,6 +75,7 @@ export class ParticleView implements Component {
   private bodies: RAPIER.RigidBody[] = [];
   private colliders: RAPIER.Collider[] = [];
   private attractorCollider: RAPIER.Collider | null = null;
+  private attractorBody: RAPIER.RigidBody | null = null;
   private attractorMesh: Mesh | null = null;
   private lifetimes!: Float32Array;
   private maxLifetimes!: Float32Array;
@@ -90,7 +90,6 @@ export class ParticleView implements Component {
   private lastDamping = NaN;
   private lastRestitution = NaN;
   private lastAttractorRadius = NaN;
-  private lastTimescale = NaN;
   private storeUnsub: (() => void) | null = null;
   private disposed = false;
 
@@ -103,8 +102,9 @@ export class ParticleView implements Component {
   }
 
   private async init(): Promise<void> {
-    await RAPIER.init();
+    const world = await getPhysicsWorld();
     if (this.disposed) return;
+    this.world = world;
 
     // SoA storage. Allocated to MAX_PARTICLES once so we never re-allocate.
     this.lifetimes = new Float32Array(MAX_PARTICLES);
@@ -113,7 +113,6 @@ export class ParticleView implements Component {
 
     this.curlNoise = createCurlNoise({ scale: this.params.noiseScale });
 
-    this.world = new RAPIER.World({ x: 0, y: 0, z: 0 });
     this.addAttractor(this.params.attractorRadius);
     this.spawnBodies(this.numParticles);
 
@@ -141,7 +140,7 @@ export class ParticleView implements Component {
 
     // Listen for reconfig param changes. Hot params (lifetime, noiseScale,
     // noiseStrength, restitution, attractorStrength, attractorRadius,
-    // spawnRadius, swirlStrength, timescale, damping) are read from
+    // spawnRadius, swirlStrength, damping) are read from
     // this.params each frame via the bag — no subscription needed.
     this.storeUnsub = this.paramStore.subscribe((key, value) => {
       if (this.disposed) return;
@@ -197,6 +196,7 @@ export class ParticleView implements Component {
         ATTRACTOR_POSITION.z,
       ),
     );
+    this.attractorBody = body;
     this.attractorCollider = this.world.createCollider(
       RAPIER.ColliderDesc.ball(radius).setRestitution(this.params.restitution),
       body,
@@ -270,15 +270,15 @@ export class ParticleView implements Component {
 
   private rebuildBodies(n: number): void {
     if (!this.world) return;
-    // Free the entire world (drops all bodies + colliders), recreate it,
-    // re-add walls, spawn the new body pool. Also dispose + recreate the
-    // InstancedMesh at the new size — see createInstancedMesh for why we
-    // size to numParticles rather than reusing one mesh at MAX_PARTICLES.
-    this.world.free();
+    // Shared world — remove only our particle bodies (colliders go with them)
+    // and respawn the pool at the new size. The attractor body is untouched,
+    // and freeing the world here would invalidate every other component's
+    // handles. Also dispose + recreate the InstancedMesh at the new size —
+    // see createInstancedMesh for why we size to numParticles rather than
+    // reusing one mesh at MAX_PARTICLES.
+    for (const b of this.bodies) this.world.removeRigidBody(b);
     this.bodies = [];
     this.colliders = [];
-    this.world = new RAPIER.World({ x: 0, y: 0, z: 0 });
-    this.addAttractor(this.params.attractorRadius);
     this.spawnBodies(n);
     this.disposeInstancedMesh();
     this.createInstancedMesh(n);
@@ -288,7 +288,6 @@ export class ParticleView implements Component {
     this.lastDamping = NaN;
     this.lastRestitution = NaN;
     this.lastAttractorRadius = NaN;
-    this.lastTimescale = NaN;
   }
 
   update(): void {
@@ -329,14 +328,7 @@ export class ParticleView implements Component {
       if (this.attractorMesh) this.attractorMesh.scale.setScalar(attractorRadius);
       this.lastAttractorRadius = attractorRadius;
     }
-    // timescale is hot — multiplier on rapier's per-step dt. Range capped
-    // at 3x because the solver assumes small timesteps; bigger and contacts
-    // start to tunnel. 0 = paused (rendering continues, physics stops).
-    if (this.params.timescale !== this.lastTimescale) {
-      this.world.timestep = (1 / 60) * this.params.timescale;
-      this.lastTimescale = this.params.timescale;
-    }
-    this.world.step();
+    // App stepped the shared world already; read its dt for lifetime decay.
     const dt = this.world.timestep;
 
     for (let i = 0; i < this.numParticles; i++) {
@@ -429,13 +421,17 @@ export class ParticleView implements Component {
       (this.attractorMesh.material as MeshBasicNodeMaterial).dispose();
       this.attractorMesh = null;
     }
+    // Shared world: remove our own bodies (colliders ride along), never free
+    // it. References are dropped in the same breath — a setter on a removed
+    // body panics rapier with "unreachable".
     if (this.world) {
-      // Frees all bodies + colliders too (including the attractor).
-      this.world.free();
+      for (const b of this.bodies) this.world.removeRigidBody(b);
+      if (this.attractorBody) this.world.removeRigidBody(this.attractorBody);
       this.world = null;
     }
     this.bodies = [];
     this.colliders = [];
     this.attractorCollider = null;
+    this.attractorBody = null;
   }
 }

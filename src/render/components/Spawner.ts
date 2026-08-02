@@ -5,11 +5,13 @@ import {
   CylinderGeometry,
   BufferGeometry,
   Object3D,
+  Color,
 } from "three";
 import { MeshBasicNodeMaterial } from "three/webgpu";
-import { vec3, vec4, float, dot, max, normalWorld } from "three/tsl";
+import { vec3, vec4, float, dot, max, normalWorld, uniform } from "three/tsl";
 import RAPIER from "@dimforge/rapier3d-compat";
 import { createCurlNoise } from "../curl-noise";
+import { getPhysicsWorld } from "./physics";
 import type { Component, ComponentDeps } from "./Component";
 
 // Per-type fixed pool size. 512 instances * 64-byte matrix = 32KB, under the
@@ -55,11 +57,18 @@ interface ShapeDef {
   geometry: () => BufferGeometry;
   collider: () => RAPIER.ColliderDesc;
   resize: (c: RAPIER.Collider, s: number) => void;
-  color: [number, number, number];
+  // Param key holding this shape's 0xRRGGBB color.
+  colorParam: string;
   // Param key holding this shape's per-object size multiplier.
   scaleParam: string;
-  // Param key holding this shape's continuous spawn rate (objects/second).
-  rateParam: string;
+  // Exactly one of the two below. `rateParam` = objects/second, spawned at the
+  // origin (what the buttons and audio triggers push into). `ambient` = hold a
+  // live population of `amountParam` instead: physics and force fields are
+  // identical, only the spawn policy differs — they appear spread through a
+  // ball of `radiusParam` at `driftParam` speed and are topped back up as they
+  // expire, so the scene always has that many of them to hit.
+  rateParam?: string;
+  ambient?: { amountParam: string; radiusParam: string; driftParam: string };
 }
 
 const SHAPES: ShapeDef[] = [
@@ -67,7 +76,7 @@ const SHAPES: ShapeDef[] = [
     geometry: () => new BoxGeometry(BASE * 2, BASE * 2, BASE * 2),
     collider: () => RAPIER.ColliderDesc.cuboid(BASE, BASE, BASE),
     resize: (c, s) => c.setHalfExtents({ x: BASE * s, y: BASE * s, z: BASE * s }),
-    color: [0.95, 0.45, 0.25],
+    colorParam: "cubeColor",
     scaleParam: "cubeScale",
     rateParam: "cubeRate",
   },
@@ -75,7 +84,7 @@ const SHAPES: ShapeDef[] = [
     geometry: () => new IcosahedronGeometry(BASE, 2),
     collider: () => RAPIER.ColliderDesc.ball(BASE),
     resize: (c, s) => c.setRadius(BASE * s),
-    color: [0.3, 0.7, 0.95],
+    colorParam: "sphereColor",
     scaleParam: "sphereScale",
     rateParam: "sphereRate",
   },
@@ -86,11 +95,32 @@ const SHAPES: ShapeDef[] = [
       c.setRadius(BASE * s);
       c.setHalfHeight(DISK_HALF_HEIGHT * s);
     },
-    color: [0.6, 0.9, 0.4],
+    colorParam: "diskColor",
     scaleParam: "diskScale",
     rateParam: "diskRate",
   },
+  {
+    geometry: () => new IcosahedronGeometry(BASE, 2),
+    collider: () => RAPIER.ColliderDesc.ball(BASE),
+    resize: (c, s) => c.setRadius(BASE * s),
+    colorParam: "sphere2Color",
+    scaleParam: "sphere2Scale",
+    ambient: {
+      amountParam: "sphere2Amount",
+      radiusParam: "sphere2Radius",
+      driftParam: "sphere2Drift",
+    },
+  },
 ];
+
+function randUnit(out: Float32Array): void {
+  const theta = Math.random() * Math.PI * 2;
+  const phi = Math.acos(2 * Math.random() - 1);
+  const sinPhi = Math.sin(phi);
+  out[0] = sinPhi * Math.cos(theta);
+  out[1] = sinPhi * Math.sin(theta);
+  out[2] = Math.cos(phi);
+}
 
 // One shape's ring buffer: fixed body/collider pool + parallel SoA slot state.
 // Plain data; all logic lives in Spawner.
@@ -102,6 +132,14 @@ class Pool {
   maxLifetime = new Float32Array(MAX_PER_TYPE);
   scale = new Float32Array(MAX_PER_TYPE);
   next = 0;
+  // Shape color, referenced live by the material's uniform node — mutate it in
+  // place (setHex) and the next frame picks it up; never reassign.
+  color = new Color();
+  lastColor = NaN;
+  // Live slot count, maintained by spawn/expire. Ambient pools top up against
+  // it every frame; counting the `active` array instead would be a 512-slot
+  // scan per frame for the same number.
+  live = 0;
   // Fractional spawn-rate carry: rate*dt accumulates here; whole units spawn.
   accum = 0;
   mesh!: InstancedMesh;
@@ -120,13 +158,16 @@ export class Spawner implements Component {
     lifetime: { min: 1, max: 15, step: 0.1 },
     restitution: { min: 0, max: 1, step: 0.01 },
     damping: { min: 0, max: 2, step: 0.01 },
-    timescale: { min: 0, max: 3, step: 0.01 },
     cubeScale: { min: 0.2, max: 9, step: 0.05 },
     sphereScale: { min: 0.2, max: 9, step: 0.05 },
     diskScale: { min: 0.2, max: 9, step: 0.05 },
+    sphere2Scale: { min: 0.2, max: 9, step: 0.05 },
     cubeRate: { min: 0, max: 50, step: 0.5 },
     sphereRate: { min: 0, max: 50, step: 0.5 },
     diskRate: { min: 0, max: 50, step: 0.5 },
+    sphere2Amount: { min: 0, max: MAX_PER_TYPE, step: 1 },
+    sphere2Radius: { min: 0, max: 6, step: 0.05 },
+    sphere2Drift: { min: 0, max: 3, step: 0.01 },
   };
   static paramDefaults = {
     forceFieldType: 0,
@@ -136,18 +177,33 @@ export class Spawner implements Component {
     lifetime: 4,
     restitution: 0.5,
     damping: 0.1,
-    timescale: 1.0,
     cubeScale: 1.0,
     sphereScale: 1.0,
     diskScale: 1.0,
+    sphere2Scale: 1.0,
     cubeRate: 0,
     sphereRate: 0,
     diskRate: 0,
+    // Non-zero so there's something in the scene to hit the moment the module
+    // is on — the impulse shapes stay at 0 and wait for a button or trigger.
+    sphere2Amount: 60,
+    sphere2Radius: 2.0,
+    sphere2Drift: 0.25,
+    // sRGB packed defaults — these are the previously hardcoded linear colors
+    // encoded to sRGB, so the picker's swatch and the render agree.
+    cubeColor: 0xf9b389,
+    sphereColor: 0x95daf9,
+    diskColor: 0xcbf3aa,
+    sphere2Color: 0xddd4f9,
     wireframe: 0,
   };
   static paramKinds = {
     forceFieldType: "discrete" as const,
     wireframe: "discrete" as const,
+    cubeColor: "color" as const,
+    sphereColor: "color" as const,
+    diskColor: "color" as const,
+    sphere2Color: "color" as const,
   };
   static paramDiscreteOptions = {
     forceFieldType: [0, 1, 2],
@@ -169,12 +225,11 @@ export class Spawner implements Component {
   private pools: Pool[] = [];
   private dummy = new Object3D();
   private curlOut = new Float32Array(3);
+  private dirScratch = new Float32Array(3);
   private curlNoise!: (x: number, y: number, z: number, out: Float32Array) => void;
   private lastNoiseScale = NaN;
   private lastDamping = NaN;
   private lastRestitution = NaN;
-  private lastTimescale = NaN;
-  private lastGravityY = NaN;
   private lastTime = NaN;
   private lastWireframe = NaN;
   private disposed = false;
@@ -187,13 +242,12 @@ export class Spawner implements Component {
   }
 
   private async init(): Promise<void> {
-    await RAPIER.init();
+    const world = await getPhysicsWorld();
     if (this.disposed) return;
+    this.world = world;
 
     this.curlNoise = createCurlNoise({ scale: this.params.noiseScale });
     this.lastNoiseScale = this.params.noiseScale;
-    this.world = new RAPIER.World({ x: 0, y: 0, z: 0 });
-
     for (const def of SHAPES) {
       const pool = new Pool(def);
       // Pre-create the full body/collider pool, all disabled (out of the
@@ -213,12 +267,12 @@ export class Spawner implements Component {
         pool.bodies.push(body);
         pool.colliders.push(collider);
       }
-      pool.mesh = this.createMesh(def);
+      pool.mesh = this.createMesh(pool);
       this.pools.push(pool);
     }
   }
 
-  private createMesh(def: ShapeDef): InstancedMesh {
+  private createMesh(pool: Pool): InstancedMesh {
     // Hand-rolled lambert on an UNLIT MeshBasicNodeMaterial. Real lit node
     // materials (MeshStandardNodeMaterial) can't resolve scene lights in this
     // project — the node renderer throws "Light node not found" (dual three
@@ -227,9 +281,13 @@ export class Spawner implements Component {
     const lightDir = vec3(0.408, 0.866, 0.306);
     const ndotl = max(dot(normalWorld, lightDir), float(0.0));
     const lit = ndotl.mul(0.7).add(0.3);
-    mat.colorNode = vec4(vec3(...def.color).mul(lit), 1.0);
+    // The uniform holds the pool's Color by reference; update() mutates it when
+    // the param moves, no material rebuild.
+    pool.color.setHex(this.params[pool.def.colorParam]);
+    pool.lastColor = this.params[pool.def.colorParam];
+    mat.colorNode = vec4(uniform(pool.color).mul(lit), 1.0);
 
-    const mesh = new InstancedMesh(def.geometry(), mat, MAX_PER_TYPE);
+    const mesh = new InstancedMesh(pool.def.geometry(), mat, MAX_PER_TYPE);
     // Objects roam the whole frame; skip per-instance frustum culling on the
     // (origin-centered, zero-sized) bounding sphere which would cull them all.
     mesh.frustumCulled = false;
@@ -242,8 +300,10 @@ export class Spawner implements Component {
     return mesh;
   }
 
-  // Activate the next ring slot of `pool` at the origin with a random-direction
-  // impulse. Recycles the oldest live object when the pool is full.
+  // Activate the next ring slot of `pool`. Regular shapes launch from the
+  // origin with a random-direction impulse; ambient pools appear anywhere
+  // inside their radius and drift. Recycles the oldest live object when the
+  // pool is full.
   private spawn(pool: Pool): void {
     const i = pool.next;
     pool.next = (pool.next + 1) % MAX_PER_TYPE;
@@ -252,22 +312,28 @@ export class Spawner implements Component {
     pool.scale[i] = s;
     pool.lifetime[i] = this.params.lifetime + Math.random() * LIFETIME_JITTER_SECS;
     pool.maxLifetime[i] = pool.lifetime[i];
+    // Recycling a still-live slot replaces it rather than adding to the count.
+    if (!pool.active[i]) pool.live++;
     pool.active[i] = 1;
     pool.def.resize(pool.colliders[i], s);
 
-    // Random direction on the unit sphere * impulse magnitude.
-    const theta = Math.random() * Math.PI * 2;
-    const phi = Math.acos(2 * Math.random() - 1);
-    const sinPhi = Math.sin(phi);
-    const k = this.params.spawnImpulse;
-    const vx = sinPhi * Math.cos(theta) * k;
-    const vy = sinPhi * Math.sin(theta) * k;
-    const vz = Math.cos(phi) * k;
+    const amb = pool.def.ambient;
+    const d = this.dirScratch;
+    // Position: origin for impulse shapes; a uniform point in the ball of
+    // radius sphere2Radius for ambient ones (cbrt spreads them evenly through
+    // the volume instead of clumping at the center).
+    randUnit(d);
+    const r = amb ? this.params[amb.radiusParam] * Math.cbrt(Math.random()) : 0;
+    const px = d[0] * r, py = d[1] * r, pz = d[2] * r;
+    // Fresh direction for the drift so ambient spheres don't all stream
+    // radially outward from wherever they appeared.
+    if (amb) randUnit(d);
+    const k = amb ? this.params[amb.driftParam] : this.params.spawnImpulse;
 
     const body = pool.bodies[i];
     body.setEnabled(true);
-    body.setTranslation({ x: 0, y: 0, z: 0 }, true);
-    body.setLinvel({ x: vx, y: vy, z: vz }, true);
+    body.setTranslation({ x: px, y: py, z: pz }, true);
+    body.setLinvel({ x: d[0] * k, y: d[1] * k, z: d[2] * k }, true);
     body.setAngvel({ x: 0, y: 0, z: 0 }, true);
   }
 
@@ -279,13 +345,6 @@ export class Spawner implements Component {
     if (this.params.noiseScale !== this.lastNoiseScale) {
       this.curlNoise = createCurlNoise({ scale: this.params.noiseScale });
       this.lastNoiseScale = this.params.noiseScale;
-    }
-    // Only the Linear field uses world gravity (-Y); Curl and Attract zero it
-    // and apply a per-body impulse below. Set only on change.
-    const gy = type === FIELD_LINEAR ? -this.params.forceStrength : 0;
-    if (gy !== this.lastGravityY) {
-      this.world.gravity = { x: 0, y: gy, z: 0 };
-      this.lastGravityY = gy;
     }
     // Hot param sweeps over the full pools (active or not — cheap, and keeps
     // recycled bodies correct). Guarded so we don't churn setters every frame.
@@ -302,9 +361,12 @@ export class Spawner implements Component {
         for (const c of pool.colliders) c.setRestitution(this.params.restitution);
       this.lastRestitution = this.params.restitution;
     }
-    if (this.params.timescale !== this.lastTimescale) {
-      this.world.timestep = (1 / 60) * this.params.timescale;
-      this.lastTimescale = this.params.timescale;
+    // Colors are hot: mutate the Color the material's uniform already points at.
+    for (const pool of this.pools) {
+      const hex = this.params[pool.def.colorParam];
+      if (hex === pool.lastColor) continue;
+      pool.color.setHex(hex);
+      pool.lastColor = hex;
     }
     if (this.params.wireframe !== this.lastWireframe) {
       const on = this.params.wireframe >= 0.5;
@@ -328,7 +390,23 @@ export class Spawner implements Component {
       : 0;
     this.lastTime = now;
     for (const pool of this.pools) {
-      const rate = this.params[pool.def.rateParam];
+      const amb = pool.def.ambient;
+      if (amb) {
+        // Population target, not a rate: refill whatever expired since the last
+        // frame. Clamped to the pool so a maxed-out slider can't spin forever.
+        // Lowering the slider doesn't cull anyone — the surplus just ages out.
+        const target = Math.min(Math.round(this.params[amb.amountParam]), MAX_PER_TYPE);
+        while (pool.live < target) {
+          // Walk the ring to a free slot first: recycling a live object would
+          // reset a perfectly good sphere's lifetime without growing the
+          // population, and the loop could spin. live < target <= MAX_PER_TYPE
+          // guarantees a free slot exists, so this always terminates.
+          while (pool.active[pool.next]) pool.next = (pool.next + 1) % MAX_PER_TYPE;
+          this.spawn(pool);
+        }
+        continue;
+      }
+      const rate = pool.def.rateParam ? this.params[pool.def.rateParam] : 0;
       if (rate <= 0) {
         pool.accum = 0;
         continue;
@@ -340,7 +418,7 @@ export class Spawner implements Component {
       }
     }
 
-    this.world.step();
+    // App stepped the shared world already; read its dt to scale the fields.
     const dt = this.world.timestep;
     const fieldK = this.params.forceStrength * dt;
 
@@ -352,6 +430,7 @@ export class Spawner implements Component {
         pool.lifetime[i] -= dt;
         if (pool.lifetime[i] <= 0) {
           pool.active[i] = 0;
+          pool.live--;
           body.setEnabled(false);
           this.dummy.scale.setScalar(0);
           this.dummy.position.set(0, 0, 0);
@@ -362,7 +441,13 @@ export class Spawner implements Component {
         }
 
         const t = body.translation();
-        if (type === FIELD_CURL) {
+        if (type === FIELD_LINEAR) {
+          // Per-body rather than world gravity: the world is shared now, so a
+          // component can't own world.gravity. dv = -strength*dt is exactly
+          // what a gravity of -forceStrength would have applied.
+          const v = body.linvel();
+          body.setLinvel({ x: v.x, y: v.y - fieldK, z: v.z }, true);
+        } else if (type === FIELD_CURL) {
           this.curlNoise(t.x, t.y, t.z, this.curlOut);
           const v = body.linvel();
           body.setLinvel(
@@ -403,6 +488,14 @@ export class Spawner implements Component {
 
   dispose(): void {
     this.disposed = true;
+    // Shared world: remove our own bodies (colliders go with them), never free
+    // it — that would invalidate every other component's handles. Has to run
+    // before this.pools is cleared.
+    if (this.world) {
+      for (const pool of this.pools)
+        for (const b of pool.bodies) this.world.removeRigidBody(b);
+      this.world = null;
+    }
     for (const pool of this.pools) {
       this.scene.remove(pool.mesh);
       pool.mesh.geometry.dispose();
@@ -410,9 +503,5 @@ export class Spawner implements Component {
       pool.mesh.dispose();
     }
     this.pools = [];
-    if (this.world) {
-      this.world.free();
-      this.world = null;
-    }
   }
 }

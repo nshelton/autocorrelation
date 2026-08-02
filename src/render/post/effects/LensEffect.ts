@@ -5,6 +5,8 @@ import type { Node } from "three/webgpu";
 import type { FolderApi } from "tweakpane";
 import type { PostEffect, PassCtx } from "../PostEffect";
 import type { ParamStore } from "../../../params/ParamStore";
+import type { Modulator } from "../../../params/Modulator";
+import type { ParamProxyRegistry } from "../../../params/bindParam";
 
 // Wraps LensNode (barrel + CA + vignette in one resample). Hot updates write
 // `lensNode.<field>.value`; rebuild via PostStack only triggers on enable toggle.
@@ -50,7 +52,12 @@ export class LensEffect implements PostEffect {
     return node;
   }
 
-  bindUI(folder: FolderApi, store: ParamStore): void {
+  bindUI(
+    folder: FolderApi,
+    store: ParamStore,
+    _modulator: Modulator,
+    proxies: ParamProxyRegistry,
+  ): void {
     const b = {
       enabled:        store.get("post.lens.enabled")        as boolean,
       distortion:     store.get("post.lens.distortion")     as number,
@@ -73,6 +80,13 @@ export class LensEffect implements PostEffect {
     folder
       .addBinding(b, "vignetteRadius", { label: "Vig. radius", min: 0, max: 1, step: 0.01 })
       .on("change", (e: { value: number }) => store.set("post.lens.vignetteRadius", e.value));
+    // The widgets bind `b`, which only ever moves on user input — re-pull it so
+    // programmatic writes (preset load, reset) show up in the panel.
+    proxies.set("post.lens.enabled", () => { b.enabled = store.get("post.lens.enabled") as boolean; });
+    proxies.set("post.lens.distortion", () => { b.distortion = store.get("post.lens.distortion") as number; });
+    proxies.set("post.lens.chromatic", () => { b.chromatic = store.get("post.lens.chromatic") as number; });
+    proxies.set("post.lens.vignette", () => { b.vignette = store.get("post.lens.vignette") as number; });
+    proxies.set("post.lens.vignetteRadius", () => { b.vignetteRadius = store.get("post.lens.vignetteRadius") as number; });
   }
 
   dispose(): void {

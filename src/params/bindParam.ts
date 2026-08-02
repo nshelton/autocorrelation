@@ -309,6 +309,13 @@ function makeWidget(
   if (schema.kind === "boolean") {
     return folder.addBinding(proxy, "value", { label: schema.label });
   }
+  if (schema.kind === "color") {
+    // Tweakpane renders a number as a color swatch + picker under this view,
+    // reading and writing it as 0xRRGGBB. No mod button: bindParam returns
+    // early for every non-continuous kind, and modulating packed RGB is noise.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    return folder.addBinding(proxy, "value", { label: schema.label, view: "color" } as any);
+  }
   if (schema.kind === "discrete") {
     const labels = schema.optionLabels ?? schema.options.map(String);
     return folder.addBinding(proxy, "value", {

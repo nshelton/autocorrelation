@@ -1,0 +1,194 @@
+import type { ParamStore, ParamValue } from "./ParamStore";
+import type { ModBinding, Modulator, TriggerBinding } from "./Modulator";
+
+// What a preset section owns. `id` is the storage/fold key; `prefixes` are the
+// param key namespaces it captures — usually one (a component's param prefix),
+// but Camera spans both "camera." and "light.". A preset never reaches outside
+// its prefixes, which is why `components.<id>.enabled` is not captured for
+// components: loading a preset shouldn't toggle the module on or off.
+export interface PresetScope {
+  id: string;
+  prefixes: string[];
+}
+
+export interface Preset {
+  name: string;
+  params: Record<string, ParamValue>;
+  mods: Record<string, ModBinding>;
+  triggers: Record<string, TriggerBinding>;
+}
+
+type ScopeState = { current: string | null; list: Preset[] };
+
+const STORAGE_KEY = "autocorrelation.presets.v1";
+
+export class PresetStore {
+  private scopes = new Map<string, ScopeState>();
+  private subs = new Set<(scope: string) => void>();
+
+  constructor(
+    private store: ParamStore,
+    private modulator: Modulator,
+  ) {
+    this.load();
+  }
+
+  list(scope: PresetScope): Preset[] {
+    return this.state(scope.id).list;
+  }
+
+  current(scope: PresetScope): string | null {
+    return this.state(scope.id).current;
+  }
+
+  // Overwrites the preset of the same name, otherwise appends. Either way the
+  // saved preset becomes current, so the UI immediately reads back clean.
+  save(scope: PresetScope, name: string): void {
+    const st = this.state(scope.id);
+    const preset: Preset = { name, ...this.capture(scope) };
+    const i = st.list.findIndex((p) => p.name === name);
+    if (i >= 0) st.list[i] = preset;
+    else st.list.push(preset);
+    st.current = name;
+    this.persist();
+    this.emit(scope.id);
+  }
+
+  apply(scope: PresetScope, name: string): void {
+    const st = this.state(scope.id);
+    const preset = st.list.find((p) => p.name === name);
+    if (!preset) return;
+    // Params go through store.set so the existing "user" subscribers do their
+    // usual work: mirror into the component's params bag and re-pull sliders.
+    for (const [key, value] of Object.entries(preset.params)) {
+      if (this.store.schemaFor(key)) this.store.set(key, value);
+    }
+    // Clear in-scope bindings the preset doesn't carry, then write its own —
+    // otherwise a modulation added since the save would survive the load.
+    for (const key of this.modulator.bindingKeys()) {
+      if (inScope(scope, key) && !(key in preset.mods)) this.modulator.setBinding(key, null);
+    }
+    for (const [key, b] of Object.entries(preset.mods)) this.modulator.setBinding(key, b);
+    for (const key of this.modulator.triggerKeys()) {
+      if (inScope(scope, key) && !(key in preset.triggers)) this.modulator.setTrigger(key, null);
+    }
+    for (const [key, t] of Object.entries(preset.triggers)) this.modulator.setTrigger(key, t);
+    st.current = name;
+    this.persist();
+    this.emit(scope.id);
+  }
+
+  remove(scope: PresetScope, name: string): void {
+    const st = this.state(scope.id);
+    const i = st.list.findIndex((p) => p.name === name);
+    if (i < 0) return;
+    st.list.splice(i, 1);
+    if (st.current === name) st.current = null;
+    this.persist();
+    this.emit(scope.id);
+  }
+
+  // True when the live state has drifted from the current preset — the "*" in
+  // the panel. No current preset means nothing to be dirty against.
+  isDirty(scope: PresetScope): boolean {
+    const st = this.state(scope.id);
+    if (!st.current) return false;
+    const saved = st.list.find((p) => p.name === st.current);
+    if (!saved) return false;
+    const { params, mods, triggers } = saved;
+    return stable(this.capture(scope)) !== stable({ params, mods, triggers });
+  }
+
+  subscribe(fn: (scope: string) => void): () => void {
+    this.subs.add(fn);
+    return () => this.subs.delete(fn);
+  }
+
+  private capture(scope: PresetScope): Omit<Preset, "name"> {
+    const params: Record<string, ParamValue> = {};
+    for (const schema of this.store.schemasInOrder()) {
+      if (inScope(scope, schema.key)) params[schema.key] = this.store.get(schema.key);
+    }
+    const mods: Record<string, ModBinding> = {};
+    for (const key of this.modulator.bindingKeys()) {
+      if (!inScope(scope, key)) continue;
+      const b = this.modulator.getBinding(key);
+      if (b) mods[key] = b;
+    }
+    const triggers: Record<string, TriggerBinding> = {};
+    for (const key of this.modulator.triggerKeys()) {
+      if (!inScope(scope, key)) continue;
+      const t = this.modulator.getTrigger(key);
+      if (t) triggers[key] = t;
+    }
+    return { params, mods, triggers };
+  }
+
+  private state(scope: string): ScopeState {
+    let st = this.scopes.get(scope);
+    if (!st) {
+      st = { current: null, list: [] };
+      this.scopes.set(scope, st);
+    }
+    return st;
+  }
+
+  private emit(scope: string): void {
+    for (const fn of this.subs) fn(scope);
+  }
+
+  private load(): void {
+    let parsed: unknown;
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if (!raw) return;
+      parsed = JSON.parse(raw);
+    } catch {
+      return;
+    }
+    if (!parsed || typeof parsed !== "object") return;
+    for (const [scope, val] of Object.entries(parsed as Record<string, unknown>)) {
+      const st = val as Partial<ScopeState>;
+      if (!Array.isArray(st?.list)) continue;
+      const list = st.list.filter(
+        (p): p is Preset => !!p && typeof p.name === "string" && !!p.params,
+      );
+      // Normalize: presets written before mods/triggers existed lack those.
+      for (const p of list) {
+        p.mods ??= {};
+        p.triggers ??= {};
+      }
+      const current = typeof st.current === "string" && list.some((p) => p.name === st.current)
+        ? st.current
+        : null;
+      this.scopes.set(scope, { current, list });
+    }
+  }
+
+  private persist(): void {
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(Object.fromEntries(this.scopes)));
+    } catch {
+      // localStorage unavailable; presets stay in-memory for the session
+    }
+  }
+}
+
+function inScope(scope: PresetScope, key: string): boolean {
+  return scope.prefixes.some((p) => key.startsWith(`${p}.`));
+}
+
+// Key-sorted stringify so dirty-checking compares content, not insertion order
+// (a freshly captured mods map iterates in binding order, a loaded one in JSON
+// order). Undefined-valued fields are skipped so an omitted optional and an
+// explicit `undefined` compare equal.
+function stable(v: unknown): string {
+  if (v === null || typeof v !== "object") return JSON.stringify(v) ?? "null";
+  if (Array.isArray(v)) return `[${v.map(stable).join(",")}]`;
+  const o = v as Record<string, unknown>;
+  const parts = Object.keys(o)
+    .sort()
+    .filter((k) => o[k] !== undefined)
+    .map((k) => `${JSON.stringify(k)}:${stable(o[k])}`);
+  return `{${parts.join(",")}}`;
+}

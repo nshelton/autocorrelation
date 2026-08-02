@@ -167,6 +167,16 @@ export class Modulator {
     return t ? { ...t } : null;
   }
 
+  // Keys that currently have a binding / trigger. PresetStore filters these by
+  // module prefix to snapshot and restore a module's modulation state.
+  bindingKeys(): string[] {
+    return [...this.bindings.keys()];
+  }
+
+  triggerKeys(): string[] {
+    return [...this.triggers.keys()];
+  }
+
   // Attach the action a trigger fires. Called by the UI for every button each
   // panel build; cleared on dispose so stale closures never fire.
   registerTriggerCallback(key: string, fn: () => void): void {

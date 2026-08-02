@@ -98,6 +98,16 @@ export default defineConfig({
   },
   resolve: {
     dedupe: ["three"],
+    // three ships two separate build files: "three" → three.module.js (core)
+    // and "three/webgpu" + "three/tsl" → three.webgpu.js (core + WebGPU, a
+    // SUPERSET that re-exports the whole core). Importing from both loads two
+    // copies of every core class, so a DirectionalLight from "three" is a
+    // different class than the one the WebGPU node renderer registers light
+    // nodes against → "Light node not found" + "Multiple instances of Three.js".
+    // Alias the bare specifier to the webgpu bundle so there's ONE copy. The
+    // regex is exact-match, so "three/webgpu", "three/tsl", and
+    // "three/examples/*" pass through unchanged.
+    alias: [{ find: /^three$/, replacement: "three/webgpu" }],
   },
   server: {
     port: 5173,

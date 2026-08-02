@@ -16,6 +16,7 @@ import {
   instancedBufferAttribute,
 } from "three/tsl";
 import RAPIER from "@dimforge/rapier3d-compat";
+import { getPhysicsWorld } from "./physics";
 import type { Component, ComponentDeps } from "./Component";
 
 const BOX_COUNT = 1024;
@@ -28,12 +29,10 @@ export class BoxView implements Component {
   static paramPrefix = "boxView";
   static paramOpts = {
     pull: { min: 0, max: 1, step: 0.01 },
-    timestep: { min: 0.005, max: 0.1, step: 0.001 },
     width: { min: 0, max: 2, step: 0.01 },
   };
   static paramDefaults = {
     pull: 0.3,
-    timestep: 1 / 30,
     width: 0.5,
   };
 
@@ -57,11 +56,8 @@ export class BoxView implements Component {
   }
 
   private async init(): Promise<void> {
-    await RAPIER.init();
+    const world = await getPhysicsWorld();
     if (this.disposed) return;
-
-    const world = new RAPIER.World({ x: 0, y: 0, z: 0 });
-    world.timestep = this.params.timestep;
 
     const c = CONTAINER_HALF;
 
@@ -123,8 +119,6 @@ export class BoxView implements Component {
 
   update(): void {
     if (!this.world || !this.mesh) return;
-    this.world.timestep = this.params.timestep;
-    this.world.step();
     const PULL = this.params.pull;
 
     const spec = this.store.get("spectrum");
@@ -178,8 +172,11 @@ export class BoxView implements Component {
       this.mesh.dispose();
       this.mesh = null;
     }
+    // Shared world: drop only our own bodies (their colliders go with them).
+    // Clearing the arrays in the same breath matters — a setter on a removed
+    // body panics rapier with "unreachable".
     if (this.world) {
-      this.world.free();
+      for (const b of this.bodies) this.world.removeRigidBody(b);
       this.world = null;
     }
     this.bodies = [];

@@ -2,6 +2,8 @@ import type { FolderApi } from "tweakpane";
 import type { Component, ComponentClass, ComponentDeps } from "./Component";
 import { Modulator } from "../../params/Modulator";
 import { bindParam, bindTrigger, type ParamProxyRegistry } from "../../params/bindParam";
+import { addPresetSection } from "../../params/PresetSection";
+import type { PresetStore } from "../../params/PresetStore";
 
 // Per-component runtime state. paramsBag is null for components that don't
 // declare static paramDefaults. The bag is allocated once per page lifetime
@@ -74,7 +76,7 @@ export class ComponentManager {
   // Add one tweakpane folder per component: enable checkbox first, then
   // (if applicable) one slider per param bound to the stable bag. Must
   // be called AFTER start() — slots are populated there.
-  bindUI(parent: FolderApi, modulator: Modulator): void {
+  bindUI(parent: FolderApi, modulator: Modulator, presets: PresetStore): void {
     const { paramStore } = this.deps;
 
     for (const slot of this.slots) {
@@ -168,6 +170,14 @@ export class ComponentManager {
         folder.refresh();
       });
       this.paneTeardowns.push({ dispose: refreshUnsub });
+
+      // Added last so the collapsible Presets section sits at the bottom of the
+      // module. Scoped to the component's param prefix, so it captures exactly
+      // the params + modulations bound above.
+      const prefix = slot.cls.paramPrefix ?? slot.cls.id;
+      this.paneTeardowns.push(
+        addPresetSection(folder, presets, { id: prefix, prefixes: [prefix] }),
+      );
     }
   }
 
@@ -210,7 +220,15 @@ export class ComponentManager {
     for (const [k, def] of Object.entries(cls.paramDefaults)) {
       const fullKey = `${prefix}.${k}`;
       const kind = cls.paramKinds?.[k] ?? "continuous";
-      if (kind === "discrete") {
+      if (kind === "color") {
+        paramStore.register({
+          key: fullKey,
+          label: k,
+          kind: "color",
+          reconfig: false,
+          default: def,
+        });
+      } else if (kind === "discrete") {
         const options = cls.paramDiscreteOptions?.[k];
         if (!options) {
           throw new Error(

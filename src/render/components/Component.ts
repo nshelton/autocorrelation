@@ -41,7 +41,9 @@ export interface ComponentClass {
   paramDefaults?: Record<string, number>;
   // Per-key kind override. Absent or "continuous" → continuous (uses paramOpts
   // min/max/step). "discrete" → uses paramDiscreteOptions for the value set.
-  paramKinds?: Record<string, "continuous" | "discrete">;
+  // "color" → a 0xRRGGBB integer shown as a color picker; the default in
+  // paramDefaults is the packed value.
+  paramKinds?: Record<string, "continuous" | "discrete" | "color">;
   // For each key whose paramKinds entry is "discrete", the allowed values.
   // Must be present when paramKinds[key] === "discrete".
   paramDiscreteOptions?: Record<string, number[]>;

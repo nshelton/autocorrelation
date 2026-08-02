@@ -8,10 +8,13 @@ import { FpsOverlay } from "./ui/Stats";
 import { PerfOverlay } from "./ui/PerfOverlay";
 import { ComponentManager } from "./render/components/ComponentManager";
 import { COMPONENTS } from "./render/components";
+import { stepPhysics } from "./render/components/physics";
 import { shTween } from "./render/orbital/ShTween";
 
 import { Modulator } from "./params/Modulator";
-import { bindParam } from "./params/bindParam";
+import { PresetStore } from "./params/PresetStore";
+import { addPresetSection } from "./params/PresetSection";
+import { bindParam, type ParamProxyRegistry } from "./params/bindParam";
 import type { ParamStore } from "./params/ParamStore";
 import type { WebGPURenderer } from "three/webgpu";
 import type { CameraPose } from "./render/CameraRig";
@@ -76,6 +79,10 @@ export class App {
   private components!: ComponentManager;
   private postStack!: PostStack;
   public modulator!: Modulator;
+  private presets!: PresetStore;
+  // Camera + Post preset sections and their panel subscriptions. Component ones
+  // are owned by ComponentManager.
+  private presetSections: Array<{ dispose(): void }> = [];
   private cameraUnsub: (() => void) | null = null;
   private directionalLight!: DirectionalLight;
   private scene!: Scene;
@@ -109,6 +116,7 @@ export class App {
       COMPONENTS,
     );
     this.modulator = new Modulator(paramStore, this.store);
+    this.presets = new PresetStore(paramStore, this.modulator);
     this.components.start();
 
     this.postStack = new PostStack(renderer, scene, camera, paramStore, buildPostEffects(renderer));
@@ -220,6 +228,12 @@ export class App {
       const t1 = performance.now();
       shTween.tick(dt, this.deps.paramStore);
       this.modulator.tick();
+      // Single step for the shared world, before any component reads a body
+      // transform. Components never step it themselves.
+      stepPhysics(
+        paramStore.get("physics.timescale") as number,
+        -(paramStore.get("physics.gravity") as number),
+      );
       this.components.update();
       const t2 = performance.now();
       void this.postStack.renderAsync();
@@ -242,11 +256,39 @@ export class App {
   }
 
   bindUI(parent: import("tweakpane").FolderApi): void {
-    this.components.bindUI(parent, this.modulator);
+    // Every physics component shares one world, so timescale and gravity are
+    // global — one folder above the per-scene ones rather than a copy each.
+    const store = this.deps.paramStore;
+    const folder = parent.addFolder({ title: "Physics", expanded: true });
+    const proxies: ParamProxyRegistry = new Map();
+    for (const key of ["physics.timescale", "physics.gravity"]) {
+      const schema = store.schemaFor(key);
+      if (!schema) throw new Error(`bindUI: ${key} schema missing`);
+      bindParam(folder, store, this.modulator, schema, proxies);
+    }
+    const unsub = store.subscribe((key, _value, source) => {
+      if (source !== "user") return;
+      const refresh = proxies.get(key);
+      if (!refresh) return;
+      refresh();
+      folder.refresh();
+    });
+    this.presetSections.push({ dispose: unsub });
+    this.presetSections.push(
+      addPresetSection(folder, this.presets, { id: "physics", prefixes: ["physics"] }),
+    );
+
+    this.components.bindUI(parent, this.modulator, this.presets);
   }
 
   bindPostUI(folder: FolderApi): void {
-    this.postStack.bindUI(folder, this.modulator);
+    this.presetSections.push({ dispose: this.postStack.bindUI(folder, this.modulator) });
+    // Below the per-effect folders, so the section reads as "presets for the
+    // whole post chain" — it captures every post.* param, effect enables
+    // included.
+    this.presetSections.push(
+      addPresetSection(folder, this.presets, { id: "post", prefixes: ["post"] }),
+    );
   }
 
   bindCameraUI(folder: FolderApi): void {
@@ -261,10 +303,13 @@ export class App {
     }
     const rotateSchema = store.schemaFor("camera.rotate");
     if (!rotateSchema) throw new Error("bindCameraUI: camera.rotate schema missing");
-    bindParam(folder, store, this.modulator, fovSchema);
-    bindParam(folder, store, this.modulator, presetSchema);
-    bindParam(folder, store, this.modulator, rotateSchema);
-    bindParam(folder, store, this.modulator, lightSchema);
+    // Collects "re-pull from store" callbacks so a preset load moves the
+    // widgets instead of leaving them stale; driven from the subscriber below.
+    const proxies: ParamProxyRegistry = new Map();
+    bindParam(folder, store, this.modulator, fovSchema, proxies);
+    bindParam(folder, store, this.modulator, presetSchema, proxies);
+    bindParam(folder, store, this.modulator, rotateSchema, proxies);
+    bindParam(folder, store, this.modulator, lightSchema, proxies);
 
     const swimKeys = [
       "camera.swim.enabled",
@@ -276,7 +321,7 @@ export class App {
     for (const key of swimKeys) {
       const schema = store.schemaFor(key);
       if (!schema) throw new Error(`bindCameraUI: ${key} schema missing`);
-      bindParam(folder, store, this.modulator, schema);
+      bindParam(folder, store, this.modulator, schema, proxies);
     }
     const applySwim = () => this.rig.setSwim({
       enabled:      store.get("camera.swim.enabled") as boolean,
@@ -305,7 +350,21 @@ export class App {
         if (value) this.scene.add(this.directionalLight);
         else this.scene.remove(this.directionalLight);
       }
+      // Widget sync rides along on the same subscription. Gated on
+      // source==='user' so per-frame modulator notifies don't jitter the UI.
+      if (source !== "user") return;
+      const refresh = proxies.get(key);
+      if (refresh) {
+        refresh();
+        folder.refresh();
+      }
     });
+
+    // "light" rides along with the camera scope: the directional light toggle
+    // is rendered in this folder, so a camera preset should carry it.
+    this.presetSections.push(
+      addPresetSection(folder, this.presets, { id: "camera", prefixes: ["camera", "light"] }),
+    );
 
     camera.fov = store.get("camera.fov") as number;
     camera.updateProjectionMatrix();
@@ -328,6 +387,8 @@ export class App {
     this.perf.unmount();
     this.cameraUnsub?.();
     this.cameraUnsub = null;
+    for (const s of this.presetSections) s.dispose();
+    this.presetSections = [];
     this.deps.workletNode.port.onmessage = null;
   }
 }

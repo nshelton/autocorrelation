@@ -3,6 +3,7 @@ import type { ShaderNodeObject } from "three/tsl";
 import type { Node } from "three/webgpu";
 import type { ParamStore } from "../../params/ParamStore";
 import type { Modulator } from "../../params/Modulator";
+import type { ParamProxyRegistry } from "../../params/bindParam";
 import type { FolderApi } from "tweakpane";
 
 // Context handed to every effect's build() — the scene-pass texture nodes.
@@ -29,8 +30,16 @@ export interface PostEffect {
   // Register param schemas + uniform subscriptions. Called once at construction.
   registerParams(store: ParamStore, requestRebuild: () => void): void;
 
-  // Add UI widgets into the effect's sub-folder under "Post".
-  bindUI(folder: FolderApi, store: ParamStore, modulator: Modulator): void;
+  // Add UI widgets into the effect's sub-folder under "Post". `proxies`
+  // collects per-key "re-pull the widget's value from the store" callbacks so
+  // programmatic writes (preset load, reset) move the widgets instead of
+  // leaving them stale — PostStack drives them.
+  bindUI(
+    folder: FolderApi,
+    store: ParamStore,
+    modulator: Modulator,
+    proxies: ParamProxyRegistry,
+  ): void;
 
   dispose(): void;
 }

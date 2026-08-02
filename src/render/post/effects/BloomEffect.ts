@@ -7,7 +7,7 @@ import type { FolderApi } from "tweakpane";
 import type { PostEffect, PassCtx } from "../PostEffect";
 import type { ParamStore } from "../../../params/ParamStore";
 import type { Modulator } from "../../../params/Modulator";
-import { bindParam } from "../../../params/bindParam";
+import { bindParam, type ParamProxyRegistry } from "../../../params/bindParam";
 
 // Wraps three's TSL bloom(node, strength, radius, threshold). The three
 // args become uniforms on the returned BloomNode; hot updates write
@@ -46,7 +46,12 @@ export class BloomEffect implements PostEffect {
     return input.add(node);
   }
 
-  bindUI(folder: FolderApi, store: ParamStore, modulator: Modulator): void {
+  bindUI(
+    folder: FolderApi,
+    store: ParamStore,
+    modulator: Modulator,
+    proxies: ParamProxyRegistry,
+  ): void {
     for (const key of [
       "post.bloom.enabled",
       "post.bloom.strength",
@@ -55,7 +60,7 @@ export class BloomEffect implements PostEffect {
     ]) {
       const schema = store.schemaFor(key);
       if (!schema) throw new Error(`BloomEffect.bindUI: schema ${key} missing`);
-      bindParam(folder, store, modulator, schema);
+      bindParam(folder, store, modulator, schema, proxies);
     }
   }
 

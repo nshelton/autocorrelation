@@ -7,7 +7,7 @@ import { ao } from "../GTAONode.js";
 import type { PostEffect, PassCtx } from "../PostEffect";
 import type { ParamStore } from "../../../params/ParamStore";
 import type { Modulator } from "../../../params/Modulator";
-import { bindParam } from "../../../params/bindParam";
+import { bindParam, type ParamProxyRegistry } from "../../../params/bindParam";
 
 export class AoEffect implements PostEffect {
   readonly id = "ao";
@@ -49,7 +49,12 @@ export class AoEffect implements PostEffect {
     return input.mul(factor);
   }
 
-  bindUI(folder: FolderApi, store: ParamStore, modulator: Modulator): void {
+  bindUI(
+    folder: FolderApi,
+    store: ParamStore,
+    modulator: Modulator,
+    proxies: ParamProxyRegistry,
+  ): void {
     for (const key of [
       "post.ao.enabled",
       "post.ao.radius",
@@ -57,7 +62,7 @@ export class AoEffect implements PostEffect {
     ]) {
       const schema = store.schemaFor(key);
       if (!schema) throw new Error(`AoEffect.bindUI: schema ${key} missing`);
-      bindParam(folder, store, modulator, schema);
+      bindParam(folder, store, modulator, schema, proxies);
     }
   }
 

@@ -9,7 +9,12 @@ export type ParamSchema = {
   | { kind: "discrete"; options: number[]; optionLabels?: string[] }
   | { kind: "continuous"; min: number; max: number; step: number }
   | { kind: "boolean" }
+  // Packed 0xRRGGBB sRGB integer. Stored as a plain number so persistence,
+  // presets and reset need no special casing; only the widget differs.
+  | { kind: "color" }
 );
+
+export const COLOR_MAX = 0xffffff;
 
 type Subscriber = (key: string, value: ParamValue, source: "user" | "modulator") => void;
 
@@ -107,6 +112,7 @@ export class ParamStore {
     if (schema.kind === "boolean") return typeof value === "boolean";
     if (typeof value !== "number") return false;
     if (schema.kind === "discrete") return schema.options.includes(value);
+    if (schema.kind === "color") return value >= 0 && value <= COLOR_MAX;
     return value >= schema.min && value <= schema.max;
   }
 

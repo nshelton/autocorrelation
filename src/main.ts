@@ -161,10 +161,12 @@ const onStart = async (factory: SourceProvider): Promise<void> => {
       const { postSchemas } = await import("./params/postSchemas");
       const { cameraSchemas } = await import("./params/cameraSchemas");
       const { lightSchemas } = await import("./params/lightSchemas");
+      const { physicsSchemas } = await import("./params/physicsSchemas");
       for (const s of analysisSchemas) paramStore.register(s);
       for (const s of postSchemas) paramStore.register(s);
       for (const s of cameraSchemas) paramStore.register(s);
       for (const s of lightSchemas) paramStore.register(s);
+      for (const s of physicsSchemas) paramStore.register(s);
     }
     sourceProvider = wrapAsReusable(factory);
     pageDeps = await buildPageDeps(sourceProvider, paramStore);

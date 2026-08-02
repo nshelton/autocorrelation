@@ -6,6 +6,7 @@ import type { ParamStore } from "../../params/ParamStore";
 import type { FolderApi } from "tweakpane";
 import type { PostEffect, PassCtx } from "./PostEffect";
 import type { Modulator } from "../../params/Modulator";
+import type { ParamProxyRegistry } from "../../params/bindParam";
 
 // Owns a single PostProcessing instance plus an ordered list of effects.
 // Subscribes to ParamStore: any `post.*.enabled` change reads each effect's
@@ -90,11 +91,23 @@ export class PostStack {
     this.post.needsUpdate = true;
   }
 
-  bindUI(folder: FolderApi, modulator: Modulator): void {
+  // Returns the UI unsubscribe; App owns the teardown (bindUI can be called
+  // again after an HMR panel rebuild, and each call adds one subscription).
+  bindUI(folder: FolderApi, modulator: Modulator): () => void {
+    const proxies: ParamProxyRegistry = new Map();
     for (const effect of this.effects) {
       const sub = folder.addFolder({ title: effect.label, expanded: false });
-      effect.bindUI(sub, this.store, modulator);
+      effect.bindUI(sub, this.store, modulator, proxies);
     }
+    // Gated on source==='user' so per-frame modulator notifies don't jitter the
+    // UI; matches ComponentManager and ParamPanel.
+    return this.store.subscribe((key, _value, source) => {
+      if (source !== "user") return;
+      const refresh = proxies.get(key);
+      if (!refresh) return;
+      refresh();
+      folder.refresh();
+    });
   }
 
   async renderAsync(): Promise<void> {

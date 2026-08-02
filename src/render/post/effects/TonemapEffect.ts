@@ -12,7 +12,7 @@ import type { FolderApi } from "tweakpane";
 import type { PostEffect, PassCtx } from "../PostEffect";
 import type { ParamStore } from "../../../params/ParamStore";
 import type { Modulator } from "../../../params/Modulator";
-import { bindParam } from "../../../params/bindParam";
+import { bindParam, type ParamProxyRegistry } from "../../../params/bindParam";
 
 // Index -> three.js ToneMapping constant. Must match optionLabels in
 // postSchemas.ts (`post.tonemap.mode`): ["None","AgX","ACES","Neutral"].
@@ -68,7 +68,12 @@ export class TonemapEffect implements PostEffect {
     return input.mul(this.exposureU);
   }
 
-  bindUI(folder: FolderApi, store: ParamStore, modulator: Modulator): void {
+  bindUI(
+    folder: FolderApi,
+    store: ParamStore,
+    modulator: Modulator,
+    proxies: ParamProxyRegistry,
+  ): void {
     for (const key of [
       "post.tonemap.enabled",
       "post.tonemap.mode",
@@ -76,7 +81,7 @@ export class TonemapEffect implements PostEffect {
     ]) {
       const schema = store.schemaFor(key);
       if (!schema) throw new Error(`TonemapEffect.bindUI: schema ${key} missing`);
-      bindParam(folder, store, modulator, schema);
+      bindParam(folder, store, modulator, schema, proxies);
     }
   }
 
