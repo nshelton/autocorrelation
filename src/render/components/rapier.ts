@@ -1,4 +1,4 @@
-import RAPIER from "@dimforge/rapier3d-compat";
+import RAPIER from "@dimforge/rapier3d-simd-compat";
 
 // rapier3d-compat's init() is NOT idempotent — each call re-instantiates the
 // wasm module and rebinds the module-level instance. Components init

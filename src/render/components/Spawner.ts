@@ -9,7 +9,7 @@ import {
 } from "three";
 import { MeshLambertNodeMaterial } from "three/webgpu";
 import { vec4, uniform } from "three/tsl";
-import RAPIER from "@dimforge/rapier3d-compat";
+import RAPIER from "@dimforge/rapier3d-simd-compat";
 import { createCurlNoise } from "../curl-noise";
 import { getPhysicsWorld } from "./physics";
 import type { Component, ComponentDeps } from "./Component";
@@ -131,6 +131,9 @@ class Pool {
   lifetime = new Float32Array(MAX_PER_TYPE);
   maxLifetime = new Float32Array(MAX_PER_TYPE);
   scale = new Float32Array(MAX_PER_TYPE);
+  // Fade factor last pushed into the collider — resizes are throttled to >3%
+  // deltas because every resize dirties the broad-phase.
+  fadeApplied = new Float32Array(MAX_PER_TYPE);
   next = 0;
   // Shape color, referenced live by the material's uniform node — mutate it in
   // place (setHex) and the next frame picks it up; never reassign.
@@ -232,6 +235,7 @@ export class Spawner implements Component {
   private lastRestitution = NaN;
   private lastTime = NaN;
   private lastWireframe = NaN;
+  private lastFieldType = NaN;
   private disposed = false;
 
   constructor(deps: ComponentDeps, params: Record<string, number>) {
@@ -302,18 +306,23 @@ export class Spawner implements Component {
   // origin with a random-direction impulse; ambient pools appear anywhere
   // inside their radius and drift. Recycles the oldest live object when the
   // pool is full.
-  private spawn(pool: Pool): void {
+  //
+  // `staggered` starts the object part-way through its life instead of at the
+  // beginning — see the ambient top-up in update() for why.
+  private spawn(pool: Pool, staggered = false): void {
     const i = pool.next;
     pool.next = (pool.next + 1) % MAX_PER_TYPE;
 
     const s = (SCALE_MIN + Math.random() * (SCALE_MAX - SCALE_MIN)) * this.params[pool.def.scaleParam];
     pool.scale[i] = s;
-    pool.lifetime[i] = this.params.lifetime + Math.random() * LIFETIME_JITTER_SECS;
-    pool.maxLifetime[i] = pool.lifetime[i];
+    const full = this.params.lifetime + Math.random() * LIFETIME_JITTER_SECS;
+    pool.maxLifetime[i] = full;
+    pool.lifetime[i] = staggered ? Math.random() * full : full;
     // Recycling a still-live slot replaces it rather than adding to the count.
     if (!pool.active[i]) pool.live++;
     pool.active[i] = 1;
     pool.def.resize(pool.colliders[i], s);
+    pool.fadeApplied[i] = 1;
 
     const amb = pool.def.ambient;
     const d = this.dirScratch;
@@ -338,6 +347,16 @@ export class Spawner implements Component {
   update(): void {
     if (!this.world) return;
     const type = Math.round(this.params.forceFieldType);
+    // Fields skip sleeping bodies, so a settled pile would ignore the
+    // dropdown; one wake-all on type change keeps it responsive.
+    if (type !== this.lastFieldType) {
+      if (Number.isFinite(this.lastFieldType)) {
+        for (const pool of this.pools)
+          for (let i = 0; i < MAX_PER_TYPE; i++)
+            if (pool.active[i]) pool.bodies[i].wakeUp();
+      }
+      this.lastFieldType = type;
+    }
 
     // noiseScale is hot — createCurlNoise closes over scale at construction.
     if (this.params.noiseScale !== this.lastNoiseScale) {
@@ -394,13 +413,21 @@ export class Spawner implements Component {
         // frame. Clamped to the pool so a maxed-out slider can't spin forever.
         // Lowering the slider doesn't cull anyone — the surplus just ages out.
         const target = Math.min(Math.round(this.params[amb.amountParam]), MAX_PER_TYPE);
+        // Filling more than one slot in a frame is either the first fill or an
+        // amount increase. Born together they also DIE together (only the ~1s
+        // lifetime jitter separates them), which empties the pool, triggers
+        // another batch, and locks the population into a visible oscillation.
+        // Staggering their starting ages across a full lifetime spreads the
+        // deaths out permanently: from then on slots free up a few at a time
+        // and each replacement gets a normal full life.
+        const staggered = target - pool.live > 1;
         while (pool.live < target) {
           // Walk the ring to a free slot first: recycling a live object would
           // reset a perfectly good sphere's lifetime without growing the
           // population, and the loop could spin. live < target <= MAX_PER_TYPE
           // guarantees a free slot exists, so this always terminates.
           while (pool.active[pool.next]) pool.next = (pool.next + 1) % MAX_PER_TYPE;
-          this.spawn(pool);
+          this.spawn(pool, staggered);
         }
         continue;
       }
@@ -439,12 +466,18 @@ export class Spawner implements Component {
         }
 
         const t = body.translation();
-        if (type === FIELD_LINEAR) {
+        // Sleep etiquette: sleeping bodies are skipped AND the field writes
+        // pass wake=false — the wake flag resets the sleep timer, so with
+        // wake=true a body at rest could never fall asleep in the first
+        // place. The type-change wake above keeps the dropdown live.
+        if (body.isSleeping()) {
+          // Skip field writes but keep fading/rendering below.
+        } else if (type === FIELD_LINEAR) {
           // Per-body rather than world gravity: the world is shared now, so a
           // component can't own world.gravity. dv = -strength*dt is exactly
           // what a gravity of -forceStrength would have applied.
           const v = body.linvel();
-          body.setLinvel({ x: v.x, y: v.y - fieldK, z: v.z }, true);
+          body.setLinvel({ x: v.x, y: v.y - fieldK, z: v.z }, false);
         } else if (type === FIELD_CURL) {
           this.curlNoise(t.x, t.y, t.z, this.curlOut);
           const v = body.linvel();
@@ -454,7 +487,7 @@ export class Spawner implements Component {
               y: v.y + this.curlOut[1] * fieldK,
               z: v.z + this.curlOut[2] * fieldK,
             },
-            true,
+            false,
           );
         } else if (type === FIELD_ATTRACT) {
           // Constant-magnitude pull toward the origin (unit direction * strength).
@@ -462,7 +495,7 @@ export class Spawner implements Component {
           const v = body.linvel();
           body.setLinvel(
             { x: v.x - t.x * inv, y: v.y - t.y * inv, z: v.z - t.z * inv },
-            true,
+            false,
           );
         }
 
@@ -473,7 +506,14 @@ export class Spawner implements Component {
         // (tunneling-prone) near-zero size in the last instants before expiry.
         const fade = pool.lifetime[i] / pool.maxLifetime[i];
         const s = pool.scale[i] * fade;
-        pool.def.resize(pool.colliders[i], pool.scale[i] * Math.max(fade, COLLIDER_MIN_FADE));
+        // Throttled: a resize dirties the broad-phase even at identical size,
+        // so per-frame resizes made every active object re-pair every frame.
+        // ~3% steps land ~10 resizes over a lifetime instead.
+        const cf = Math.max(fade, COLLIDER_MIN_FADE);
+        if (Math.abs(cf - pool.fadeApplied[i]) > 0.03) {
+          pool.def.resize(pool.colliders[i], pool.scale[i] * cf);
+          pool.fadeApplied[i] = cf;
+        }
         this.dummy.position.set(t.x, t.y, t.z);
         this.dummy.quaternion.set(r.x, r.y, r.z, r.w);
         this.dummy.scale.set(s, s, s);

@@ -1,5 +1,10 @@
 import type { ParamStore, ParamValue } from "./ParamStore";
 import type { ModBinding, Modulator, TriggerBinding } from "./Modulator";
+import { presetTween } from "./PresetTween";
+
+// Seconds to glide from the live values to a loaded preset's. 0 = snap. Read
+// per apply(), so changing it mid-tween doesn't disturb the one in flight.
+const TWEEN_KEY = "system.presetTweenSecs";
 
 // What a preset section owns. `id` is the storage/fold key; `prefixes` are the
 // param key namespaces it captures — usually one (a component's param prefix),
@@ -65,11 +70,22 @@ export class PresetStore {
     const st = this.state(scope.id);
     const preset = st.list.find((p) => p.name === name);
     if (!preset) return;
-    // Params go through store.set so the existing "user" subscribers do their
-    // usual work: mirror into the component's params bag and re-pull sliders.
+    // Structure snaps, values glide. Booleans (module enables) and discrete
+    // dropdowns (primitive type, force field, tonemap mode) have no meaningful
+    // in-between, so they land immediately; continuous params and colors are
+    // handed to the tween. Everything goes through store.set in the end, so the
+    // usual "user" subscribers still mirror into params bags and re-pull sliders.
+    const targets = new Map<string, number>();
     for (const [key, value] of Object.entries(preset.params)) {
-      if (this.store.schemaFor(key)) this.store.set(key, value);
+      const schema = this.store.schemaFor(key);
+      if (!schema) continue;
+      if (typeof value === "number" && (schema.kind === "continuous" || schema.kind === "color")) {
+        targets.set(key, value);
+      } else {
+        this.store.set(key, value);
+      }
     }
+    presetTween.start(this.store, targets, this.tweenSecs());
     // Clear in-scope bindings the preset doesn't carry, then write its own —
     // otherwise a modulation added since the save would survive the load.
     for (const key of this.modulator.bindingKeys()) {
@@ -129,6 +145,13 @@ export class PresetStore {
       if (t) triggers[key] = t;
     }
     return { params, mods, triggers };
+  }
+
+  // 0 when the schema isn't registered (tests, early boot) — presets snap.
+  private tweenSecs(): number {
+    if (!this.store.schemaFor(TWEEN_KEY)) return 0;
+    const v = this.store.get(TWEEN_KEY);
+    return typeof v === "number" ? v : 0;
   }
 
   private state(scope: string): ScopeState {

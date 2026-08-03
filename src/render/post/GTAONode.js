@@ -1,6 +1,6 @@
 import { DataTexture, RenderTarget, RepeatWrapping, Vector2, Vector3 } from 'three';
 import { PostProcessingUtils } from 'three/webgpu';
-import { getNormalFromDepth, getScreenPosition, getViewPosition, QuadMesh, TempNode, nodeObject, Fn, float, NodeUpdateType, uv, uniform, Loop, vec2, vec3, vec4, int, dot, max, pow, abs, If, textureSize, sin, cos, PI, texture, passTexture, mat3, add, normalize, mul, cross, div, mix, sqrt, sub, acos, clamp, NodeMaterial } from 'three/tsl';
+import { getNormalFromDepth, getScreenPosition, getViewPosition, QuadMesh, TempNode, nodeObject, Fn, float, NodeUpdateType, uv, uniform, Loop, vec2, vec3, vec4, int, dot, max, min, pow, abs, If, textureSize, sin, cos, PI, texture, passTexture, mat3, add, normalize, mul, cross, div, mix, sqrt, sub, acos, clamp, NodeMaterial } from 'three/tsl';
 
 const _quadMesh = /*@__PURE__*/ new QuadMesh();
 const _size = /*@__PURE__*/ new Vector2();
@@ -103,7 +103,12 @@ class GTAONode extends TempNode {
 			const viewPosition = getViewPosition( uvNode, depth, this.cameraProjectionMatrixInverse ).toVar();
 			const viewNormal = sampleNormal( uvNode ).toVar();
 
-			const radiusToUse = this.radius;
+			// Cap the world-space radius by view distance so the projected sample
+			// footprint stays bounded in screen space (~15% of view height). The
+			// stock example doesn't clamp: walk the camera up to geometry and each
+			// pixel's samples scatter across the whole depth texture — cache
+			// coherence collapses and GPU time diverges as ~1/distance².
+			const radiusToUse = min( this.radius, viewPosition.z.abs().mul( 0.15 ) ).toVar();
 
 			const noiseResolution = textureSize( this.noiseNode, 0 );
 			let noiseUv = vec2( uvNode.x, uvNode.y.oneMinus() );

@@ -8,7 +8,7 @@ import {
 } from "three";
 import { MeshLambertNodeMaterial } from "three/webgpu";
 import { vec4, uniform } from "three/tsl";
-import RAPIER from "@dimforge/rapier3d-compat";
+import RAPIER from "@dimforge/rapier3d-simd-compat";
 import { getPhysicsWorld } from "./physics";
 import type { Component, ComponentDeps } from "./Component";
 
@@ -72,6 +72,9 @@ export class BoxView implements Component {
   // reassign, so rebuilt materials keep pointing at the same instance.
   private color = new Color();
   private lastColor = NaN;
+  // Size last pushed into each collider — resizes are throttled to >3% deltas
+  // because every resize dirties the broad-phase (see Spawner).
+  private sizeApplied = new Float32Array(0);
   private disposed = false;
 
   constructor(deps: ComponentDeps, params: Record<string, number>) {
@@ -134,6 +137,7 @@ export class BoxView implements Component {
       this.bodies.push(body);
       this.colliders.push(world.createCollider(shape.setRestitution(0.9), body));
     }
+    this.sizeApplied = new Float32Array(n).fill(BASE_SIZE);
 
     // Sphere radius = box half-extent, so the two primitives occupy the same
     // size envelope and minSize/maxSize mean the same thing for both.
@@ -188,15 +192,20 @@ export class BoxView implements Component {
       const r = b.rotation();
 
       const restX = ((i - halfCount) * this.params.width) / n;
-      const vel = b.linvel();
-      b.setLinvel(
-        {
-          x: vel.x + (restX - t.x) * PULL,
-          y: vel.y - t.y * PULL,
-          z: vel.z - t.z * PULL,
-        },
-        true,
-      );
+      // Skip settled bodies and write with wake=false — the wake flag resets
+      // the sleep timer, so wake=true kept the whole pool in the solver
+      // forever even when every box sat at rest.
+      if (!b.isSleeping()) {
+        const vel = b.linvel();
+        b.setLinvel(
+          {
+            x: vel.x + (restX - t.x) * PULL,
+            y: vel.y - t.y * PULL,
+            z: vel.z - t.z * PULL,
+          },
+          false,
+        );
+      }
 
       // Silence (no spectrum yet) sits every instance at minSize.
       let size = minSize;
@@ -205,9 +214,18 @@ export class BoxView implements Component {
         size = minSize + (maxSize - minSize) * spec[bin];
       }
 
-      const h = size / 2;
-      if (isSphere) this.colliders[i].setRadius(h);
-      else this.colliders[i].setHalfExtents({ x: h, y: h, z: h });
+      // Collider follows the audio-driven size in >3% steps only; the mesh
+      // below stays perfectly smooth, physics just quantizes imperceptibly.
+      const applied = this.sizeApplied[i];
+      if (Math.abs(size - applied) > applied * 0.03) {
+        const h = size / 2;
+        if (isSphere) this.colliders[i].setRadius(h);
+        else this.colliders[i].setHalfExtents({ x: h, y: h, z: h });
+        this.sizeApplied[i] = size;
+        // A collider change doesn't wake a sleeping body on its own — audio
+        // kicking back in must re-animate settled boxes.
+        if (b.isSleeping()) b.wakeUp();
+      }
 
       const s = size / BASE_SIZE;
       this.dummy.position.set(t.x, t.y, t.z);

@@ -12,7 +12,9 @@ export async function createRenderer(canvas: HTMLCanvasElement): Promise<WebGPUR
   // Self-disables if the adapter lacks the timestamp-query feature.
   const renderer = new WebGPURenderer({ canvas, antialias: true, trackTimestamp: true });
   await renderer.init();
-  renderer.setPixelRatio(window.devicePixelRatio);
+  // Capped: full retina DPR quadruples every per-pixel cost (AO, shadows,
+  // post) for marginal sharpness in a motion-heavy visualizer.
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5));
   renderer.setSize(window.innerWidth, window.innerHeight, false);
   renderer.setClearColor(new Color(0x0a0a0a), 1);
   // The shadow pass only runs while a shadow-casting light is in the scene,

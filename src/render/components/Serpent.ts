@@ -8,7 +8,7 @@ import {
 } from "three";
 import { MeshLambertNodeMaterial } from "three/webgpu";
 import { vec4, uniform } from "three/tsl";
-import RAPIER from "@dimforge/rapier3d-compat";
+import RAPIER from "@dimforge/rapier3d-simd-compat";
 import { getPhysicsWorld } from "./physics";
 import type { Component, ComponentDeps } from "./Component";
 

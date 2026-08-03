@@ -22,11 +22,15 @@ export interface FrameSample {
   cameraMs: number;
   physicsMs: number;
   componentsMs: number;
-  submitMs: number;
+  // Main-thread render cost measured to renderAsync completion (encode of
+  // scene + shadow + post passes). One frame stale; NaN until the first
+  // frame finishes.
+  renderMs: number;
   analysisMs: number; // NaN when no dspPerf yet
   analysisHz: number;
   bodies: number;
   colliders: number;
+  active: number; // enabled + awake — the solver's real workload
   now: number; // RAF timestamp, drives the footer throttle
 }
 
@@ -81,7 +85,7 @@ export class PerfOverlay {
         { label: "cam", color: "#3987e5" },
         { label: "phys", color: "#d95926" },
         { label: "cmp", color: "#199e70" },
-        { label: "sub", color: "#c98500" },
+        { label: "rnd", color: "#c98500" },
       ],
     });
     this.phys = new LinePlot({
@@ -89,6 +93,7 @@ export class PerfOverlay {
       series: [
         { label: "bodies", color: "#3987e5" },
         { label: "colliders", color: "#d95926" },
+        { label: "act", color: "#199e70" },
       ],
       autoFloor: 10,
       format: COUNT,
@@ -115,8 +120,8 @@ export class PerfOverlay {
   // timeseries); the plot headers EMA their own readouts.
   sample(s: FrameSample): void {
     this.fps.push(s.fps);
-    this.cpu.push(s.cameraMs, s.physicsMs, s.componentsMs, s.submitMs);
-    this.phys.push(s.bodies, s.colliders);
+    this.cpu.push(s.cameraMs, s.physicsMs, s.componentsMs, s.renderMs);
+    this.phys.push(s.bodies, s.colliders, s.active);
     this.dsp.push(s.analysisMs);
     if (Number.isFinite(s.analysisHz)) this.analysisHz = ema(this.analysisHz, s.analysisHz);
 

@@ -1,4 +1,4 @@
-import RAPIER from "@dimforge/rapier3d-compat";
+import RAPIER from "@dimforge/rapier3d-simd-compat";
 import { initRapier } from "./rapier";
 
 // ONE rapier world for every physics component. Objects from different scenes
@@ -27,7 +27,13 @@ const BASE_TIMESTEP = 1 / 60;
 
 export async function getPhysicsWorld(): Promise<RAPIER.World> {
   await initRapier();
-  world ??= new RAPIER.World({ x: 0, y: 0, z: 0 });
+  if (!world) {
+    world = new RAPIER.World({ x: 0, y: 0, z: 0 });
+    // Half of rapier's default 4. Dense clusters spend most of the step in
+    // the contact solver; piles get slightly softer in exchange for ~40% off
+    // that cost — the right trade for a visualizer.
+    world.numSolverIterations = 2;
+  }
   return world;
 }
 
@@ -39,8 +45,22 @@ export function stepPhysics(timescale: number, gravityY: number): void {
   world.step();
 }
 
-export function physicsStats(): { bodies: number; colliders: number } {
-  return world
-    ? { bodies: world.bodies.len(), colliders: world.colliders.len() }
-    : { bodies: 0, colliders: 0 };
+// `active` = enabled AND awake — what the solver actually chews on. bodies.len()
+// counts the pre-created disabled pool slots too, which is why total counts sit
+// flat while the real workload ramps. The sweep is a per-body wasm call over
+// every slot, so it's refreshed every 15 frames, not every frame.
+let activeCache = 0;
+let activeTtl = 0;
+
+export function physicsStats(): { bodies: number; colliders: number; active: number } {
+  if (!world) return { bodies: 0, colliders: 0, active: 0 };
+  if (--activeTtl <= 0) {
+    activeTtl = 15;
+    let n = 0;
+    world.bodies.forEach((b) => {
+      if (b.isEnabled() && !b.isSleeping()) n++;
+    });
+    activeCache = n;
+  }
+  return { bodies: world.bodies.len(), colliders: world.colliders.len(), active: activeCache };
 }

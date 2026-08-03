@@ -1,11 +1,11 @@
-import { AmbientLight, DirectionalLight, Scene, Vector3 } from "three";
+import { AmbientLight, DirectionalLight, Vector3 } from "three";
 import { createSceneAndCamera } from "./render/Scene";
 import { CameraRig } from "./render/CameraRig";
 import { PostStack } from "./render/post/PostStack";
 import { buildPostEffects } from "./render/post";
 import { FeatureStore } from "./store/FeatureStore";
 import { PerfOverlay } from "./ui/PerfOverlay";
-import { ComponentManager } from "./render/components/ComponentManager";
+import { ComponentManager, type SceneColumnHost } from "./render/components/ComponentManager";
 import { COMPONENTS } from "./render/components";
 import { stepPhysics, physicsStats } from "./render/components/physics";
 import { snapshotCanvas } from "./render/thumbnail";
@@ -14,6 +14,7 @@ import { shTween } from "./render/orbital/ShTween";
 
 import { Modulator } from "./params/Modulator";
 import { PresetStore } from "./params/PresetStore";
+import { presetTween } from "./params/PresetTween";
 import { addPresetSection } from "./params/PresetSection";
 import { bindParam, type ParamProxyRegistry } from "./params/bindParam";
 import type { ParamStore } from "./params/ParamStore";
@@ -86,8 +87,9 @@ export class App {
   private cameraUnsub: (() => void) | null = null;
   // Set by captureThumbnail(); the RAF loop resolves it after the next frame.
   private thumbRequest: ((dataUrl: string) => void) | null = null;
+  // Last completed frame's main-thread render time (renderAsync start → done).
+  private renderMs = NaN;
   private directionalLight!: DirectionalLight;
-  private scene!: Scene;
 
   constructor(private deps: AppDeps) {}
 
@@ -95,15 +97,18 @@ export class App {
     const { renderer, workletNode, paramStore, audioContext } = this.deps;
 
     const { scene, camera } = createSceneAndCamera();
-    this.scene = scene;
 
     // Direction matches the lightDir the component materials hardcoded before
-    // they went lit: 0.7 directional + 0.3 ambient reproduces the old
-    // hand-rolled `ndotl*0.7 + 0.3` lambert exactly, so the look is
-    // continuous. Toggle adds/removes from scene in the bindCameraUI handler.
-    this.directionalLight = new DirectionalLight(0xffffff, 0.7);
+    // they went lit, so the look is continuous. The light stays in the scene
+    // permanently even at intensity 0: r170's WebGPU renderer doesn't reliably
+    // rebuild existing pipelines when a light is added/removed at runtime, so
+    // brightness only ever moves the intensity uniform — see bindCameraUI.
+    this.directionalLight = new DirectionalLight(
+      0xffffff,
+      paramStore.get("light.directional.intensity") as number,
+    );
     this.directionalLight.position.set(4.08, 8.66, 3.06);
-    this.directionalLight.castShadow = true;
+    this.directionalLight.castShadow = this.directionalLight.intensity > 0;
     const shadow = this.directionalLight.shadow;
     shadow.mapSize.set(2048, 2048);
     // Ortho box sized to the play area (CONTAINER_HALF/zone scale ~ a few
@@ -117,9 +122,7 @@ export class App {
     // Curved instanced surfaces (spheres, capsules) acne under plain depth
     // bias; normal bias pushes samples along the surface normal instead.
     shadow.normalBias = 0.02;
-    if (paramStore.get("light.directional.enabled") as boolean) {
-      scene.add(this.directionalLight);
-    }
+    scene.add(this.directionalLight);
     // Always on — the lit materials' shadow/ambient floor. Without it,
     // toggling the directional light off would black out every lit mesh.
     scene.add(new AmbientLight(0xffffff, 0.3));
@@ -245,6 +248,7 @@ export class App {
       this.rig.update(dt);
       const t1 = performance.now();
       shTween.tick(dt, this.deps.paramStore);
+      presetTween.tick(dt, this.deps.paramStore);
       this.modulator.tick();
       const t2 = performance.now();
       // Single step for the shared world, before any component reads a body
@@ -257,6 +261,14 @@ export class App {
       this.components.update();
       const t4 = performance.now();
       const frame = this.postStack.renderAsync();
+      // renderAsync suspends at its first await, so nearly all renderer CPU
+      // work (node eval, pipeline binding, encoding — scene, shadow AND post
+      // passes) runs in the promise continuation after this callback returns.
+      // Time it to completion; the sample below reports last frame's value
+      // (one frame stale, EMA'd anyway). Includes queue-submit, not GPU wait.
+      void frame.then(() => {
+        this.renderMs = performance.now() - t4;
+      });
       // A WebGPU canvas keeps no preserved drawing buffer, so a thumbnail has
       // to be read right after the frame lands — not whenever the button was
       // clicked, which would sample a black canvas.
@@ -265,7 +277,6 @@ export class App {
         this.thumbRequest = null;
         void frame.then(() => pending(snapshotCanvas(renderer.domElement)));
       }
-      const t5 = performance.now();
 
       const dsp = this.store.get("dspPerf");
       const phys = physicsStats();
@@ -274,11 +285,12 @@ export class App {
         cameraMs: t1 - t0,
         physicsMs: t3 - t2,
         componentsMs: t2 - t1 + (t4 - t3),
-        submitMs: t5 - t4,
+        renderMs: this.renderMs,
         analysisMs: dsp.length > 0 ? dsp[0] : NaN,
         analysisHz: dsp.length > 1 ? dsp[1] : NaN,
         bodies: phys.bodies,
         colliders: phys.colliders,
+        active: phys.active,
         now,
       });
 
@@ -287,11 +299,16 @@ export class App {
     this.rafHandle = requestAnimationFrame(loop);
   }
 
-  bindUI(parent: import("tweakpane").FolderApi): void {
+  // `scenes` is the toggle column; each enabled scene's params get their own
+  // column from `host`.
+  bindUI(scenes: FolderApi, host: SceneColumnHost): void {
+    // Scene toggles first — that column is the index into everything else.
+    this.components.bindUI(scenes, host, this.modulator, this.presets);
+
     // Every physics component shares one world, so timescale and gravity are
-    // global — one folder above the per-scene ones rather than a copy each.
+    // global — one folder under the toggles rather than a copy per scene.
     const store = this.deps.paramStore;
-    const folder = parent.addFolder({ title: "Physics", expanded: true });
+    const folder = scenes.addFolder({ title: "Physics", expanded: true });
     const proxies: ParamProxyRegistry = new Map();
     for (const key of ["physics.timescale", "physics.gravity"]) {
       const schema = store.schemaFor(key);
@@ -309,8 +326,6 @@ export class App {
     this.presetSections.push(
       addPresetSection(folder, this.presets, { id: "physics", prefixes: ["physics"] }),
     );
-
-    this.components.bindUI(parent, this.modulator, this.presets);
   }
 
   // System presets: every param and every modulation in one snapshot, with a
@@ -344,7 +359,7 @@ export class App {
 
     const fovSchema = store.schemaFor("camera.fov");
     const presetSchema = store.schemaFor("camera.preset");
-    const lightSchema = store.schemaFor("light.directional.enabled");
+    const lightSchema = store.schemaFor("light.directional.intensity");
     if (!fovSchema || !presetSchema || !lightSchema) {
       throw new Error("bindCameraUI: required schemas missing");
     }
@@ -380,8 +395,8 @@ export class App {
 
     // Side-effects subscriber. Continuous modulatable keys (camera.fov,
     // camera.rotate) write through on every notify so the modulator can
-    // drive them. preset (discrete) and light (boolean) are not
-    // modulatable; gated on source==="user" defensively.
+    // drive them. preset (discrete) is not modulatable; gated on
+    // source==="user" defensively.
     this.cameraUnsub = store.subscribe((key, value, source) => {
       if (key === "camera.fov" && typeof value === "number") {
         camera.fov = value;
@@ -393,9 +408,13 @@ export class App {
         this.rig.setAutorotate(value * ROTATE_DEG_PER_UNIT);
       } else if (key.startsWith("camera.swim.")) {
         applySwim();
-      } else if (key === "light.directional.enabled" && typeof value === "boolean" && source === "user") {
-        if (value) this.scene.add(this.directionalLight);
-        else this.scene.remove(this.directionalLight);
+      } else if (key === "light.directional.intensity" && typeof value === "number") {
+        // Writes through on every notify (like camera.fov) so the modulator
+        // can drive brightness. At 0 the shadow pass is disabled too — no
+        // point encoding + sampling a shadow map that contributes nothing.
+        // Flipping castShadow rebuilds pipelines (cached after first flip).
+        this.directionalLight.intensity = value;
+        this.directionalLight.castShadow = value > 0;
       }
       // Widget sync rides along on the same subscription. Gated on
       // source==='user' so per-frame modulator notifies don't jitter the UI.

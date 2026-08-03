@@ -1,4 +1,4 @@
-import type { FolderApi } from "tweakpane";
+import type { FolderApi, Pane } from "tweakpane";
 import type { Component, ComponentClass, ComponentDeps } from "./Component";
 import { Modulator } from "../../params/Modulator";
 import { bindParam, bindTrigger, type ParamProxyRegistry } from "../../params/bindParam";
@@ -14,6 +14,13 @@ interface Slot {
   paramsBag: Record<string, number> | null;
   instance: Component | null;
   enabledKey: string;
+}
+
+// Supplies a panel per enabled scene. ParamPanel implements it, dropping the
+// panel wherever the user last dragged that scene (or a column of its own the
+// first time it appears).
+export interface SceneColumnHost {
+  addScenePanel(id: string): { pane: Pane; dispose(): void };
 }
 
 export class ComponentManager {
@@ -76,35 +83,72 @@ export class ComponentManager {
   // Add one tweakpane folder per component: enable checkbox first, then
   // (if applicable) one slider per param bound to the stable bag. Must
   // be called AFTER start() — slots are populated there.
-  bindUI(parent: FolderApi, modulator: Modulator, presets: PresetStore): void {
+  // `toggles` gets one checkbox per component — that's the whole Scenes column.
+  // Each ENABLED component's params then live in their own column, built by
+  // `host` on enable and torn down on disable, so two busy scenes sit side by
+  // side instead of stacking into one scrolling column.
+  bindUI(
+    toggles: FolderApi,
+    host: SceneColumnHost,
+    modulator: Modulator,
+    presets: PresetStore,
+  ): void {
     const { paramStore } = this.deps;
 
     for (const slot of this.slots) {
-      const enabled = paramStore.get(slot.enabledKey) === true;
-      const folder = parent.addFolder({ title: slot.cls.label, expanded: enabled });
-      this.paneTeardowns.push(folder);
-
-      const enabledProxy: { enabled: boolean } = { enabled };
-      const enabledBinding = folder.addBinding(enabledProxy, "enabled", {
-        label: "enabled",
+      const enabledProxy = { enabled: paramStore.get(slot.enabledKey) === true };
+      const binding = toggles.addBinding(enabledProxy, "enabled", {
+        label: slot.cls.label,
       });
-      enabledBinding.on("change", (e: { value: boolean }) => {
+      binding.on("change", (e: { value: boolean }) => {
         paramStore.set(slot.enabledKey, e.value);
       });
-      // Mirror external enable changes (e.g. from `Reset to defaults`)
-      // back into the checkbox UI, and collapse the folder when a component
-      // is disabled so disabled scenes don't clutter the panel.
-      const unsub = paramStore.subscribe((key, value) => {
-        if (key === slot.enabledKey && typeof value === "boolean") {
-          if (enabledProxy.enabled !== value) {
-            enabledProxy.enabled = value;
-            folder.refresh();
-          }
-          folder.expanded = value;
-        }
-      });
-      this.paneTeardowns.push({ dispose: unsub });
 
+      let panel: { dispose(): void } | null = null;
+      const sync = (on: boolean) => {
+        if (on && !panel) panel = this.buildPanel(slot, host, modulator, presets);
+        else if (!on && panel) {
+          panel.dispose();
+          panel = null;
+        }
+      };
+      sync(enabledProxy.enabled);
+
+      // Mirror external enable changes (e.g. a preset load or `Reset to
+      // defaults`) into the checkbox, and build/tear down the column with them.
+      const unsub = paramStore.subscribe((key, value) => {
+        if (key !== slot.enabledKey || typeof value !== "boolean") return;
+        if (enabledProxy.enabled !== value) {
+          enabledProxy.enabled = value;
+          toggles.refresh();
+        }
+        sync(value);
+      });
+      this.paneTeardowns.push({
+        dispose: () => {
+          unsub();
+          panel?.dispose();
+          panel = null;
+        },
+      });
+    }
+  }
+
+  // One scene's column: its own pane, one folder, and everything that used to
+  // live in the shared Scenes column. Returned handle tears the whole column
+  // back out.
+  private buildPanel(
+    slot: Slot,
+    host: SceneColumnHost,
+    modulator: Modulator,
+    presets: PresetStore,
+  ): { dispose(): void } {
+    const { paramStore } = this.deps;
+    const column = host.addScenePanel(slot.cls.id);
+    const folder = column.pane.addFolder({ title: slot.cls.label, expanded: true });
+    const teardowns: Array<{ dispose: () => void }> = [];
+
+    {
       // Per-component reset button. Only touches THIS component's params;
       // does not reset the enabled flag or any other component's params.
       // Setting each key through paramStore.set() flows through the mirror
@@ -141,11 +185,11 @@ export class ComponentManager {
         }
       }
 
-      if (!slot.paramsBag) continue;
-      // Slider/dropdown bindings are not pushed into paneTeardowns
-      // explicitly; tweakpane's folder.dispose() cascades to child
-      // bindings and their change listeners, and the folder IS in
-      // paneTeardowns.
+      if (!slot.paramsBag) {
+        return { dispose: () => column.dispose() };
+      }
+      // Slider/dropdown bindings need no explicit teardown: disposing the
+      // column disposes its pane, which cascades to every folder and binding.
       const allKeys = new Set<string>([
         ...Object.keys(slot.cls.paramOpts ?? {}),
         ...Object.keys(slot.cls.paramDefaults ?? {}),
@@ -169,16 +213,21 @@ export class ComponentManager {
         refresh();
         folder.refresh();
       });
-      this.paneTeardowns.push({ dispose: refreshUnsub });
+      teardowns.push({ dispose: refreshUnsub });
 
       // Added last so the collapsible Presets section sits at the bottom of the
       // module. Scoped to the component's param prefix, so it captures exactly
       // the params + modulations bound above.
       const prefix = slot.cls.paramPrefix ?? slot.cls.id;
-      this.paneTeardowns.push(
-        addPresetSection(folder, presets, { id: prefix, prefixes: [prefix] }),
-      );
+      teardowns.push(addPresetSection(folder, presets, { id: prefix, prefixes: [prefix] }));
     }
+
+    return {
+      dispose: () => {
+        for (const t of teardowns) t.dispose();
+        column.dispose();
+      },
+    };
   }
 
   // No-op after dispose() (slots cleared); safe to call from a paused

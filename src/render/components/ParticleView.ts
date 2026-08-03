@@ -8,7 +8,7 @@ import {
 } from "three";
 import { MeshLambertNodeMaterial } from "three/webgpu";
 import { vec3, vec4, instancedBufferAttribute } from "three/tsl";
-import RAPIER from "@dimforge/rapier3d-compat";
+import RAPIER from "@dimforge/rapier3d-simd-compat";
 import { createCurlNoise } from "../curl-noise";
 import { getPhysicsWorld } from "./physics";
 import type { Component, ComponentDeps } from "./Component";

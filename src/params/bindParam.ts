@@ -313,20 +313,23 @@ function ensureParamCss(): void {
   height: 15px; padding: 0; text-align: right; font-size: 10px;
   background: transparent; box-shadow: none; border-radius: 0;
 }
-/* Sits on the slider line, not centered across both lines. */
+/* One knob for everything modulation-tinted. */
+:root { --mod-accent: #f5a623; }
+/* Glyph only — no fill, no border. Sits on the slider line, not centered
+   across both lines of the row. */
 .mod-btn {
   position: absolute; right: 2px; bottom: 2px;
-  width: 16px; height: 16px; padding: 0; line-height: 14px;
-  font-size: 12px; text-align: center;
-  background: #2a2a2a; color: #888; border: 1px solid #444; border-radius: 3px;
+  width: 16px; height: 16px; padding: 0; line-height: 16px;
+  font-size: 13px; text-align: center;
+  background: none; color: #777; border: none; border-radius: 0;
   cursor: pointer; z-index: 2;
 }
-.mod-btn:hover { color: #ccc; border-color: #666; }
-.mod-btn.active { color: #1ea7e1; border-color: #1ea7e1; }
-/* A param row with a modulation hooked up: accent-blue slider fill bar. Label
-   and value text keep their normal color (only .tp-sldv_k::before is tinted,
-   not --in-fg which also colors the number text). */
-.modulated .tp-sldv_k::before { background-color: #1ea7e1; }
+.mod-btn:hover { color: #fff; }
+.mod-btn.active { color: var(--mod-accent); }
+/* A param row with a modulation hooked up: accent-tinted slider fill bar.
+   Label and value text keep their normal color (only .tp-sldv_k::before is
+   tinted, not --in-fg which also colors the number text). */
+.modulated .tp-sldv_k::before { background-color: var(--mod-accent); }
 /* Trigger action buttons: gray outline, no fill. Flash filled on fire and fade
    back (the envelope) via the trig-flash animation. Selector is .tp-btnv_b.trig-btn
    (specificity beats tweakpane's .tp-btnv_b) so we avoid !important — an
