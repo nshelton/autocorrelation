@@ -71,7 +71,7 @@ export class DofEffect implements PostEffect {
   build(input: ShaderNodeObject<Node>, ctx: PassCtx): ShaderNodeObject<Node> {
     this.camera = ctx.camera;
     return bokeh(
-      input, ctx.sceneViewZ,
+      input, ctx.sceneViewZ, ctx.sceneDepth,
       this.focusU, this.apertureU,
       this.bladesU, this.rotationU, this.boostU,
     ) as ShaderNodeObject<Node>;

@@ -1,4 +1,4 @@
-import { Fn, uniform, vec2, vec4, float, fract, dot, frameId, screenCoordinate } from "three/tsl";
+import { Fn, uniform, vec2, vec4, float, hash, texture, frameId, screenCoordinate } from "three/tsl";
 import type { ShaderNodeObject } from "three/tsl";
 import type { Node } from "three/webgpu";
 import type { FolderApi } from "tweakpane";
@@ -6,16 +6,13 @@ import type { PostEffect, PassCtx } from "../PostEffect";
 import type { ParamStore } from "../../../params/ParamStore";
 import type { Modulator } from "../../../params/Modulator";
 import type { ParamProxyRegistry } from "../../../params/bindParam";
+import { getBlueNoiseTexture, BLUE_NOISE_SIZE } from "../blueNoise";
 
-// Film grain via Interleaved Gradient Noise (Jorge Jimenez, COD: Advanced
-// Warfare). IGN is a single-hash formula that produces a noise pattern
-// visually indistinguishable from real blue noise for grain purposes — no
-// low-frequency clumping, evenly distributed, very cheap. The per-frame
-// `frameId` shift gives the "film moving" temporal effect; without it the
-// noise pattern would be static.
-//
-// True blue noise would require sampling a precomputed texture; IGN is the
-// industry-standard zero-asset alternative.
+// Film grain sampled from a procedural blue-noise mask (void-and-cluster,
+// see blueNoise.ts) — no clumping, evenly distributed, no baked asset. The
+// mask tiles (RepeatWrapping) and is shifted by a new pseudo-random offset
+// every frame for the "film moving" temporal effect; a static offset would
+// just look like a fixed dither pattern.
 export class GrainEffect implements PostEffect {
   readonly id = "grain";
   readonly label = "Grain";
@@ -37,19 +34,21 @@ export class GrainEffect implements PostEffect {
   }
 
   build(input: ShaderNodeObject<Node>, _ctx: PassCtx): ShaderNodeObject<Node> {
+    const mask = getBlueNoiseTexture();
     return Fn(() => {
-      // Per-pixel coord with per-frame shift. The constants 47 and 17 are
-      // arbitrary primes chosen for maximum decorrelation between frames.
-      const coord = screenCoordinate.xy
-        .mul(this.scaleU)
-        .add(float(frameId).mul(vec2(47.0, 17.0)));
-      // IGN: fract(52.98... * fract(dot(coord, magic_vec2))).
-      const noise = fract(
-        float(52.9829189).mul(fract(dot(coord, vec2(0.06711056, 0.00583715)))),
-      );
-      // Center around 0; monochrome grain applied to all RGB channels equally.
-      const g = noise.sub(0.5).mul(this.strengthU);
-      return (input as ShaderNodeObject<Node>).add(vec4(g, g, g, 0.0));
+      // New pseudo-random shift per frame; the mask wraps (RepeatWrapping)
+      // so any shift lands on a valid texel.
+      const shift = vec2(hash(float(frameId)), hash(float(frameId).add(1.0)))
+        .mul(float(BLUE_NOISE_SIZE));
+      const uv = screenCoordinate.xy.div(this.scaleU).add(shift).div(float(BLUE_NOISE_SIZE));
+      // Multiplicative, not additive: Grain runs after tonemap, in clipped
+      // [0,1] display space. Additive noise clips asymmetrically near black/
+      // white (e.g. a near-black pixel's negative excursions clip to 0 but
+      // its positive ones survive), biasing the image lighter overall on a
+      // mostly-dark scene. Scaling by the pixel's own value keeps
+      // E[input * (1 + g)] == input exactly, and black stays black.
+      const gain = texture(mask, uv).r.sub(0.5).mul(this.strengthU).add(1.0);
+      return (input as ShaderNodeObject<Node>).mul(vec4(gain, gain, gain, 1.0));
     })() as ShaderNodeObject<Node>;
   }
 

@@ -21,6 +21,7 @@ export class LensEffect implements PostEffect {
     chromatic: { value: number };
     vignetteStrength: { value: number };
     vignetteRadius: { value: number };
+    zoom: { value: number };
   } | null = null;
   private store: ParamStore | null = null;
   private unsub: (() => void) | null = null;
@@ -33,6 +34,7 @@ export class LensEffect implements PostEffect {
       else if (key === "post.lens.chromatic")      this.lensNode.chromatic.value = value;
       else if (key === "post.lens.vignette")       this.lensNode.vignetteStrength.value = value;
       else if (key === "post.lens.vignetteRadius") this.lensNode.vignetteRadius.value = value;
+      else if (key === "post.lens.zoom")           this.lensNode.zoom.value = value;
     });
   }
 
@@ -42,11 +44,13 @@ export class LensEffect implements PostEffect {
     const chromatic      = s.get("post.lens.chromatic")      as number;
     const vignette       = s.get("post.lens.vignette")       as number;
     const vignetteRadius = s.get("post.lens.vignetteRadius") as number;
-    const node = lens(input, distortion, chromatic, vignette, vignetteRadius) as ShaderNodeObject<Node> & {
+    const zoom = s.get("post.lens.zoom") as number;
+    const node = lens(input, distortion, chromatic, vignette, vignetteRadius, zoom) as ShaderNodeObject<Node> & {
       distortion: { value: number };
       chromatic: { value: number };
       vignetteStrength: { value: number };
       vignetteRadius: { value: number };
+      zoom: { value: number };
     };
     this.lensNode = node;
     return node;
@@ -64,6 +68,7 @@ export class LensEffect implements PostEffect {
       chromatic:      store.get("post.lens.chromatic")      as number,
       vignette:       store.get("post.lens.vignette")       as number,
       vignetteRadius: store.get("post.lens.vignetteRadius") as number,
+      zoom:           store.get("post.lens.zoom")           as number,
     };
     folder
       .addBinding(b, "enabled", { label: "Enabled" })
@@ -80,6 +85,9 @@ export class LensEffect implements PostEffect {
     folder
       .addBinding(b, "vignetteRadius", { label: "Vig. radius", min: 0, max: 1, step: 0.01 })
       .on("change", (e: { value: number }) => store.set("post.lens.vignetteRadius", e.value));
+    folder
+      .addBinding(b, "zoom", { label: "Zoom", min: 0, max: 0.5, step: 0.01 })
+      .on("change", (e: { value: number }) => store.set("post.lens.zoom", e.value));
     // The widgets bind `b`, which only ever moves on user input — re-pull it so
     // programmatic writes (preset load, reset) show up in the panel.
     proxies.set("post.lens.enabled", () => { b.enabled = store.get("post.lens.enabled") as boolean; });
@@ -87,6 +95,7 @@ export class LensEffect implements PostEffect {
     proxies.set("post.lens.chromatic", () => { b.chromatic = store.get("post.lens.chromatic") as number; });
     proxies.set("post.lens.vignette", () => { b.vignette = store.get("post.lens.vignette") as number; });
     proxies.set("post.lens.vignetteRadius", () => { b.vignetteRadius = store.get("post.lens.vignetteRadius") as number; });
+    proxies.set("post.lens.zoom", () => { b.zoom = store.get("post.lens.zoom") as number; });
   }
 
   dispose(): void {

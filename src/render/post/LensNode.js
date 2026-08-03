@@ -5,6 +5,9 @@
 //
 // distortion > 0  → barrel  (corners pushed outward)
 // distortion < 0  → pincushion
+// zoom = scales the sample offset inward before distortion, i.e. zooms the
+// source image in at the center. Use it to crop out the edge artifacts
+// (empty/repeated texels) that barrel distortion pulls in from outside [0,1].
 // chromatic = uv-fraction offset between R/G/B samples (radial; stronger at edges)
 // vignetteStrength = corner darkening 0..1
 // vignetteRadius = where darkening begins (radial distance, 0..1; 1 = none)
@@ -14,13 +17,14 @@ import { TempNode, nodeObject, Fn, uv, uniform, vec2, vec3, vec4, float, smooths
 class LensNode extends TempNode {
   static get type() { return 'LensNode'; }
 
-  constructor(textureNode, distortion = 0, chromatic = 0, vignetteStrength = 0, vignetteRadius = 0.4) {
+  constructor(textureNode, distortion = 0, chromatic = 0, vignetteStrength = 0, vignetteRadius = 0.4, zoom = 0) {
     super('vec4');
     this.textureNode = textureNode;
     this.distortion = uniform(distortion);
     this.chromatic = uniform(chromatic);
     this.vignetteStrength = uniform(vignetteStrength);
     this.vignetteRadius = uniform(vignetteRadius);
+    this.zoom = uniform(zoom);
   }
 
   setup() {
@@ -34,7 +38,10 @@ class LensNode extends TempNode {
 
       // Barrel/pincushion: scale offset by (1 + k*r^2).
       const distort = float(1.0).add(r2.mul(this.distortion));
-      const warped = center.add(offset.mul(distort));
+      // Zoom scales the final sample offset down (post-distortion, r2 stays
+      // screen-space so vignette/CA below aren't affected by zoom level) —
+      // crops out the edge artifacts barrel distortion pulls in from outside [0,1].
+      const warped = center.add(offset.mul(distort).mul(float(1.0).sub(this.zoom)));
 
       // Radial chromatic aberration: R sampled outward, B inward, G centered.
       // Magnitude scales with offset (so center has zero CA, corners have most).
@@ -57,5 +64,5 @@ class LensNode extends TempNode {
 
 export default LensNode;
 
-export const lens = (node, distortion, chromatic, vignetteStrength, vignetteRadius) =>
-  nodeObject(new LensNode(convertToTexture(node), distortion, chromatic, vignetteStrength, vignetteRadius));
+export const lens = (node, distortion, chromatic, vignetteStrength, vignetteRadius, zoom) =>
+  nodeObject(new LensNode(convertToTexture(node), distortion, chromatic, vignetteStrength, vignetteRadius, zoom));

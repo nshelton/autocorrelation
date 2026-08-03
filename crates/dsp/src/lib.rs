@@ -122,11 +122,12 @@ impl Dsp {
     }
 
     /// Set a tunable param. Unknown keys are silently ignored.
-    /// Recognized keys: "smoothingTauSecs", "onsetSmoothingTauSecs",
-    /// "teaTauSecs", "teaSigma", "acfSmoothingSigma", "dbFloor", "phaseLock",
-    /// "autoGain".
+    /// Recognized keys: "windowFall", "smoothingTauSecs",
+    /// "onsetSmoothingTauSecs", "teaTauSecs", "acfSmoothingSigma", "acfDecay",
+    /// "dbFloor", "phaseLock", "autoGain".
     pub fn set_param(&mut self, key: &str, value: f32) {
         match key {
+            "windowFall" => self.spectrum.set_window_fall(value.max(0.0) as usize),
             "smoothingTauSecs" => self.spectrum.set_smoothing_tau(value, self.dt),
             "onsetSmoothingTauSecs" => self.spectrum.set_onset_release_tau(value, self.dt),
             "teaTauSecs" => self.beat.set_tea_tau(value, self.dt),

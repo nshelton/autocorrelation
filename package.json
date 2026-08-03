@@ -22,7 +22,7 @@
     "vitest": "^2.0.0"
   },
   "dependencies": {
-    "@dimforge/rapier3d-simd-compat": "^0.19.3",
+    "@dimforge/rapier3d-compat": "^0.19.3",
     "@types/three": "^0.170.0",
     "simplex-noise": "^4.0.3",
     "three": "^0.170.0",

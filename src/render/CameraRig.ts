@@ -12,8 +12,6 @@ export interface GoToOptions {
   easing?: (t: number) => number;
 }
 
-export type ProceduralController = (dt: number, camera: PerspectiveCamera) => void;
-
 export interface SwimConfig {
   enabled: boolean;
   posRoughness: number;   // time rate of the position wander (rad/s base freq)
@@ -58,7 +56,6 @@ export class CameraRig {
   private presets = new Map<string, CameraPose>();
   private currentTarget = new Vector3();
   private tween: ActiveTween | null = null;
-  private procedural: ProceduralController | null = null;
 
   // Additive "swim" wander layered on top of the base pose each frame.
   // swimPos holds the offset applied last frame so we can strip it before the
@@ -100,7 +97,6 @@ export class CameraRig {
       return;
     }
 
-    this.procedural = null;
     this.controls.enabled = false;
     const from: CameraPose = {
       position: this.camera.position.clone(),
@@ -120,13 +116,20 @@ export class CameraRig {
     });
   }
 
-  setProceduralController(fn: ProceduralController | null): void {
-    this.procedural = fn;
-    this.controls.enabled = fn === null;
-  }
-
   setSwim(cfg: SwimConfig): void {
     this.swim = cfg;
+  }
+
+  // Rescales the offset from currentTarget to camera.position to `distance`,
+  // preserving the current orbit direction. Strips swimPos first (like
+  // getPose) so a live swim wobble doesn't get baked into the new radius —
+  // OrbitControls picks up the new position as ground truth on its next
+  // update(), same as applyPose/tween writes.
+  setDistance(distance: number): void {
+    const dir = this.camera.position.clone().sub(this.swimPos).sub(this.currentTarget);
+    if (dir.lengthSq() < 1e-8) dir.set(0, 0, 1);
+    else dir.normalize();
+    this.camera.position.copy(this.currentTarget).addScaledVector(dir, distance);
   }
 
   setAutorotate(degPerSec: number): void {
@@ -185,14 +188,9 @@ export class CameraRig {
         const resolve = this.tween.resolve;
         this.tween = null;
         this.controls.target.copy(this.currentTarget);
-        this.controls.enabled = this.procedural === null;
+        this.controls.enabled = true;
         resolve();
       }
-      return;
-    }
-
-    if (this.procedural) {
-      this.procedural(dt, this.camera);
       return;
     }
 
@@ -229,6 +227,6 @@ export class CameraRig {
       this.camera.updateProjectionMatrix();
     }
     this.controls.target.copy(pose.target);
-    this.controls.enabled = this.procedural === null;
+    this.controls.enabled = true;
   }
 }

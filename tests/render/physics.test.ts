@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import RAPIER from "@dimforge/rapier3d-simd-compat";
+import RAPIER from "@dimforge/rapier3d-compat";
 import { getPhysicsWorld, stepPhysics } from "../../src/render/components/physics";
 
 describe("shared physics world", () => {

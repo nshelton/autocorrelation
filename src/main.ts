@@ -197,10 +197,11 @@ startTab.addEventListener("click", async () => {
   await onStart(createTabSource);
 });
 
-// Keyboard shortcuts before start: T → test signal (440 Hz), any other key → mic.
+// Any key before start → mic. (There is no test-signal source to bind to yet;
+// AudioSource only exports the mic and tab factories.)
 window.addEventListener(
   "keydown",
-  async (e) => {
+  async () => {
     if (started) return;
     const { createMicSource } = await import("./audio/AudioSource");
     await onStart(createMicSource);

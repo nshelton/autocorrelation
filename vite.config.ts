@@ -109,6 +109,19 @@ export default defineConfig({
     // "three/examples/*" pass through unchanged.
     alias: [{ find: /^three$/, replacement: "three/webgpu" }],
   },
+  build: {
+    rollupOptions: {
+      output: {
+        // Split the two big vendored blobs out of the app chunk. Same total
+        // bytes, but three and rapier change only on a dependency bump, so a
+        // normal app edit no longer invalidates ~3 MB of cache.
+        manualChunks(id: string) {
+          if (id.includes("node_modules/@dimforge/")) return "rapier";
+          if (id.includes("node_modules/three/")) return "three";
+        },
+      },
+    },
+  },
   server: {
     port: 5173,
     headers: {

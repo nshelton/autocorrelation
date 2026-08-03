@@ -48,7 +48,6 @@ export class BeatGridMarkers {
 
     const period = beatGrid[0];
     const phase = beatGrid[1];
-    const score = beatGrid[2] ?? 1;
     const lineCount = this.requiredLineCount(period, rmsHistoryLength);
 
     if (lineCount > this.maxLines) this.createLines(lineCount);
@@ -66,8 +65,6 @@ export class BeatGridMarkers {
     }
 
     const newest = rmsHistoryLength - 1;
-    // const brightness = Math.max(0.15, Math.min(1, Number.isNaN(score) ? 1 : score));
-    const brightness = 1;
     let visible = 0;
 
     for (let k = 0; k < lineCount; k++) {
@@ -75,7 +72,9 @@ export class BeatGridMarkers {
       if (idx < 0 || idx > newest) continue;
 
       const x = idx / newest;
-      this.writeLine(visible, x, brightness);
+      // Flat brightness. beatGrid[2] (score) used to modulate this; it washed
+      // the grid out at low confidence, so every line is drawn at full.
+      this.writeLine(visible, x, 1);
       visible++;
     }
 

@@ -54,6 +54,7 @@ export const postSchemas: ParamSchema[] = [
   { key: "post.lens.chromatic",      label: "Lens chromatic",   kind: "continuous", min: 0.0,  max: 0.05, step: 0.001, default: 0.005, reconfig: false },
   { key: "post.lens.vignette",       label: "Lens vignette",    kind: "continuous", min: 0.0,  max: 1.0,  step: 0.01,  default: 0.5,   reconfig: false },
   { key: "post.lens.vignetteRadius", label: "Lens vig. radius", kind: "continuous", min: 0.0,  max: 1.0,  step: 0.01,  default: 0.4,   reconfig: false },
+  { key: "post.lens.zoom",           label: "Lens zoom",        kind: "continuous", min: 0.0,  max: 0.5,  step: 0.01,  default: 0.0,   reconfig: false },
 
   // Grain: film grain via Interleaved Gradient Noise (Jimenez, COD:AW).
   // Visually approximates blue noise; per-frame `frameId` shift gives temporal motion.

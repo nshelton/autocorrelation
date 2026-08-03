@@ -9,7 +9,7 @@ import {
 import type { MeshStandardNodeMaterial } from "three/webgpu";
 import { makeLitMaterial, releaseLitMaterial } from "./litMaterial";
 import { vec4, uniform } from "three/tsl";
-import RAPIER from "@dimforge/rapier3d-simd-compat";
+import RAPIER from "@dimforge/rapier3d-compat";
 import { getPhysicsWorld } from "./physics";
 import type { Component, ComponentDeps } from "./Component";
 

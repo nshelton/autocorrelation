@@ -28,6 +28,11 @@ export interface FrameSample {
   renderMs: number;
   analysisMs: number; // NaN when no dspPerf yet
   analysisHz: number;
+  // Latency legs, ms. `deliver` = worklet publish → main-thread receipt.
+  // `age` = how old the newest analysis frame was when the scene consumed it
+  // (deliver + RAF wait, plus a whole hop on frames that got no new data).
+  deliverMs: number;
+  ageMs: number;
   bodies: number;
   colliders: number;
   active: number; // enabled + awake — the solver's real workload
@@ -43,6 +48,7 @@ export class PerfOverlay {
   private cpu: LinePlot;
   private phys: LinePlot;
   private dsp: LinePlot;
+  private lat: LinePlot;
   private footer: HTMLDivElement;
   private lastFooter = 0;
 
@@ -103,7 +109,19 @@ export class PerfOverlay {
       series: [{ label: "ms", color: "#3987e5" }],
       autoFloor: 0.1,
     });
-    for (const p of [this.fps, this.gpu, this.cpu, this.phys, this.dsp]) el.appendChild(p.el);
+    // autoFloor 20 keeps the scale steady around one hop period (21 ms at the
+    // default 1024/48k) so a quiet frame doesn't rescale the whole plot.
+    this.lat = new LinePlot({
+      title: "LAT",
+      series: [
+        { label: "deliver", color: "#3987e5" },
+        { label: "age", color: "#d95926" },
+      ],
+      autoFloor: 20,
+      format: (v) => v.toFixed(1),
+    });
+    for (const p of [this.fps, this.gpu, this.cpu, this.phys, this.dsp, this.lat])
+      el.appendChild(p.el);
 
     this.footer = document.createElement("div");
     this.footer.style.cssText =
@@ -123,6 +141,7 @@ export class PerfOverlay {
     this.cpu.push(s.cameraMs, s.physicsMs, s.componentsMs, s.renderMs);
     this.phys.push(s.bodies, s.colliders, s.active);
     this.dsp.push(s.analysisMs);
+    this.lat.push(s.deliverMs, s.ageMs);
     if (Number.isFinite(s.analysisHz)) this.analysisHz = ema(this.analysisHz, s.analysisHz);
 
     if (s.now - this.lastFooter >= FOOTER_INTERVAL_MS) {

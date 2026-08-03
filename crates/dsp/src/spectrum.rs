@@ -12,12 +12,56 @@ const ONSET_SMOOTHING_TAU_SECS_DEFAULT: f32 = 0.05;
 const LOW_BAND_HZ_MAX: f32 = 150.0;
 const MID_BAND_HZ_MAX: f32 = 1500.0;
 
+/// Asymmetric Hann: a rising half-Hann over the first `n - fall` samples, then
+/// a falling half-Hann over the last `fall`. `fall = n/2` is the ordinary
+/// symmetric Hann.
+///
+/// This exists for latency, not for spectral shape. The analysis window is
+/// right-aligned — the newest sample sits at index `n-1`, where a symmetric
+/// Hann weighs ~0 — so a fresh transient contributes nothing to the spectrum
+/// until it has slid `n/2` samples to the center. That taper IS the onset
+/// detection latency (21 ms at n=2048, 48 kHz). Shortening `fall` moves the
+/// peak next to the newest sample instead, so a transient is at near-full
+/// weight the moment it arrives. The cost is a wider mainlobe and higher near
+/// sidelobes — the window stays C¹ at both ends and at the peak, so the
+/// asymptotic rolloff is unchanged.
+///
+/// Both halves have mean 0.5 and mean-square 3/8 whatever their length, so
+/// `sum(w)` and `sum(w²)` — and therefore `mag_scale` and
+/// `parseval_band_scale` — come out the same for every `fall`. Amplitude
+/// calibration is unaffected.
+///
+/// NOTE: at `fall = n/2` this is the *periodic* (DFT-even) Hann, `2πi/n`. The
+/// window this replaced used the symmetric `2πi/(n-1)` form. The periodic form
+/// is the correct one for DFT analysis; the difference is under 1e-5 per sample.
+fn build_window(n: usize, fall: usize) -> Vec<f32> {
+    let fall = fall.clamp(2, n / 2);
+    let rise = n - fall;
+    (0..n)
+        .map(|i| {
+            if i < rise {
+                0.5 - 0.5 * (std::f32::consts::PI * i as f32 / rise as f32).cos()
+            } else {
+                0.5 + 0.5 * (std::f32::consts::PI * (i - rise) as f32 / fall as f32).cos()
+            }
+        })
+        .collect()
+}
+
+/// `(mag_scale, parseval_band_scale)` for a window. Recomputed from the actual
+/// coefficients rather than assumed, so a window shape change can never
+/// silently desync the amplitude calibration.
+fn window_scales(window: &[f32], n: usize) -> (f32, f32) {
+    let energy: f32 = window.iter().map(|w| w * w).sum();
+    (2.0 / window.iter().sum::<f32>(), 2.0 / (n as f32 * energy))
+}
+
 pub struct SpectrumState {
     fft: Arc<dyn RealToComplex<f32>>,
     fft_buffer: Vec<f32>,
     freq_buffer: Vec<Complex<f32>>,
-    hann: Vec<f32>,
-    /// 2/sum(hann). FFT bin magnitude → amplitude-equivalent units.
+    window: Vec<f32>,
+    /// 2/sum(window). FFT bin magnitude → amplitude-equivalent units.
     mag_scale: f32,
     /// Previous frame's per-bin |X|, scaled by `mag_scale`. Used for spectral flux.
     prev_mag: Vec<f32>,
@@ -28,7 +72,7 @@ pub struct SpectrumState {
     onset_envelope: f32,
     low_band_bin_end: usize,
     mid_band_bin_end: usize,
-    /// Parseval scale: 2 / (N · Σ hann²). Maps Σ|X[k]|² over a band → band RMS².
+    /// Parseval scale: 2 / (N · Σ w²). Maps Σ|X[k]|² over a band → band RMS².
     parseval_band_scale: f32,
 }
 
@@ -38,24 +82,18 @@ impl SpectrumState {
         let fft = planner.plan_fft_forward(window_size);
         let freq_buffer = fft.make_output_vec();
         let spectrum_len = freq_buffer.len() - 1;
-        let hann: Vec<f32> = (0..window_size)
-            .map(|i| {
-                0.5 - 0.5
-                    * (2.0 * std::f32::consts::PI * i as f32 / (window_size as f32 - 1.0)).cos()
-            })
-            .collect();
-        let mag_scale = 2.0 / hann.iter().sum::<f32>();
+        // Symmetric by default — same latency as before until `windowFall` moves.
+        let window = build_window(window_size, window_size / 2);
+        let (mag_scale, parseval_band_scale) = window_scales(&window, window_size);
         let smoothing_alpha = 1.0 - (-dt / SMOOTHING_TAU_SECS_DEFAULT).exp();
         let onset_release_retention = (-dt / ONSET_SMOOTHING_TAU_SECS_DEFAULT).exp();
         let low_band_bin_end = bin_for_hz(LOW_BAND_HZ_MAX, sample_rate, window_size);
         let mid_band_bin_end = bin_for_hz(MID_BAND_HZ_MAX, sample_rate, window_size);
-        let hann_energy: f32 = hann.iter().map(|h| h * h).sum();
-        let parseval_band_scale = 2.0 / (window_size as f32 * hann_energy);
         Self {
             fft,
             fft_buffer: vec![0.0; window_size],
             freq_buffer,
-            hann,
+            window,
             mag_scale,
             prev_mag: vec![0.0; spectrum_len],
             smoothing_alpha,
@@ -65,6 +103,16 @@ impl SpectrumState {
             mid_band_bin_end,
             parseval_band_scale,
         }
+    }
+
+    /// Length of the window's falling edge, in samples. Clamped to [2, n/2];
+    /// n/2 is the symmetric Hann. Shorter = lower onset latency, more leakage.
+    pub fn set_window_fall(&mut self, fall: usize) {
+        let n = self.fft_buffer.len();
+        self.window = build_window(n, fall);
+        let (mag, parseval) = window_scales(&self.window, n);
+        self.mag_scale = mag;
+        self.parseval_band_scale = parseval;
     }
 
     pub fn set_smoothing_tau(&mut self, tau_secs: f32, dt: f32) {
@@ -95,7 +143,7 @@ impl SpectrumState {
         let n = input.len().min(window_size);
 
         for i in 0..n {
-            self.fft_buffer[i] = input[i] * self.hann[i];
+            self.fft_buffer[i] = input[i] * self.window[i];
         }
         for i in n..window_size {
             self.fft_buffer[i] = 0.0;
@@ -251,23 +299,120 @@ mod tests {
 
     #[test]
     fn parseval_band_scale_matches_formula() {
-        // parseval_band_scale = 2 / (N · Σ hann²)
+        // parseval_band_scale = 2 / (N · Σ w²). The default window is the
+        // PERIODIC Hann (2πi/n) — see build_window's note.
         let dt = 1024.0_f32 / 48000.0;
         let state = SpectrumState::new(2048, 48000.0, dt);
         let n = 2048usize;
-        let hann_energy: f32 = (0..n)
+        let energy: f32 = (0..n)
             .map(|i| {
-                let h =
-                    0.5 - 0.5 * (2.0 * std::f32::consts::PI * i as f32 / (n as f32 - 1.0)).cos();
+                let h = 0.5 - 0.5 * (2.0 * std::f32::consts::PI * i as f32 / n as f32).cos();
                 h * h
             })
             .sum();
-        let expected = 2.0 / (n as f32 * hann_energy);
+        let expected = 2.0 / (n as f32 * energy);
         assert!(
             (state.parseval_band_scale - expected).abs() < 1e-10,
             "got {}, expected {}",
             state.parseval_band_scale,
             expected
+        );
+    }
+
+    #[test]
+    fn default_window_is_the_symmetric_hann() {
+        let w = build_window(2048, 1024);
+        assert!((w[0] - 0.0).abs() < 1e-6);
+        assert!((w[1024] - 1.0).abs() < 1e-6, "peak at center, got {}", w[1024]);
+        // Symmetric about the peak.
+        for k in 1..1024 {
+            assert!((w[1024 - k] - w[1024 + k]).abs() < 1e-5, "asymmetric at k={}", k);
+        }
+    }
+
+    #[test]
+    fn short_fall_puts_full_weight_next_to_the_newest_sample() {
+        let n = 2048;
+        let fall = 64;
+        let w = build_window(n, fall);
+        // The peak — and therefore the detection latency — moves from n/2 to
+        // `fall` samples from the right edge. That IS the latency win.
+        assert!((w[n - fall] - 1.0).abs() < 1e-6, "peak value {}", w[n - fall]);
+        // A transient one hop old (1024 samples in from the right) used to sit
+        // at full weight; now it's already on the way out, and a BRAND NEW
+        // transient is the one being weighted heavily.
+        assert!(w[n - 1] < 0.01, "newest sample still tapered: {}", w[n - 1]);
+        assert!(w[n - fall / 2] > 0.4, "half a fall in should be substantial");
+        // Ends still touch zero, so the window stays C¹ and the asymptotic
+        // sidelobe rolloff is preserved.
+        assert!(w[0] < 1e-6);
+    }
+
+    #[test]
+    fn amplitude_calibration_is_independent_of_fall() {
+        // Both half-Hanns have mean 0.5 and mean-square 3/8 whatever their
+        // length, so sum(w) and sum(w²) — and every scale derived from them —
+        // must not move when the window shape does.
+        let dt = 1024.0_f32 / 48000.0;
+        let mut state = SpectrumState::new(2048, 48000.0, dt);
+        let (mag0, parseval0) = (state.mag_scale, state.parseval_band_scale);
+        for fall in [512, 256, 128, 64, 32] {
+            state.set_window_fall(fall);
+            assert!(
+                (state.mag_scale - mag0).abs() / mag0 < 1e-4,
+                "mag_scale moved at fall={}: {} vs {}",
+                fall,
+                state.mag_scale,
+                mag0
+            );
+            assert!(
+                (state.parseval_band_scale - parseval0).abs() / parseval0 < 1e-4,
+                "parseval scale moved at fall={}",
+                fall
+            );
+        }
+    }
+
+    #[test]
+    fn window_fall_is_clamped_to_half_the_window() {
+        // Over-large values (the schema default is 2048 at every windowSize)
+        // must land on the symmetric window, not panic on `n - fall`.
+        let w = build_window(512, 99_999);
+        assert_eq!(w.len(), 512);
+        assert!((w[256] - 1.0).abs() < 1e-6);
+        // Degenerate small values are floored, not zero-length.
+        assert_eq!(build_window(512, 0).len(), 512);
+    }
+
+    #[test]
+    fn short_fall_detects_a_transient_a_full_hop_earlier() {
+        // The whole point, end to end: a burst at the very end of the window
+        // (i.e. one that JUST arrived) must produce real flux with a short
+        // fall, and near-nothing with the symmetric window.
+        let dt = 1024.0_f32 / 48000.0;
+        let n = 2048;
+        let mut input = vec![0.0f32; n];
+        for (i, s) in input.iter_mut().enumerate().skip(n - 256) {
+            // Alternating full-scale — broadband, like the LatencyProbe burst.
+            *s = if i % 2 == 0 { 1.0 } else { -1.0 };
+        }
+        let mut spectrum = vec![0.0f32; n / 2 - 1];
+
+        let mut sym = SpectrumState::new(n, 48000.0, dt);
+        sym.process(&vec![0.0; n], &mut spectrum, -100.0);
+        let (_, _, _, flux_sym) = sym.process(&input, &mut spectrum, -100.0);
+
+        let mut asym = SpectrumState::new(n, 48000.0, dt);
+        asym.set_window_fall(64);
+        asym.process(&vec![0.0; n], &mut spectrum, -100.0);
+        let (_, _, _, flux_asym) = asym.process(&input, &mut spectrum, -100.0);
+
+        assert!(
+            flux_asym > flux_sym * 4.0,
+            "short fall should see a just-arrived transient far more strongly: \
+             asym {} vs sym {}",
+            flux_asym,
+            flux_sym
         );
     }
 }

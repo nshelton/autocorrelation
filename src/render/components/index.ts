@@ -1,4 +1,5 @@
 import { DebugView } from "../debug/DebugView";
+import { PointLightScene } from "./PointLight";
 import { BoxView } from "./BoxView";
 import { ParticleView } from "./ParticleView";
 import { OrbitalCloud } from "./OrbitalCloud";
@@ -8,12 +9,14 @@ import { Serpent } from "./Serpent";
 import { Fireflies } from "./Fireflies";
 import { PhysicsBalls } from "./PhysicsBalls";
 import { Grid } from "./Grid";
+import { Tunnel } from "./Tunnel";
 import type { ComponentClass } from "./Component";
 
 // Order = render order in the scene (insertion order). Also drives the
 // order of folders in the tweakpane panel.
 export const COMPONENTS: readonly ComponentClass[] = [
   DebugView,
+  PointLightScene as unknown as ComponentClass,
   BoxView as unknown as ComponentClass,
   ParticleView as unknown as ComponentClass,
   OrbitalCloud as unknown as ComponentClass,
@@ -23,4 +26,5 @@ export const COMPONENTS: readonly ComponentClass[] = [
   Fireflies as unknown as ComponentClass,
   PhysicsBalls as unknown as ComponentClass,
   Grid as unknown as ComponentClass,
+  Tunnel as unknown as ComponentClass,
 ];

@@ -95,10 +95,6 @@ export class ParamStore {
     }
   }
 
-  getAll(): Record<string, ParamValue> {
-    return Object.fromEntries(this.values);
-  }
-
   schemasInOrder(): ParamSchema[] {
     return Array.from(this.schemas.values());
   }

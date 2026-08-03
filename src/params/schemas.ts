@@ -25,6 +25,22 @@ export const analysisSchemas: ParamSchema[] = [
     default: 1024,
     reconfig: false,
   },
+  // Falling-edge length of the analysis window, in samples. Clamped to
+  // windowSize/2 in Rust, which is the symmetric Hann — the default, and
+  // identical to the old fixed window. Shorter puts the window's peak next to
+  // the NEWEST sample instead of the center, cutting ~windowSize/2 samples of
+  // onset-detection latency (21 ms at 2048/48k) at the cost of spectral
+  // leakage. Sweep it against the `L` latency probe; see docs/latency.md.
+  {
+    key: "dsp.windowFall",
+    label: "window fall (samples)",
+    kind: "continuous",
+    min: 32,
+    max: 2048,
+    step: 32,
+    default: 2048,
+    reconfig: false,
+  },
   {
     key: "dsp.smoothingTauSecs",
     label: "fft τ (s)",

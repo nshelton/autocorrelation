@@ -2,6 +2,7 @@ import type { ParamStore } from "./ParamStore";
 
 const HOT_KEYS = [
   "hopSize",
+  "windowFall",
   "smoothingTauSecs",
   "onsetSmoothingTauSecs",
   "dbFloor",

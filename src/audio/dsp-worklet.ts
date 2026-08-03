@@ -6,6 +6,13 @@ type WorkletInbound =
   | { type: "configure"; windowSize: number; rmsHistoryLen: number }
   | { type: "param"; key: string; value: number };
 
+// `performance` isn't guaranteed in AudioWorkletGlobalScope (see perf.rs for
+// the same guard on the Rust side). Where it exists it shares the document's
+// time origin, so the main thread can diff these stamps against its own
+// performance.now() directly.
+const nowMs: () => number =
+  typeof performance !== "undefined" ? () => performance.now() : () => NaN;
+
 class DSPProcessor extends AudioWorkletProcessor {
   private window: Float32Array = new Float32Array(2048);
   private hopCounter = 0;
@@ -14,6 +21,9 @@ class DSPProcessor extends AudioWorkletProcessor {
   private windowSize = 2048;
   private hopSize = 1024;
   private rmsHistoryLen = 512;
+  // Clamped to windowSize/2 in Rust, so the default is symmetric at every
+  // windowSize option (max 4096 → 2048).
+  private windowFall = 2048;
   private smoothingTauSecs = 0.0956;
   private onsetSmoothingTauSecs = 0.05;
   private teaTauSecs = 4.0;
@@ -72,7 +82,8 @@ class DSPProcessor extends AudioWorkletProcessor {
         return;
       }
       // Cache so applyConfigure can re-apply across rebuilds.
-      if (msg.key === "smoothingTauSecs") this.smoothingTauSecs = msg.value;
+      if (msg.key === "windowFall") this.windowFall = msg.value;
+      else if (msg.key === "smoothingTauSecs") this.smoothingTauSecs = msg.value;
       else if (msg.key === "onsetSmoothingTauSecs")
         this.onsetSmoothingTauSecs = msg.value;
       else if (msg.key === "teaTauSecs") this.teaTauSecs = msg.value;
@@ -107,6 +118,7 @@ class DSPProcessor extends AudioWorkletProcessor {
       this.hopSize,
       this.rmsHistoryLen,
     );
+    this.dsp.set_param("windowFall", this.windowFall);
     this.dsp.set_param("smoothingTauSecs", this.smoothingTauSecs);
     this.dsp.set_param("onsetSmoothingTauSecs", this.onsetSmoothingTauSecs);
     this.dsp.set_param("teaTauSecs", this.teaTauSecs);
@@ -147,7 +159,19 @@ class DSPProcessor extends AudioWorkletProcessor {
         buffers[name] = data;
         transferList.push(data.buffer as ArrayBuffer);
       }
-      this.port.postMessage({ type: "features", buffers }, transferList);
+      // Latency instrumentation, two clocks. `t` is the context time of the
+      // NEWEST sample in the window (this quantum's end), so a consumer can
+      // diff it against a scheduled event's context time without leaving the
+      // sample clock. `hopMs` is wall-clock at publish, for the main thread.
+      this.port.postMessage(
+        {
+          type: "features",
+          buffers,
+          t: currentTime + len / sampleRate,
+          hopMs: nowMs(),
+        },
+        transferList,
+      );
       this.hopCounter -= this.hopSize;
     }
 

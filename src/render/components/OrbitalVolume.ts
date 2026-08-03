@@ -31,11 +31,8 @@ const SH_LABELS = [
   "c_3_-3", "c_3_-2", "c_3_-1", "c_3_0", "c_3_1", "c_3_2", "c_3_3",
 ];
 const SHARED_SH_KEYS = SH_LABELS.map((k) => `orbitalCloud.${k}`);
-// const POS_COLOR = /*@__PURE__*/ vec3(0.230, 0.99, 0.14);
-// const NEG_COLOR = /*@__PURE__*/ vec3(0.206, 0.66, 0.950);
-
 const POS_COLOR = /*@__PURE__*/ vec3(0.3, 1, 0);
-const NEG_COLOR = /*@__PURE__*/ vec3(0,0.5,1);
+const NEG_COLOR = /*@__PURE__*/ vec3(0, 0.5, 1);
 
 const BLACK = /*@__PURE__*/ vec3(0, 0, 0);
 

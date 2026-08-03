@@ -1,4 +1,4 @@
-import RAPIER from "@dimforge/rapier3d-simd-compat";
+import RAPIER from "@dimforge/rapier3d-compat";
 import { initRapier } from "./rapier";
 
 // ONE rapier world for every physics component. Objects from different scenes

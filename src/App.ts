@@ -6,6 +6,7 @@ import { PostStack } from "./render/post/PostStack";
 import { buildPostEffects } from "./render/post";
 import { FeatureStore } from "./store/FeatureStore";
 import { PerfOverlay } from "./ui/PerfOverlay";
+import { LatencyProbe } from "./audio/LatencyProbe";
 import { ComponentManager, type SceneColumnHost } from "./render/components/ComponentManager";
 import { COMPONENTS } from "./render/components";
 import { stepPhysics, physicsStats } from "./render/components/physics";
@@ -68,6 +69,10 @@ export interface AppDeps {
 type WorkletMsg = {
   type: "features";
   buffers: Record<string, Float32Array>;
+  // Context time of the newest sample in this frame's window, and the
+  // worklet's wall clock at publish. See LatencyProbe.
+  t: number;
+  hopMs: number;
 };
 
 export class App {
@@ -75,6 +80,7 @@ export class App {
   private store = new FeatureStore();
   private last = 0;
   private perf = new PerfOverlay();
+  private latency!: LatencyProbe;
   private rafHandle: number | null = null;
   private keydownHandler: (e: KeyboardEvent) => void = () => {};
   private resizeHandler: () => void = () => {};
@@ -226,6 +232,10 @@ export class App {
         this.perf.toggle();
         return;
       }
+      if (e.key === "l" || e.key === "L") {
+        this.latency.fire();
+        return;
+      }
       if (e.key === "h" || e.key === "H") {
         // Hide/show the whole GUI (panel + overlays carry the .gui-el class).
         document.body.classList.toggle("gui-hidden");
@@ -244,12 +254,15 @@ export class App {
     };
     window.addEventListener("resize", this.resizeHandler);
 
+    this.latency = new LatencyProbe(audioContext, workletNode);
+
     workletNode.port.onmessage = (e) => {
       const msg = e.data as WorkletMsg;
       if (msg.type !== "features") return;
       for (const [name, buf] of Object.entries(msg.buffers)) {
         this.store.set(name, buf);
       }
+      this.latency.onFeatures(msg.t, msg.hopMs, this.store.get("onset"));
     };
 
     const loop = (now: number) => {
@@ -282,6 +295,10 @@ export class App {
       const t3 = performance.now();
       this.components.update();
       const t4 = performance.now();
+      // Geometry for this frame is written; stamp how stale the audio behind
+      // it was. Must be here, not after renderAsync — this is the moment the
+      // scene stopped being able to react to newer analysis.
+      this.latency.onConsume(t4);
       const frame = this.postStack.renderAsync();
       // renderAsync suspends at its first await, so nearly all renderer CPU
       // work (node eval, pipeline binding, encoding — scene, shadow AND post
@@ -289,7 +306,9 @@ export class App {
       // Time it to completion; the sample below reports last frame's value
       // (one frame stale, EMA'd anyway). Includes queue-submit, not GPU wait.
       void frame.then(() => {
-        this.renderMs = performance.now() - t4;
+        const done = performance.now();
+        this.renderMs = done - t4;
+        this.latency.onRendered(done);
       });
       // A WebGPU canvas keeps no preserved drawing buffer, so a thumbnail has
       // to be read right after the frame lands — not whenever the button was
@@ -310,6 +329,8 @@ export class App {
         renderMs: this.renderMs,
         analysisMs: dsp.length > 0 ? dsp[0] : NaN,
         analysisHz: dsp.length > 1 ? dsp[1] : NaN,
+        deliverMs: this.latency.deliverMs,
+        ageMs: this.latency.ageMs,
         bodies: phys.bodies,
         colliders: phys.colliders,
         active: phys.active,
@@ -404,12 +425,15 @@ export class App {
     }
     const rotateSchema = store.schemaFor("camera.rotate");
     if (!rotateSchema) throw new Error("bindCameraUI: camera.rotate schema missing");
+    const distanceSchema = store.schemaFor("camera.distance");
+    if (!distanceSchema) throw new Error("bindCameraUI: camera.distance schema missing");
     // Collects "re-pull from store" callbacks so a preset load moves the
     // widgets instead of leaving them stale; driven from the subscriber below.
     const proxies: ParamProxyRegistry = new Map();
     bindParam(folder, store, this.modulator, fovSchema, proxies);
     bindParam(folder, store, this.modulator, presetSchema, proxies);
     bindParam(folder, store, this.modulator, rotateSchema, proxies);
+    bindParam(folder, store, this.modulator, distanceSchema, proxies);
     for (const key of [
       "light.directional.intensity",
       "light.directional.color",
@@ -456,6 +480,8 @@ export class App {
         if (name) void this.rig.goTo(name, { duration: 0.8 });
       } else if (key === "camera.rotate" && typeof value === "number") {
         this.rig.setAutorotate(value * ROTATE_DEG_PER_UNIT);
+      } else if (key === "camera.distance" && typeof value === "number") {
+        this.rig.setDistance(value);
       } else if (key.startsWith("camera.swim.")) {
         applySwim();
       } else if (key === "light.directional.intensity" && typeof value === "number") {
@@ -496,6 +522,10 @@ export class App {
     camera.fov = store.get("camera.fov") as number;
     camera.updateProjectionMatrix();
     this.rig.setAutorotate((store.get("camera.rotate") as number) * ROTATE_DEG_PER_UNIT);
+    // camera.distance is deliberately NOT force-applied here (unlike fov/
+    // rotate): the pose already loaded above (saved pose or preset) encodes
+    // its own distance, and scroll-wheel dolly changes it live without ever
+    // touching this param — forcing it on every bind would fight both.
     applySwim();
   }
 

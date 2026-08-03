@@ -10,7 +10,7 @@ import {
 import type { MeshStandardNodeMaterial } from "three/webgpu";
 import { makeLitMaterial, releaseLitMaterial } from "./litMaterial";
 import { vec4, uniform } from "three/tsl";
-import RAPIER from "@dimforge/rapier3d-simd-compat";
+import RAPIER from "@dimforge/rapier3d-compat";
 import { createCurlNoise } from "../curl-noise";
 import { getPhysicsWorld } from "./physics";
 import type { Component, ComponentDeps } from "./Component";
@@ -28,6 +28,13 @@ const LIFETIME_JITTER_SECS = 1.0;
 // Lower bound on the collider's shrink factor — keeps it from collapsing to a
 // degenerate size as an object fades out (the mesh still shrinks fully to 0).
 const COLLIDER_MIN_FADE = 0.15;
+// Floor on the spawn radius, so no two objects are ever born at EXACTLY the
+// same point. Perfectly coincident shapes leave parry deriving the contact
+// normal from a zero-length separation vector; that degenerate case panics
+// rapier inside world.step(), which aborts the wasm module outright
+// ("RuntimeError: unreachable") rather than throwing something catchable.
+// Three orders of magnitude under BASE, so it's visually a no-op.
+const SPAWN_JITTER = 1e-4;
 
 // Force field types (forceFieldType param values).
 const FIELD_LINEAR = 0;
@@ -327,11 +334,14 @@ export class Spawner implements Component {
 
     const amb = pool.def.ambient;
     const d = this.dirScratch;
-    // Position: origin for impulse shapes; a uniform point in the ball of
+    // Position: the origin for impulse shapes; a uniform point in the ball of
     // radius sphere2Radius for ambient ones (cbrt spreads them evenly through
-    // the volume instead of clumping at the center).
+    // the volume instead of clumping at the center). SPAWN_JITTER floors both
+    // — impulse shapes because they'd otherwise all stack on the origin, and
+    // ambient ones because sphere2Radius goes to 0.
     randUnit(d);
-    const r = amb ? this.params[amb.radiusParam] * Math.cbrt(Math.random()) : 0;
+    const spread = Math.max(amb ? this.params[amb.radiusParam] : 0, SPAWN_JITTER);
+    const r = spread * Math.cbrt(Math.random());
     const px = d[0] * r, py = d[1] * r, pz = d[2] * r;
     // Fresh direction for the drift so ambient spheres don't all stream
     // radially outward from wherever they appeared.

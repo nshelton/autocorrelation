@@ -1,5 +1,4 @@
-/// Maximum number of tempo candidates tracked per hop. Shared with `Buffers`,
-/// which sizes `candidates` as `3 * MAX_PEAKS` triples (lag, mag, sharpness).
+/// Period multiples the beat pulses ride on: one saw per 1x/2x/4x/8x cycle.
 const BEAT_PULSE_CYCLES: [f32; 4] = [1.0, 2.0, 4.0, 8.0];
 const TEA_TAU_DEFAULT_SECS: f32 = 4.0;
 // Default time constant for the phase-smoothing PLL. EMA gain is derived as
@@ -13,11 +12,16 @@ const PHASE_LOCK_DEFAULT_SECS: f32 = 1.0;
 /// the bracket — bogus refinement).
 fn parabolic_refine(ym: f32, y0: f32, yp: f32) -> f32 {
     let denom = ym - 2.0 * y0 + yp;
-    if denom.abs() < 1e-9 {
+    // A peak is concave DOWN, so denom must be negative. Flat (|denom| ~ 0) has
+    // no vertex, and concave-up brackets a minimum — refining against either
+    // pulls the estimate away from the real maximum instead of toward it.
+    if denom > -1e-9 {
         return 0.0;
     }
+    // A strict local max keeps the vertex inside the bracket, so this holds for
+    // well-formed input; it stays as a guard against denormal edge cases.
     let delta = 0.5 * (ym - yp) / denom;
-    if delta.abs() <= 1.0 {
+    if delta.abs() <= 0.5 {
         delta
     } else {
         0.0
@@ -74,8 +78,7 @@ impl BeatState {
     }
 
     /// Run one beat-tracker frame: pick candidates, score phases, update TEA,
-    /// write public outputs (`candidates`, `tea`, `beatGrid`, `beatState`,
-    /// `beatPulses`).
+    /// write public outputs (`beatGrid`, `beatState`, `beatPulses`).
     pub fn process(
         &mut self,
         onset: &[f32],

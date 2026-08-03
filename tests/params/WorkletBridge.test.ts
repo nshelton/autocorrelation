@@ -71,9 +71,15 @@ describe("WorkletBridge", () => {
       key: "autoGain",
       value: 1.0,
     });
-    // 1 configure + 9 hot keys (hopSize, smoothingTauSecs, onsetSmoothingTauSecs,
-    // dbFloor, teaTauSecs, teaSigma, acfSmoothingSigma, phaseLock, autoGain).
-    expect(calls.length).toBe(10);
+    expect(calls).toContainEqual({
+      type: "param",
+      key: "windowFall",
+      value: 2048,
+    });
+    // 1 configure + 10 hot keys (hopSize, windowFall, smoothingTauSecs,
+    // onsetSmoothingTauSecs, dbFloor, teaTauSecs, acfSmoothingSigma, acfDecay,
+    // phaseLock, autoGain).
+    expect(calls.length).toBe(11);
   });
 
   it("windowSize change posts a configure message with both reconfig params", () => {
