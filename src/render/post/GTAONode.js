@@ -35,6 +35,12 @@ class GTAONode extends TempNode {
 
 		this.SAMPLES = uniform( 16 );
 
+		// AO is low-frequency, so it renders at half the drawing-buffer size and
+		// the passTexture bilinear-magnifies it back up: a quarter of the
+		// horizon-loop fragments (16 samples over 3-5 directions each) for a
+		// difference you can't see on this content.
+		this.resolutionScale = 0.5;
+
 		this._aoRenderTarget = new RenderTarget( 1, 1, { depthBuffer: false } );
 		this._aoRenderTarget.texture.name = 'GTAONode.AO';
 
@@ -67,7 +73,10 @@ class GTAONode extends TempNode {
 		//
 
 		const size = renderer.getDrawingBufferSize( _size );
-		this.setSize( size.width, size.height );
+		this.setSize(
+			Math.max( 1, Math.round( size.width * this.resolutionScale ) ),
+			Math.max( 1, Math.round( size.height * this.resolutionScale ) ),
+		);
 
 		_quadMesh.material = this._material;
 

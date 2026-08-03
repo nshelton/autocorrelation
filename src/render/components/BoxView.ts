@@ -6,7 +6,8 @@ import {
   Object3D,
   Color,
 } from "three";
-import { MeshLambertNodeMaterial } from "three/webgpu";
+import type { MeshStandardNodeMaterial } from "three/webgpu";
+import { makeLitMaterial, releaseLitMaterial } from "./litMaterial";
 import { vec4, uniform } from "three/tsl";
 import RAPIER from "@dimforge/rapier3d-simd-compat";
 import { getPhysicsWorld } from "./physics";
@@ -149,7 +150,7 @@ export class BoxView implements Component {
     // Real lit material. The old hand-rolled lambert predated the vite alias
     // that collapsed the dual three instances — scene lights resolve now, and
     // a lit material is what receives shadows.
-    const mat = new MeshLambertNodeMaterial();
+    const mat = makeLitMaterial();
     mat.colorNode = vec4(uniform(this.color), 1.0);
 
     const mesh = new InstancedMesh(geom, mat, n);
@@ -241,7 +242,7 @@ export class BoxView implements Component {
     if (!this.mesh) return;
     this.scene.remove(this.mesh);
     this.mesh.geometry.dispose();
-    (this.mesh.material as MeshLambertNodeMaterial).dispose();
+    releaseLitMaterial(this.mesh.material as MeshStandardNodeMaterial);
     this.mesh.dispose();
     this.mesh = null;
   }

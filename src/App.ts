@@ -1,5 +1,6 @@
 import { AmbientLight, DirectionalLight, Vector3 } from "three";
 import { createSceneAndCamera } from "./render/Scene";
+import { Environment } from "./render/Environment";
 import { CameraRig } from "./render/CameraRig";
 import { PostStack } from "./render/post/PostStack";
 import { buildPostEffects } from "./render/post";
@@ -90,24 +91,39 @@ export class App {
   // Last completed frame's main-thread render time (renderAsync start → done).
   private renderMs = NaN;
   private directionalLight!: DirectionalLight;
+  private ambientLight!: AmbientLight;
+  private environment!: Environment;
 
   constructor(private deps: AppDeps) {}
+
+  // Spherical position on a fixed radius-10 orbit (the schema defaults land on
+  // the retired hardcoded (4.08, 8.66, 3.06)), so the shadow camera's [1, 25]
+  // depth bracket stays valid whatever direction the light comes from.
+  private applyLightDirection(): void {
+    const store = this.deps.paramStore;
+    const az = (store.get("light.directional.azimuth") as number) * DEG2RAD;
+    const el = (store.get("light.directional.elevation") as number) * DEG2RAD;
+    this.directionalLight.position.set(
+      10 * Math.cos(el) * Math.cos(az),
+      10 * Math.sin(el),
+      10 * Math.cos(el) * Math.sin(az),
+    );
+  }
 
   start(): void {
     const { renderer, workletNode, paramStore, audioContext } = this.deps;
 
     const { scene, camera } = createSceneAndCamera();
 
-    // Direction matches the lightDir the component materials hardcoded before
-    // they went lit, so the look is continuous. The light stays in the scene
-    // permanently even at intensity 0: r170's WebGPU renderer doesn't reliably
-    // rebuild existing pipelines when a light is added/removed at runtime, so
-    // brightness only ever moves the intensity uniform — see bindCameraUI.
+    // The light stays in the scene permanently even at intensity 0: r170's
+    // WebGPU renderer doesn't reliably rebuild existing pipelines when a light
+    // is added/removed at runtime, so brightness only ever moves the intensity
+    // uniform — see bindCameraUI.
     this.directionalLight = new DirectionalLight(
-      0xffffff,
+      paramStore.get("light.directional.color") as number,
       paramStore.get("light.directional.intensity") as number,
     );
-    this.directionalLight.position.set(4.08, 8.66, 3.06);
+    this.applyLightDirection();
     this.directionalLight.castShadow = this.directionalLight.intensity > 0;
     const shadow = this.directionalLight.shadow;
     shadow.mapSize.set(2048, 2048);
@@ -125,7 +141,13 @@ export class App {
     scene.add(this.directionalLight);
     // Always on — the lit materials' shadow/ambient floor. Without it,
     // toggling the directional light off would black out every lit mesh.
-    scene.add(new AmbientLight(0xffffff, 0.3));
+    this.ambientLight = new AmbientLight(
+      paramStore.get("light.ambient.color") as number,
+      paramStore.get("light.ambient.intensity") as number,
+    );
+    scene.add(this.ambientLight);
+
+    this.environment = new Environment(scene, paramStore);
 
     this.components = new ComponentManager(
       {
@@ -142,7 +164,7 @@ export class App {
     this.presets = new PresetStore(paramStore, this.modulator);
     this.components.start();
 
-    this.postStack = new PostStack(renderer, scene, camera, paramStore, buildPostEffects(renderer));
+    this.postStack = new PostStack(renderer, scene, camera, paramStore, buildPostEffects());
     this.postStack.build();
 
     this.rig = new CameraRig(camera, renderer.domElement);
@@ -300,19 +322,19 @@ export class App {
   }
 
   // `scenes` is the toggle column; each enabled scene's params get their own
-  // column from `host`.
+  // panel from `host`.
   bindUI(scenes: FolderApi, host: SceneColumnHost): void {
-    // Scene toggles first — that column is the index into everything else.
     this.components.bindUI(scenes, host, this.modulator, this.presets);
+  }
 
-    // Every physics component shares one world, so timescale and gravity are
-    // global — one folder under the toggles rather than a copy per scene.
+  // Every physics component shares one world, so timescale and gravity are
+  // global state — they live with the system settings, not in any scene.
+  bindPhysicsUI(folder: FolderApi): void {
     const store = this.deps.paramStore;
-    const folder = scenes.addFolder({ title: "Physics", expanded: true });
     const proxies: ParamProxyRegistry = new Map();
     for (const key of ["physics.timescale", "physics.gravity"]) {
       const schema = store.schemaFor(key);
-      if (!schema) throw new Error(`bindUI: ${key} schema missing`);
+      if (!schema) throw new Error(`bindPhysicsUI: ${key} schema missing`);
       bindParam(folder, store, this.modulator, schema, proxies);
     }
     const unsub = store.subscribe((key, _value, source) => {
@@ -353,14 +375,31 @@ export class App {
     );
   }
 
+  bindEnvironmentUI(folder: FolderApi): void {
+    const proxies: ParamProxyRegistry = new Map();
+    this.environment.bindUI(folder, this.modulator, proxies);
+    // Gated on source==='user' so per-frame modulator notifies don't jitter
+    // the UI; matches the other bind methods.
+    const unsub = this.deps.paramStore.subscribe((key, _value, source) => {
+      if (source !== "user") return;
+      const refresh = proxies.get(key);
+      if (!refresh) return;
+      refresh();
+      folder.refresh();
+    });
+    this.presetSections.push({ dispose: unsub });
+    this.presetSections.push(
+      addPresetSection(folder, this.presets, { id: "environment", prefixes: ["env"] }),
+    );
+  }
+
   bindCameraUI(folder: FolderApi): void {
     const store = this.deps.paramStore;
     const camera = this.rig.camera;
 
     const fovSchema = store.schemaFor("camera.fov");
     const presetSchema = store.schemaFor("camera.preset");
-    const lightSchema = store.schemaFor("light.directional.intensity");
-    if (!fovSchema || !presetSchema || !lightSchema) {
+    if (!fovSchema || !presetSchema) {
       throw new Error("bindCameraUI: required schemas missing");
     }
     const rotateSchema = store.schemaFor("camera.rotate");
@@ -371,7 +410,18 @@ export class App {
     bindParam(folder, store, this.modulator, fovSchema, proxies);
     bindParam(folder, store, this.modulator, presetSchema, proxies);
     bindParam(folder, store, this.modulator, rotateSchema, proxies);
-    bindParam(folder, store, this.modulator, lightSchema, proxies);
+    for (const key of [
+      "light.directional.intensity",
+      "light.directional.color",
+      "light.directional.azimuth",
+      "light.directional.elevation",
+      "light.ambient.intensity",
+      "light.ambient.color",
+    ]) {
+      const schema = store.schemaFor(key);
+      if (!schema) throw new Error(`bindCameraUI: ${key} schema missing`);
+      bindParam(folder, store, this.modulator, schema, proxies);
+    }
 
     const swimKeys = [
       "camera.swim.enabled",
@@ -415,6 +465,17 @@ export class App {
         // Flipping castShadow rebuilds pipelines (cached after first flip).
         this.directionalLight.intensity = value;
         this.directionalLight.castShadow = value > 0;
+      } else if (key === "light.directional.color" && typeof value === "number") {
+        this.directionalLight.color.setHex(value);
+      } else if (
+        (key === "light.directional.azimuth" || key === "light.directional.elevation") &&
+        typeof value === "number"
+      ) {
+        this.applyLightDirection();
+      } else if (key === "light.ambient.intensity" && typeof value === "number") {
+        this.ambientLight.intensity = value;
+      } else if (key === "light.ambient.color" && typeof value === "number") {
+        this.ambientLight.color.setHex(value);
       }
       // Widget sync rides along on the same subscription. Gated on
       // source==='user' so per-frame modulator notifies don't jitter the UI.
@@ -448,6 +509,7 @@ export class App {
     this.components?.dispose();
     this.modulator?.dispose();
     this.postStack?.dispose();
+    this.environment?.dispose();
     this.rig?.dispose();
     this.perf.unmount();
     this.cameraUnsub?.();

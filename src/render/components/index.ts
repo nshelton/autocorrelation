@@ -5,6 +5,8 @@ import { OrbitalCloud } from "./OrbitalCloud";
 import { OrbitalVolume } from "./OrbitalVolume";
 import { Spawner } from "./Spawner";
 import { Serpent } from "./Serpent";
+import { Fireflies } from "./Fireflies";
+import { PhysicsBalls } from "./PhysicsBalls";
 import { Grid } from "./Grid";
 import type { ComponentClass } from "./Component";
 
@@ -18,5 +20,7 @@ export const COMPONENTS: readonly ComponentClass[] = [
   OrbitalVolume as unknown as ComponentClass,
   Spawner as unknown as ComponentClass,
   Serpent as unknown as ComponentClass,
+  Fireflies as unknown as ComponentClass,
+  PhysicsBalls as unknown as ComponentClass,
   Grid as unknown as ComponentClass,
 ];

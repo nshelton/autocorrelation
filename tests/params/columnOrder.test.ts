@@ -35,6 +35,7 @@ describe("panel layout", () => {
       ["analysis"],
       ["scenes"],
       ["camera"],
+      ["environment"],
       ["post"],
       [], // trailing drop target
     ]);
@@ -80,6 +81,8 @@ describe("panel layout", () => {
       ["system", "scenes"],
       ["analysis", "signals"],
       ["camera", "post"],
+      // Not in the saved layout, so it gets a fresh column of its own.
+      ["environment"],
       [],
     ]);
 

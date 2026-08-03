@@ -7,7 +7,8 @@ import {
   Object3D,
   Color,
 } from "three";
-import { MeshLambertNodeMaterial } from "three/webgpu";
+import type { MeshStandardNodeMaterial } from "three/webgpu";
+import { makeLitMaterial, releaseLitMaterial } from "./litMaterial";
 import { vec4, uniform } from "three/tsl";
 import RAPIER from "@dimforge/rapier3d-simd-compat";
 import { createCurlNoise } from "../curl-noise";
@@ -280,7 +281,7 @@ export class Spawner implements Component {
     // Real lit material. The old hand-rolled lambert predated the vite alias
     // that collapsed the dual three instances ("Light node not found") —
     // scene lights resolve now, and a lit material is what receives shadows.
-    const mat = new MeshLambertNodeMaterial();
+    const mat = makeLitMaterial();
     // The uniform holds the pool's Color by reference; update() mutates it when
     // the param moves, no material rebuild.
     pool.color.setHex(this.params[pool.def.colorParam]);
@@ -388,7 +389,7 @@ export class Spawner implements Component {
     if (this.params.wireframe !== this.lastWireframe) {
       const on = this.params.wireframe >= 0.5;
       for (const pool of this.pools)
-        (pool.mesh.material as MeshLambertNodeMaterial).wireframe = on;
+        (pool.mesh.material as MeshStandardNodeMaterial).wireframe = on;
       this.lastWireframe = this.params.wireframe;
     }
 
@@ -537,7 +538,7 @@ export class Spawner implements Component {
     for (const pool of this.pools) {
       this.scene.remove(pool.mesh);
       pool.mesh.geometry.dispose();
-      (pool.mesh.material as MeshLambertNodeMaterial).dispose();
+      releaseLitMaterial(pool.mesh.material as MeshStandardNodeMaterial);
       pool.mesh.dispose();
     }
     this.pools = [];

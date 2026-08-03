@@ -5,9 +5,9 @@ import {
   NeutralToneMapping,
   type ToneMapping,
 } from "three";
-import { uniform } from "three/tsl";
+import { uniform, vec3, vec4, mix, luminance, toneMapping } from "three/tsl";
 import type { ShaderNodeObject } from "three/tsl";
-import type { Node, WebGPURenderer } from "three/webgpu";
+import type { Node } from "three/webgpu";
 import type { FolderApi } from "tweakpane";
 import type { PostEffect, PassCtx } from "../PostEffect";
 import type { ParamStore } from "../../../params/ParamStore";
@@ -23,49 +23,63 @@ const TONEMAP_TABLE: ToneMapping[] = [
   NeutralToneMapping,
 ];
 
-// Drives the renderer's tone-mapping constant (which PostProcessing applies
-// via renderOutput in update()) and inserts an exposure uniform multiply
-// before that. When disabled, sets renderer.toneMapping = NoToneMapping
-// and skips the multiply.
+// Linear-space mid-grey; the contrast power curve pivots here so pushing
+// contrast doesn't shift overall exposure.
+const MID_GREY = 0.18;
+
+// In-chain HDR grade + tonemap: exposure -> contrast (power curve about
+// mid-grey) -> saturation, all in linear HDR, then the selected three.js
+// curve maps to display range right here in the chain. renderer.toneMapping
+// is never touched (stays at its NoToneMapping default), so PostProcessing's
+// final renderOutput only does the sRGB conversion — this is what actually
+// puts Lens/Grain after the tonemap, matching the canonical order in index.ts.
 //
-// Mode and enabled changes require a rebuild because renderOutput is baked
-// into the QuadMesh material at update() time — flipping needsUpdate is what
-// picks up a new renderer.toneMapping value.
+// Mode changes rebuild (the curve function is baked into the node graph);
+// exposure/contrast/saturation are uniforms and hot-update.
 export class TonemapEffect implements PostEffect {
   readonly id = "tonemap";
   readonly label = "Tonemap";
   readonly needs = {} as const;
   enabled = true;
 
-  private renderer: WebGPURenderer;
   private exposureU = uniform(1.0);
+  private contrastU = uniform(1.0);
+  private saturationU = uniform(1.0);
+  private store: ParamStore | null = null;
   private unsub: (() => void) | null = null;
 
-  constructor(renderer: WebGPURenderer) {
-    this.renderer = renderer;
-  }
-
   registerParams(store: ParamStore, requestRebuild: () => void): void {
-    // Seed renderer tone-mapping and exposure from store.
-    this.applyMode(store);
+    this.store = store;
     this.exposureU.value = store.get("post.tonemap.exposure") as number;
+    this.contrastU.value = store.get("post.tonemap.contrast") as number;
+    this.saturationU.value = store.get("post.tonemap.saturation") as number;
 
     this.unsub = store.subscribe((key, value) => {
-      if (key === "post.tonemap.exposure" && typeof value === "number") {
-        this.exposureU.value = value;
-      } else if (key === "post.tonemap.mode") {
-        this.applyMode(store);
-        requestRebuild();   // bake new renderer.toneMapping into material
-      } else if (key === "post.tonemap.enabled") {
-        this.applyMode(store);
-        // enabled also triggers the PostStack-level rebuild via the
-        // `post.*.enabled` subscription in PostStack — no requestRebuild needed.
+      if (key === "post.tonemap.mode") {
+        requestRebuild();
+        return;
       }
+      if (typeof value !== "number") return;
+      if (key === "post.tonemap.exposure")        this.exposureU.value = value;
+      else if (key === "post.tonemap.contrast")   this.contrastU.value = value;
+      else if (key === "post.tonemap.saturation") this.saturationU.value = value;
     });
   }
 
   build(input: ShaderNodeObject<Node>, _ctx: PassCtx): ShaderNodeObject<Node> {
-    return input.mul(this.exposureU);
+    const exposed = input.rgb.mul(this.exposureU);
+    const contrasted = exposed.div(MID_GREY).pow(this.contrastU).mul(MID_GREY);
+    const graded = vec4(
+      mix(vec3(luminance(contrasted)), contrasted, this.saturationU),
+      input.a,
+    );
+    const mode = TONEMAP_TABLE[this.store!.get("post.tonemap.mode") as number] ?? NoToneMapping;
+    // Exposure already applied above, so the curve gets 1.0. Cast because
+    // ToneMappingNode's own `toneMapping: number` field shadows the chaining
+    // method in @types/three's ShaderNodeObject surface.
+    return mode === NoToneMapping
+      ? graded
+      : (toneMapping(mode, 1.0, graded) as unknown as ShaderNodeObject<Node>);
   }
 
   bindUI(
@@ -78,6 +92,8 @@ export class TonemapEffect implements PostEffect {
       "post.tonemap.enabled",
       "post.tonemap.mode",
       "post.tonemap.exposure",
+      "post.tonemap.contrast",
+      "post.tonemap.saturation",
     ]) {
       const schema = store.schemaFor(key);
       if (!schema) throw new Error(`TonemapEffect.bindUI: schema ${key} missing`);
@@ -88,14 +104,5 @@ export class TonemapEffect implements PostEffect {
   dispose(): void {
     this.unsub?.();
     this.unsub = null;
-    // HMR order is teardown then build, so the new TonemapEffect's
-    // applyMode() will restore renderer.toneMapping in registerParams.
-    this.renderer.toneMapping = NoToneMapping;
-  }
-
-  private applyMode(store: ParamStore): void {
-    const enabled = store.get("post.tonemap.enabled") as boolean;
-    const modeIdx = store.get("post.tonemap.mode") as number;
-    this.renderer.toneMapping = enabled ? (TONEMAP_TABLE[modeIdx] ?? NoToneMapping) : NoToneMapping;
   }
 }

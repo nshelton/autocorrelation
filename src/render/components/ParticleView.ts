@@ -6,7 +6,8 @@ import {
   Color,
   InstancedBufferAttribute,
 } from "three";
-import { MeshLambertNodeMaterial } from "three/webgpu";
+import type { MeshStandardNodeMaterial } from "three/webgpu";
+import { makeLitMaterial, releaseLitMaterial } from "./litMaterial";
 import { vec3, vec4, instancedBufferAttribute } from "three/tsl";
 import RAPIER from "@dimforge/rapier3d-simd-compat";
 import { createCurlNoise } from "../curl-noise";
@@ -111,7 +112,7 @@ export class ParticleView implements Component {
     // Visible attractor sphere — non-instanced single Mesh at fixed position.
     // Geometry is unit radius; mesh.scale carries the actual radius so the
     // attractorRadius hot-sweep is a single scale update, no geometry rebuild.
-    const aMat = new MeshLambertNodeMaterial();
+    const aMat = makeLitMaterial();
     aMat.colorNode = vec4(vec3(1.0, 0.6, 0.2), 1.0);
     const aGeom = new IcosahedronGeometry(1, 2);
     const aMesh = new Mesh(aGeom, aMat);
@@ -156,7 +157,7 @@ export class ParticleView implements Component {
     for (let i = 0; i < n; i++) tmpColor.toArray(colorArr, i * 3);
     const colorAttr = new InstancedBufferAttribute(colorArr, 3);
 
-    const mat = new MeshLambertNodeMaterial();
+    const mat = makeLitMaterial();
     const instColor = vec3(instancedBufferAttribute(colorAttr, "vec3", 3, 0));
     mat.colorNode = vec4(instColor, 1.0);
 
@@ -172,7 +173,7 @@ export class ParticleView implements Component {
     if (!this.mesh) return;
     this.scene.remove(this.mesh);
     this.mesh.geometry.dispose();
-    (this.mesh.material as MeshLambertNodeMaterial).dispose();
+    releaseLitMaterial(this.mesh.material as MeshStandardNodeMaterial);
     this.mesh.dispose();
     this.mesh = null;
   }
@@ -408,7 +409,7 @@ export class ParticleView implements Component {
     if (this.attractorMesh) {
       this.scene.remove(this.attractorMesh);
       this.attractorMesh.geometry.dispose();
-      (this.attractorMesh.material as MeshLambertNodeMaterial).dispose();
+      releaseLitMaterial(this.attractorMesh.material as MeshStandardNodeMaterial);
       this.attractorMesh = null;
     }
     // Shared world: remove our own bodies (colliders ride along), never free

@@ -14,6 +14,8 @@ export interface PassCtx {
   sceneNormal: ShaderNodeObject<Node> | null;
   // Always available.
   sceneDepth: ShaderNodeObject<Node>;
+  // View-space Z reconstructed from depth (negative in front of the camera).
+  sceneViewZ: ShaderNodeObject<Node>;
 }
 
 export interface PostEffect {
@@ -26,6 +28,11 @@ export interface PostEffect {
 
   // Build this effect's node chain. `input` is the upstream color node.
   build(input: ShaderNodeObject<Node>, ctx: PassCtx): ShaderNodeObject<Node>;
+
+  // Optional per-frame hook, called by PostStack right before render while
+  // the effect is enabled — for uniforms driven by live scene state (e.g.
+  // DOF auto-focus tracking the camera) rather than params.
+  update?(): void;
 
   // Register param schemas + uniform subscriptions. Called once at construction.
   registerParams(store: ParamStore, requestRebuild: () => void): void;

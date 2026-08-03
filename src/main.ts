@@ -130,7 +130,9 @@ function buildAppLayer(deps: AppDeps): void {
   bridge = new WorkletBridgeCtor(deps.paramStore, deps.workletNode.port);
   app.bindSystemUI(panel.system);
   app.bindUI(panel.scenes, panel);
+  app.bindPhysicsUI(panel.physics);
   app.bindCameraUI(panel.camera);
+  app.bindEnvironmentUI(panel.environment);
   app.bindPostUI(panel.post);
   if (initialBootstrap) {
     bridge.bootstrap();
@@ -162,12 +164,14 @@ const onStart = async (factory: SourceProvider): Promise<void> => {
       const { postSchemas } = await import("./params/postSchemas");
       const { cameraSchemas } = await import("./params/cameraSchemas");
       const { lightSchemas } = await import("./params/lightSchemas");
+      const { envSchemas } = await import("./params/envSchemas");
       const { physicsSchemas } = await import("./params/physicsSchemas");
       const { systemSchemas } = await import("./params/systemSchemas");
       for (const s of analysisSchemas) paramStore.register(s);
       for (const s of postSchemas) paramStore.register(s);
       for (const s of cameraSchemas) paramStore.register(s);
       for (const s of lightSchemas) paramStore.register(s);
+      for (const s of envSchemas) paramStore.register(s);
       for (const s of physicsSchemas) paramStore.register(s);
       for (const s of systemSchemas) paramStore.register(s);
     }

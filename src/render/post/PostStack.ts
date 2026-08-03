@@ -7,6 +7,7 @@ import type { FolderApi } from "tweakpane";
 import type { PostEffect, PassCtx } from "./PostEffect";
 import type { Modulator } from "../../params/Modulator";
 import type { ParamProxyRegistry } from "../../params/bindParam";
+import { persistFold } from "../../params/foldState";
 
 // Owns a single PostProcessing instance plus an ordered list of effects.
 // Subscribes to ParamStore: any `post.*.enabled` change reads each effect's
@@ -82,6 +83,7 @@ export class PostStack {
       camera: this.camera,
       sceneNormal,
       sceneDepth,
+      sceneViewZ: scenePass.getViewZNode(),
     };
 
     let node = sceneColor;
@@ -97,6 +99,7 @@ export class PostStack {
     const proxies: ParamProxyRegistry = new Map();
     for (const effect of this.effects) {
       const sub = folder.addFolder({ title: effect.label, expanded: false });
+      persistFold(sub, `post:${effect.id}`);
       effect.bindUI(sub, this.store, modulator, proxies);
     }
     // Gated on source==='user' so per-frame modulator notifies don't jitter the
@@ -111,6 +114,7 @@ export class PostStack {
   }
 
   async renderAsync(): Promise<void> {
+    for (const effect of this.effects) if (effect.enabled) effect.update?.();
     await this.post.renderAsync();
   }
 

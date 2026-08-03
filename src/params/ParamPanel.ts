@@ -33,7 +33,7 @@ function ensureCss(): void {
   pointer-events: auto; width: 256px; max-height: 100vh;
   display: flex; flex-direction: column; gap: 6px;
   overflow-x: hidden; overflow-y: auto;
-  --tp-base-background-color: transparent;
+  --tp-base-background-color: rgba(10, 10, 10, 0.75);
 }
 .pp-panel { flex: 0 0 auto; }
 /* Folder titles are the drag handle, so advertise it. A plain click still
@@ -60,8 +60,10 @@ body.pp-drag-active .pp-col:empty {
 export class ParamPanel {
   // Far-left box. App injects the system-preset thumbnail grid here.
   public system: FolderApi;
+  public physics: FolderApi;
   public scenes: FolderApi;
   public camera: FolderApi;
+  public environment: FolderApi;
   public post: FolderApi;
   private container: HTMLDivElement;
   private columns: HTMLDivElement[] = [];
@@ -118,6 +120,12 @@ export class ParamPanel {
     const tweenSchema = store.schemaFor("system.presetTweenSecs");
     if (tweenSchema) bindParam(system, store, modulator, tweenSchema, this.proxies);
 
+    // Physics is global — one shared rapier world for every scene — so it sits
+    // with the system settings rather than in any one scene's panel. App fills
+    // it in bindPhysicsUI.
+    this.physics = systemPane.addFolder({ title: "Physics", expanded: true });
+    persistFold(this.physics, "Physics");
+
     system.addButton({ title: "Reset to defaults" }).on("click", () => store.reset());
     system.addButton({ title: "Reset modulation" }).on("click", () => {
       for (const schema of store.schemasInOrder()) {
@@ -157,9 +165,11 @@ export class ParamPanel {
 
     this.scenes = this.addPanel("scenes").addFolder({ title: "Scenes", expanded: true });
     this.camera = this.addPanel("camera").addFolder({ title: "Camera", expanded: true });
+    this.environment = this.addPanel("environment").addFolder({ title: "Environment", expanded: true });
     this.post = this.addPanel("post").addFolder({ title: "Post", expanded: true });
     persistFold(this.scenes, "Scenes");
     persistFold(this.camera, "Camera");
+    persistFold(this.environment, "Environment");
     persistFold(this.post, "Post");
   }
 
