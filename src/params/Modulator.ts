@@ -19,6 +19,9 @@ export interface ModBinding {
   // Cheap per-tick EMA on the source before the power curve: 0 = none,
   // →1 = heavy. alpha = 1 - smoothing (clamped > 0). Optional; treated as 0.
   smoothing?: number;
+  // 0..1 offset into the cycle for the periodic (beat saw/sin) sources.
+  // Ignored by level sources. Optional; treated as 0.
+  phase?: number;
 }
 
 // A button trigger: fire the button's action once when the smoothed + power-
@@ -30,11 +33,14 @@ export interface TriggerBinding {
   threshold: number;
   power?: number;
   smoothing?: number;
+  phase?: number;
 }
 
 type SourceDescriptor = {
   buffer: string;
-  read: (b: Float32Array) => number;
+  // `phase` is a 0..1 offset the periodic sources (saw/sin) add to the beat
+  // phase before mapping it. Level sources ignore the argument.
+  read: (b: Float32Array, phase: number) => number;
 };
 
 function latest(b: Float32Array): number {
@@ -47,11 +53,17 @@ const TWO_PI = Math.PI * 2;
 // Saw reads it straight; sin maps that phase through one full sine cycle per
 // beat, remapped to 0..1. NaN phase (silence / no rhythm) flows through to the
 // tick()'s !isFinite guard, which snaps the param back to its base value.
-function beatSaw(i: number): (b: Float32Array) => number {
-  return (b) => (b.length > i ? b[i] : 0);
+function beatSaw(i: number): (b: Float32Array, phase: number) => number {
+  // Wrap back into 0..1 so the offset slides the ramp within the beat rather
+  // than pushing it out of range. NaN (no beat) survives to readSource's guard.
+  return (b, phase) => {
+    if (b.length <= i) return 0;
+    const v = b[i] + phase;
+    return v - Math.floor(v);
+  };
 }
-function beatSin(i: number): (b: Float32Array) => number {
-  return (b) => (b.length > i ? 0.5 + 0.5 * Math.sin(TWO_PI * b[i]) : 0);
+function beatSin(i: number): (b: Float32Array, phase: number) => number {
+  return (b, phase) => (b.length > i ? 0.5 + 0.5 * Math.sin(TWO_PI * (b[i] + phase)) : 0);
 }
 
 // Curated audio sources. UI dropdown + persistence use these string keys.
@@ -60,6 +72,9 @@ export const MOD_SOURCES: Record<string, SourceDescriptor> = {
   "rms.low":  { buffer: "rmsLow",  read: latest },
   "rms.mid":  { buffer: "rmsMid",  read: latest },
   "rms.high": { buffer: "rmsHigh", read: latest },
+  // Spectral flux from spectrum.rs, autogained and pushed into `onset` by the
+  // DSP each frame — the same signal the beat tracker runs its ACF over.
+  "onset.flux": { buffer: "onset", read: latest },
   "beat.1x saw": { buffer: "beatPulses", read: beatSaw(0) },
   "beat.2x saw": { buffer: "beatPulses", read: beatSaw(1) },
   "beat.4x saw": { buffer: "beatPulses", read: beatSaw(2) },
@@ -185,10 +200,10 @@ export class Modulator {
 
   // Live value of a source in 0..1, NaN/unknown → 0. Used by the trigger tick
   // and the trigger source monitor.
-  readSource(source: string): number {
+  readSource(source: string, phase = 0): number {
     const src = MOD_SOURCES[source];
     if (!src) return 0;
-    const v = src.read(this.features.get(src.buffer));
+    const v = src.read(this.features.get(src.buffer), phase);
     return Number.isFinite(v) ? v : 0;
   }
 
@@ -202,8 +217,14 @@ export class Modulator {
   // updating the per-key smoothing + processed state. Returns the 0..1 signal.
   // Shared by continuous modulation and button triggers so both filter the
   // input identically.
-  private processSource(key: string, source: string, power: number, smoothing: number): number {
-    const v = Math.max(0, this.readSource(source));
+  private processSource(
+    key: string,
+    source: string,
+    power: number,
+    smoothing: number,
+    phase: number,
+  ): number {
+    const v = Math.max(0, this.readSource(source, phase));
     const alpha = Math.max(1e-3, 1 - smoothing);
     const prev = this.smoothed.get(key);
     const sm = prev === undefined ? v : prev + alpha * (v - prev);
@@ -218,7 +239,7 @@ export class Modulator {
       const schema = this.store.schemaFor(key);
       if (!schema || schema.kind !== "continuous") continue;
       if (!MOD_SOURCES[b.source]) continue;
-      const curved = this.processSource(key, b.source, b.power ?? 1, b.smoothing ?? 0);
+      const curved = this.processSource(key, b.source, b.power ?? 1, b.smoothing ?? 0, b.phase ?? 0);
       // Map the 0..1 signal into [lo, hi] (param units; default to full range).
       // During silence curved decays to 0, so the param settles at lo.
       const lo = b.lo ?? schema.min;
@@ -232,7 +253,7 @@ export class Modulator {
     // smoothed + power-curved signal), re-arm on fall. processSource runs
     // before the callback check so the trigger graph updates regardless.
     for (const [key, t] of this.triggers) {
-      const v = this.processSource(key, t.source, t.power ?? 1, t.smoothing ?? 0);
+      const v = this.processSource(key, t.source, t.power ?? 1, t.smoothing ?? 0, t.phase ?? 0);
       const cb = this.triggerCallbacks.get(key);
       if (!cb) continue;
       const armed = this.triggerArmed.get(key);
@@ -293,7 +314,8 @@ export class Modulator {
     for (const [key, val] of Object.entries(parsed as Record<string, unknown>)) {
       if (!val || typeof val !== "object") continue;
       const candidate = val as {
-        source?: unknown; lo?: unknown; hi?: unknown; power?: unknown; smoothing?: unknown;
+        source?: unknown; lo?: unknown; hi?: unknown; power?: unknown;
+        smoothing?: unknown; phase?: unknown;
       };
       if (typeof candidate.source !== "string") continue;
       const source = LEGACY_SOURCE_ALIASES[candidate.source] ?? candidate.source;
@@ -309,6 +331,7 @@ export class Modulator {
       if (typeof candidate.hi === "number") binding.hi = candidate.hi;
       if (typeof candidate.power === "number") binding.power = candidate.power;
       if (typeof candidate.smoothing === "number") binding.smoothing = candidate.smoothing;
+      if (typeof candidate.phase === "number") binding.phase = candidate.phase;
       this.bindings.set(key, binding);
     }
   }
@@ -339,7 +362,8 @@ export class Modulator {
     for (const [key, val] of Object.entries(parsed as Record<string, unknown>)) {
       if (!val || typeof val !== "object") continue;
       const candidate = val as {
-        source?: unknown; threshold?: unknown; power?: unknown; smoothing?: unknown;
+        source?: unknown; threshold?: unknown; power?: unknown;
+        smoothing?: unknown; phase?: unknown;
       };
       if (typeof candidate.source !== "string") continue;
       if (typeof candidate.threshold !== "number") continue;
@@ -348,6 +372,7 @@ export class Modulator {
       const binding: TriggerBinding = { source, threshold: candidate.threshold };
       if (typeof candidate.power === "number") binding.power = candidate.power;
       if (typeof candidate.smoothing === "number") binding.smoothing = candidate.smoothing;
+      if (typeof candidate.phase === "number") binding.phase = candidate.phase;
       this.triggers.set(key, binding);
     }
   }

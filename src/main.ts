@@ -128,6 +128,7 @@ function buildAppLayer(deps: AppDeps): void {
   app.start();                                          // constructs modulator
   panel = new ParamPanelCtor(deps.paramStore, app.modulator);
   bridge = new WorkletBridgeCtor(deps.paramStore, deps.workletNode.port);
+  app.bindSystemUI(panel.system);
   app.bindUI(panel.scenes);
   app.bindCameraUI(panel.camera);
   app.bindPostUI(panel.post);

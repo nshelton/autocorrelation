@@ -7,8 +7,8 @@ import {
   Object3D,
   Color,
 } from "three";
-import { MeshBasicNodeMaterial } from "three/webgpu";
-import { vec3, vec4, float, dot, max, normalWorld, uniform } from "three/tsl";
+import { MeshLambertNodeMaterial } from "three/webgpu";
+import { vec4, uniform } from "three/tsl";
 import RAPIER from "@dimforge/rapier3d-compat";
 import { createCurlNoise } from "../curl-noise";
 import { getPhysicsWorld } from "./physics";
@@ -273,21 +273,19 @@ export class Spawner implements Component {
   }
 
   private createMesh(pool: Pool): InstancedMesh {
-    // Hand-rolled lambert on an UNLIT MeshBasicNodeMaterial. Real lit node
-    // materials (MeshStandardNodeMaterial) can't resolve scene lights in this
-    // project — the node renderer throws "Light node not found" (dual three
-    // instances; see BoxView.ts / OrbitalCloud.ts).
-    const mat = new MeshBasicNodeMaterial();
-    const lightDir = vec3(0.408, 0.866, 0.306);
-    const ndotl = max(dot(normalWorld, lightDir), float(0.0));
-    const lit = ndotl.mul(0.7).add(0.3);
+    // Real lit material. The old hand-rolled lambert predated the vite alias
+    // that collapsed the dual three instances ("Light node not found") —
+    // scene lights resolve now, and a lit material is what receives shadows.
+    const mat = new MeshLambertNodeMaterial();
     // The uniform holds the pool's Color by reference; update() mutates it when
     // the param moves, no material rebuild.
     pool.color.setHex(this.params[pool.def.colorParam]);
     pool.lastColor = this.params[pool.def.colorParam];
-    mat.colorNode = vec4(uniform(pool.color).mul(lit), 1.0);
+    mat.colorNode = vec4(uniform(pool.color), 1.0);
 
     const mesh = new InstancedMesh(pool.def.geometry(), mat, MAX_PER_TYPE);
+    mesh.castShadow = true;
+    mesh.receiveShadow = true;
     // Objects roam the whole frame; skip per-instance frustum culling on the
     // (origin-centered, zero-sized) bounding sphere which would cull them all.
     mesh.frustumCulled = false;
@@ -371,7 +369,7 @@ export class Spawner implements Component {
     if (this.params.wireframe !== this.lastWireframe) {
       const on = this.params.wireframe >= 0.5;
       for (const pool of this.pools)
-        (pool.mesh.material as MeshBasicNodeMaterial).wireframe = on;
+        (pool.mesh.material as MeshLambertNodeMaterial).wireframe = on;
       this.lastWireframe = this.params.wireframe;
     }
 
@@ -499,7 +497,7 @@ export class Spawner implements Component {
     for (const pool of this.pools) {
       this.scene.remove(pool.mesh);
       pool.mesh.geometry.dispose();
-      (pool.mesh.material as MeshBasicNodeMaterial).dispose();
+      (pool.mesh.material as MeshLambertNodeMaterial).dispose();
       pool.mesh.dispose();
     }
     this.pools = [];

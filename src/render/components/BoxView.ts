@@ -1,27 +1,25 @@
 import {
   InstancedMesh,
-  InstancedBufferAttribute,
   BoxGeometry,
+  IcosahedronGeometry,
+  BufferGeometry,
   Object3D,
   Color,
 } from "three";
-import { MeshBasicNodeMaterial } from "three/webgpu";
-import {
-  vec3,
-  vec4,
-  float,
-  dot,
-  max,
-  normalWorld,
-  instancedBufferAttribute,
-} from "three/tsl";
+import { MeshLambertNodeMaterial } from "three/webgpu";
+import { vec4, uniform } from "three/tsl";
 import RAPIER from "@dimforge/rapier3d-compat";
 import { getPhysicsWorld } from "./physics";
 import type { Component, ComponentDeps } from "./Component";
 
-const BOX_COUNT = 1024;
 const CONTAINER_HALF = 1.5;
+// Geometry is built once at this size; the per-instance scale is
+// (wanted world size / BASE_SIZE), so minSize/maxSize read as world units.
 const BASE_SIZE = 0.12;
+
+// primitive param values.
+const PRIM_BOX = 0;
+const PRIM_SPHERE = 1;
 
 export class BoxView implements Component {
   static id = "boxView";
@@ -30,10 +28,30 @@ export class BoxView implements Component {
   static paramOpts = {
     pull: { min: 0, max: 1, step: 0.01 },
     width: { min: 0, max: 2, step: 0.01 },
+    minSize: { min: 0.005, max: 0.5, step: 0.005 },
+    maxSize: { min: 0.005, max: 1.0, step: 0.005 },
   };
   static paramDefaults = {
     pull: 0.3,
     width: 0.5,
+    primitive: PRIM_BOX,
+    count: 1024,
+    // Spectrum 0..1 maps into [minSize, maxSize] in world units.
+    minSize: 0.02,
+    maxSize: 0.36,
+    color: 0xffffff,
+  };
+  static paramKinds = {
+    primitive: "discrete" as const,
+    count: "discrete" as const,
+    color: "color" as const,
+  };
+  static paramDiscreteOptions = {
+    primitive: [PRIM_BOX, PRIM_SPHERE],
+    count: [128, 256, 512, 1024, 2048, 4096],
+  };
+  static paramDiscreteLabels = {
+    primitive: ["Box", "Sphere"],
   };
 
   // Reference to App-owned stable bag — read each frame, mutated by tweakpane.
@@ -46,6 +64,14 @@ export class BoxView implements Component {
   private bodies: RAPIER.RigidBody[] = [];
   private colliders: RAPIER.Collider[] = [];
   private dummy = new Object3D();
+  // Live values behind the current bodies/mesh. count and primitive can't be
+  // applied in place — a change rebuilds the pool.
+  private count = 0;
+  private primitive = PRIM_BOX;
+  // Referenced live by the material's uniform node; mutate in place, never
+  // reassign, so rebuilt materials keep pointing at the same instance.
+  private color = new Color();
+  private lastColor = NaN;
   private disposed = false;
 
   constructor(deps: ComponentDeps, params: Record<string, number>) {
@@ -58,33 +84,30 @@ export class BoxView implements Component {
   private async init(): Promise<void> {
     const world = await getPhysicsWorld();
     if (this.disposed) return;
+    this.world = world;
+    this.rebuild();
+  }
+
+  // Drop the current bodies + mesh and build `count` fresh ones of the current
+  // primitive. Only called when those two params change (and once at startup),
+  // never per frame.
+  private rebuild(): void {
+    const world = this.world;
+    if (!world) return;
+    // Shared world: remove only our own bodies (colliders ride along).
+    for (const b of this.bodies) world.removeRigidBody(b);
+    this.bodies = [];
+    this.colliders = [];
+    this.disposeMesh();
+
+    const n = Math.round(this.params.count);
+    const prim = Math.round(this.params.primitive);
+    this.count = n;
+    this.primitive = prim;
 
     const c = CONTAINER_HALF;
-
-    // Per-instance HSL colors via our own InstancedBufferAttribute. setColorAt would route
-    // through NodeMaterial's vInstanceColor varying, which is broken for our setup in r170.
-    const colorArr = new Float32Array(BOX_COUNT * 3);
-    const tmpColor = new Color();
-    for (let i = 0; i < BOX_COUNT; i++) {
-      tmpColor.setHSL(1, 1, 1);
-      tmpColor.toArray(colorArr, i * 3);
-    }
-    const colorAttr = new InstancedBufferAttribute(colorArr, 3);
-
-    // MeshStandardNodeMaterial with custom colorNode silently drops lights in r170 + WebGPU +
-    // InstancedMesh. Hand-rolled lambert on MeshBasicNodeMaterial is what works.
-    const mat = new MeshBasicNodeMaterial();
-    const instColor = vec3(instancedBufferAttribute(colorAttr, "vec3", 3, 0));
-    const lightDir = vec3(0.408, 0.866, 0.306);
-    const ndotl = max(dot(normalWorld, lightDir), float(0.0));
-    const lit = ndotl.mul(0.7).add(0.3);
-    mat.colorNode = vec4(instColor.mul(lit), 1.0);
-
-    const geom = new BoxGeometry(BASE_SIZE, BASE_SIZE, BASE_SIZE);
-    const mesh = new InstancedMesh(geom, mat, BOX_COUNT);
-
     const half = BASE_SIZE / 2;
-    for (let i = 0; i < BOX_COUNT; i++) {
+    for (let i = 0; i < n; i++) {
       const x = (Math.random() - 0.5) * 2 * c * 0.7;
       const y = (Math.random() - 0.5) * 2 * c * 0.7;
       const z = (Math.random() - 0.5) * 2 * c * 0.7;
@@ -104,34 +127,67 @@ export class BoxView implements Component {
           .setLinearDamping(0.1)
           .setAngularDamping(0.1),
       );
-      const collider = world.createCollider(
-        RAPIER.ColliderDesc.cuboid(half, half, half).setRestitution(0.9),
-        body,
-      );
+      const shape =
+        prim === PRIM_SPHERE
+          ? RAPIER.ColliderDesc.ball(half)
+          : RAPIER.ColliderDesc.cuboid(half, half, half);
       this.bodies.push(body);
-      this.colliders.push(collider);
+      this.colliders.push(world.createCollider(shape.setRestitution(0.9), body));
     }
 
-    this.world = world;
+    // Sphere radius = box half-extent, so the two primitives occupy the same
+    // size envelope and minSize/maxSize mean the same thing for both.
+    const geom: BufferGeometry =
+      prim === PRIM_SPHERE
+        ? new IcosahedronGeometry(half, 2)
+        : new BoxGeometry(BASE_SIZE, BASE_SIZE, BASE_SIZE);
+
+    // Real lit material. The old hand-rolled lambert predated the vite alias
+    // that collapsed the dual three instances — scene lights resolve now, and
+    // a lit material is what receives shadows.
+    const mat = new MeshLambertNodeMaterial();
+    mat.colorNode = vec4(uniform(this.color), 1.0);
+
+    const mesh = new InstancedMesh(geom, mat, n);
+    mesh.castShadow = true;
+    mesh.receiveShadow = true;
     this.mesh = mesh;
     this.scene.add(mesh);
   }
 
   update(): void {
     if (!this.world || !this.mesh) return;
-    const PULL = this.params.pull;
+    if (
+      Math.round(this.params.count) !== this.count ||
+      Math.round(this.params.primitive) !== this.primitive
+    ) {
+      this.rebuild();
+    }
+    if (!this.mesh) return;
 
+    if (this.params.color !== this.lastColor) {
+      this.color.setHex(this.params.color);
+      this.lastColor = this.params.color;
+    }
+
+    const PULL = this.params.pull;
     const spec = this.store.get("spectrum");
     const specLen = spec.length;
 
-    const baseHalf = BASE_SIZE / 2;
-    const halfCount = (BOX_COUNT - 1) / 2;
-    for (let i = 0; i < this.bodies.length; i++) {
+    const n = this.count;
+    const minSize = this.params.minSize;
+    // Guard an inverted range (maxSize dragged below minSize) so sizes never
+    // go negative and collapse the colliders.
+    const maxSize = Math.max(this.params.maxSize, minSize);
+    const isSphere = this.primitive === PRIM_SPHERE;
+    const halfCount = (n - 1) / 2;
+
+    for (let i = 0; i < n; i++) {
       const b = this.bodies[i];
       const t = b.translation();
       const r = b.rotation();
 
-      const restX = ((i - halfCount) * this.params.width) / BOX_COUNT;
+      const restX = ((i - halfCount) * this.params.width) / n;
       const vel = b.linvel();
       b.setLinvel(
         {
@@ -142,18 +198,18 @@ export class BoxView implements Component {
         true,
       );
 
-      let s = 1.0;
+      // Silence (no spectrum yet) sits every instance at minSize.
+      let size = minSize;
       if (specLen > 0) {
-        const bin = Math.min(
-          specLen - 1,
-          Math.floor((i / BOX_COUNT) * specLen * 0.25),
-        );
-        s = 0.1 + spec[bin] * 3.0;
+        const bin = Math.min(specLen - 1, Math.floor((i / n) * specLen * 0.25));
+        size = minSize + (maxSize - minSize) * spec[bin];
       }
 
-      const h = baseHalf * s;
-      this.colliders[i].setHalfExtents({ x: h, y: h, z: h });
+      const h = size / 2;
+      if (isSphere) this.colliders[i].setRadius(h);
+      else this.colliders[i].setHalfExtents({ x: h, y: h, z: h });
 
+      const s = size / BASE_SIZE;
       this.dummy.position.set(t.x, t.y, t.z);
       this.dummy.quaternion.set(r.x, r.y, r.z, r.w);
       this.dummy.scale.set(s, s, s);
@@ -163,15 +219,18 @@ export class BoxView implements Component {
     this.mesh.instanceMatrix.needsUpdate = true;
   }
 
+  private disposeMesh(): void {
+    if (!this.mesh) return;
+    this.scene.remove(this.mesh);
+    this.mesh.geometry.dispose();
+    (this.mesh.material as MeshLambertNodeMaterial).dispose();
+    this.mesh.dispose();
+    this.mesh = null;
+  }
+
   dispose(): void {
     this.disposed = true;
-    if (this.mesh) {
-      this.scene.remove(this.mesh);
-      this.mesh.geometry.dispose();
-      (this.mesh.material as MeshBasicNodeMaterial).dispose();
-      this.mesh.dispose();
-      this.mesh = null;
-    }
+    this.disposeMesh();
     // Shared world: drop only our own bodies (their colliders go with them).
     // Clearing the arrays in the same breath matters — a setter on a removed
     // body panics rapier with "unreachable".

@@ -28,6 +28,7 @@ export function bindParam(
   schema: ParamSchema,
   refreshRegistry?: ParamProxyRegistry,
 ): void {
+  ensureParamCss();
   const proxy: { value: ParamValue } = { value: store.get(schema.key) };
   const binding = makeWidget(folder, proxy, schema);
   // True while the user is mid-drag — gates the live modulated refresh below so
@@ -95,6 +96,7 @@ export function buildModControls(
     hi: existing?.hi ?? max,
     power: existing?.power ?? 1,
     smoothing: existing?.smoothing ?? 0,
+    phase: existing?.phase ?? 0,
   };
   const write = () => {
     if (modProxy.source === NONE) {
@@ -106,6 +108,7 @@ export function buildModControls(
         hi: modProxy.hi,
         power: modProxy.power,
         smoothing: modProxy.smoothing,
+        phase: modProxy.phase,
       });
     }
   };
@@ -132,6 +135,7 @@ export function buildTriggerControls(
     threshold: existing?.threshold ?? 0.5,
     power: existing?.power ?? 1,
     smoothing: existing?.smoothing ?? 0,
+    phase: existing?.phase ?? 0,
   };
   const write = () => {
     if (trigProxy.source === NONE) {
@@ -142,6 +146,7 @@ export function buildTriggerControls(
         threshold: trigProxy.threshold,
         power: trigProxy.power,
         smoothing: trigProxy.smoothing,
+        phase: trigProxy.phase,
       });
     }
   };
@@ -152,15 +157,18 @@ export function buildTriggerControls(
   addSourceMonitor(folder, () => modulator.processedValue(triggerKey));
 }
 
-// Shared power + smoothing sliders (the source filtering common to mod bindings
-// and triggers), wired to `onChange`.
+// Shared power + smoothing + phase sliders (the source filtering common to mod
+// bindings and triggers), wired to `onChange`.
 function addFilterControls(
   folder: FolderApi,
-  proxy: { power: number; smoothing: number },
+  proxy: { power: number; smoothing: number; phase: number },
   onChange: () => void,
 ): void {
   folder.addBinding(proxy, "power", { label: "power", min: 0.1, max: 10, step: 0.1 }).on("change", onChange);
   folder.addBinding(proxy, "smoothing", { label: "smoothing", min: 0, max: 1, step: 0.01 }).on("change", onChange);
+  // Slides the beat saw/sin sources within their cycle (1.0 = a whole cycle,
+  // i.e. back where it started). Level sources like rms.* ignore it.
+  folder.addBinding(proxy, "phase", { label: "phase", min: 0, max: 1, step: 0.01 }).on("change", onChange);
 }
 
 // Inline-button trigger UI for a pushbutton: injects the "∿" button into the
@@ -241,8 +249,11 @@ function injectModButton(
   row: HTMLElement,
   onClick: (btn: HTMLButtonElement) => void,
 ): HTMLButtonElement {
-  ensureModCss();
+  ensureParamCss();
   row.style.position = "relative";
+  // Tells the CSS this row's track stops short of the edge, so the value text
+  // lines up with the end of the draggable area rather than the row.
+  row.classList.add("has-mod");
   const btn = document.createElement("button");
   btn.type = "button";
   btn.className = "mod-btn";
@@ -263,13 +274,48 @@ function injectModButton(
 }
 
 let cssInjected = false;
-function ensureModCss(): void {
+function ensureParamCss(): void {
   if (cssInjected) return;
   cssInjected = true;
   const style = document.createElement("style");
   style.textContent = `
+/* Slider rows are two-line: name + value on the top line, full-width slider
+   underneath. Tweakpane's default packs both into one row and splits the value
+   column 2:1 (.tp-sldtxtv_s flex:2 / .tp-sldtxtv_t flex:1), which wasted
+   slider width, put the number under the inline ∿ button, and left the number
+   sitting on top of the knob. Two lines gives the slider the whole column and
+   nothing overlaps the track.
+   :has() scopes this to slider rows — checkboxes, dropdowns, color pickers and
+   monitors keep tweakpane's single-line layout. */
+.tp-lblv { position: relative; }
+.tp-lblv:has(.tp-sldtxtv) { display: block; }
+.tp-lblv:has(.tp-sldtxtv) .tp-lblv_l {
+  display: block; padding-right: 64px; padding-bottom: 1px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+/* box-sizing because the 20px right padding injectModButton sets here only
+   reserves space for the button if the cell is border-box; tweakpane doesn't
+   set it, so without this the column just grew and its contents ran under. */
+.tp-lblv_v { box-sizing: border-box; }
+.tp-lblv:has(.tp-sldtxtv) .tp-lblv_v { width: 100%; }
+.tp-lblv .tp-sldtxtv_s { flex: 1; }
+/* Value as plain text on the name line — no input chrome — with its right edge
+   flush against the end of the draggable track. Positioned against the ROW, so
+   it sits on the top line rather than over the slider. */
+.tp-lblv .tp-sldtxtv_t {
+  position: absolute; top: 0; right: 0; width: 62px; height: 15px; margin: 0;
+  display: flex; align-items: center; pointer-events: none;
+}
+/* Rows carrying a ∿ button end their track 20px early; match that. */
+.tp-lblv.has-mod .tp-sldtxtv_t { right: 20px; }
+.tp-lblv .tp-sldtxtv_t .tp-txtv { width: 100%; pointer-events: auto; }
+.tp-lblv .tp-sldtxtv_t .tp-txtv_i {
+  height: 15px; padding: 0; text-align: right; font-size: 10px;
+  background: transparent; box-shadow: none; border-radius: 0;
+}
+/* Sits on the slider line, not centered across both lines. */
 .mod-btn {
-  position: absolute; right: 2px; top: 50%; transform: translateY(-50%);
+  position: absolute; right: 2px; bottom: 2px;
   width: 16px; height: 16px; padding: 0; line-height: 14px;
   font-size: 12px; text-align: center;
   background: #2a2a2a; color: #888; border: 1px solid #444; border-radius: 3px;

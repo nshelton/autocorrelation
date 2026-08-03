@@ -6,16 +6,8 @@ import {
   Color,
   InstancedBufferAttribute,
 } from "three";
-import { MeshBasicNodeMaterial } from "three/webgpu";
-import {
-  vec3,
-  vec4,
-  float,
-  dot,
-  max,
-  normalWorld,
-  instancedBufferAttribute,
-} from "three/tsl";
+import { MeshLambertNodeMaterial } from "three/webgpu";
+import { vec3, vec4, instancedBufferAttribute } from "three/tsl";
 import RAPIER from "@dimforge/rapier3d-compat";
 import { createCurlNoise } from "../curl-noise";
 import { getPhysicsWorld } from "./physics";
@@ -119,13 +111,12 @@ export class ParticleView implements Component {
     // Visible attractor sphere — non-instanced single Mesh at fixed position.
     // Geometry is unit radius; mesh.scale carries the actual radius so the
     // attractorRadius hot-sweep is a single scale update, no geometry rebuild.
-    const aMat = new MeshBasicNodeMaterial();
-    const aLightDir = vec3(0.408, 0.866, 0.306);
-    const aNdotl = max(dot(normalWorld, aLightDir), float(0.0));
-    const aLit = aNdotl.mul(0.7).add(0.3);
-    aMat.colorNode = vec4(vec3(1.0, 0.6, 0.2).mul(aLit), 1.0);
+    const aMat = new MeshLambertNodeMaterial();
+    aMat.colorNode = vec4(vec3(1.0, 0.6, 0.2), 1.0);
     const aGeom = new IcosahedronGeometry(1, 2);
     const aMesh = new Mesh(aGeom, aMat);
+    aMesh.castShadow = true;
+    aMesh.receiveShadow = true;
     aMesh.position.set(ATTRACTOR_POSITION.x, ATTRACTOR_POSITION.y, ATTRACTOR_POSITION.z);
     aMesh.scale.setScalar(this.params.attractorRadius);
     this.attractorMesh = aMesh;
@@ -165,15 +156,14 @@ export class ParticleView implements Component {
     for (let i = 0; i < n; i++) tmpColor.toArray(colorArr, i * 3);
     const colorAttr = new InstancedBufferAttribute(colorArr, 3);
 
-    const mat = new MeshBasicNodeMaterial();
+    const mat = new MeshLambertNodeMaterial();
     const instColor = vec3(instancedBufferAttribute(colorAttr, "vec3", 3, 0));
-    const lightDir = vec3(0.408, 0.866, 0.306);
-    const ndotl = max(dot(normalWorld, lightDir), float(0.0));
-    const lit = ndotl.mul(0.7).add(0.3);
-    mat.colorNode = vec4(instColor.mul(lit), 1.0);
+    mat.colorNode = vec4(instColor, 1.0);
 
     const geom = new IcosahedronGeometry(BASE_RADIUS, 1);
     const mesh = new InstancedMesh(geom, mat, n);
+    mesh.castShadow = true;
+    mesh.receiveShadow = true;
     this.mesh = mesh;
     this.scene.add(mesh);
   }
@@ -182,7 +172,7 @@ export class ParticleView implements Component {
     if (!this.mesh) return;
     this.scene.remove(this.mesh);
     this.mesh.geometry.dispose();
-    (this.mesh.material as MeshBasicNodeMaterial).dispose();
+    (this.mesh.material as MeshLambertNodeMaterial).dispose();
     this.mesh.dispose();
     this.mesh = null;
   }
@@ -418,7 +408,7 @@ export class ParticleView implements Component {
     if (this.attractorMesh) {
       this.scene.remove(this.attractorMesh);
       this.attractorMesh.geometry.dispose();
-      (this.attractorMesh.material as MeshBasicNodeMaterial).dispose();
+      (this.attractorMesh.material as MeshLambertNodeMaterial).dispose();
       this.attractorMesh = null;
     }
     // Shared world: remove our own bodies (colliders ride along), never free

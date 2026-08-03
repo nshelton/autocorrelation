@@ -1,20 +1,17 @@
-import type { ButtonApi, FolderApi } from "tweakpane";
+import type { FolderApi } from "tweakpane";
 import type { PresetScope, PresetStore } from "./PresetStore";
 import { persistFold } from "./foldState";
 
 // Collapsible "Presets" folder appended to the bottom of a module's section.
-// Same shape for every module — components, Camera, Post — the only per-module
-// input is `scope` (which param prefixes the module owns). Contents:
+// Same shape for every module — components, Camera, Post, Physics — the only
+// per-module input is `scope` (which param prefixes the module owns):
 //
-//   preset   swirly *      ← current name, "*" while edited
-//   ● swirly               ← one button per saved preset; click loads it
-//     chaos
-//   save                   ← overwrite current (or name one if there's none)
-//   + new preset           ← name dialog, saves a new one
-//   delete                 ← drop the current preset
+//   [ swirly ][ chaos  ]   ← half-width chips, two per row; click to load
+//   [ dense  ]                 white = loaded, gray = loaded + edited, black = not loaded
+//   [ 💾 ][ + ][ 🗑 ]        ← overwrite / new / delete, one row
 //
-// The button list is rebuilt from scratch whenever the store changes; there's
-// no incremental blade bookkeeping to get wrong.
+// Raw DOM rather than tweakpane blades: blades are full-width rows, which is
+// what made this section taller than the params it belongs to.
 export function addPresetSection(
   parent: FolderApi,
   presets: PresetStore,
@@ -22,63 +19,84 @@ export function addPresetSection(
 ): { dispose(): void } {
   const folder = parent.addFolder({ title: "Presets", expanded: false });
   persistFold(folder, `presets:${scope.id}`);
+  ensureCss();
 
-  // Polled by tweakpane (readonly monitor) rather than pushed, so slider drags
-  // flip the "*" without every param write touching this section.
-  const status = {
-    get value(): string {
-      const name = presets.current(scope);
-      if (!name) return "(none)";
-      return presets.isDirty(scope) ? `${name} *` : name;
-    },
-  };
+  const content = folder.element.querySelector<HTMLElement>(".tp-fldv_c") ?? folder.element;
+  const grid = document.createElement("div");
+  grid.className = "pset-grid";
+  const actions = document.createElement("div");
+  actions.className = "pset-actions";
+  content.append(grid, actions);
+
+  const saveBtn = iconButton(ICON_SAVE, "save", "overwrite the loaded preset");
+  const newBtn = iconButton(ICON_PLUS, "new preset", "save as a new preset");
+  const delBtn = iconButton(ICON_TRASH, "delete", "delete the loaded preset");
+  actions.append(saveBtn, newBtn, delBtn);
+
+  saveBtn.addEventListener("click", () => {
+    const name = presets.current(scope);
+    if (name) presets.save(scope, name);
+    else promptName(newBtn, (n) => presets.save(scope, n));
+  });
+  newBtn.addEventListener("click", () => promptName(newBtn, (n) => presets.save(scope, n)));
+  delBtn.addEventListener("click", () => {
+    const name = presets.current(scope);
+    if (name) presets.remove(scope, name);
+  });
+
+  let chips: Array<{ el: HTMLButtonElement; name: string }> = [];
 
   const rebuild = () => {
-    for (const child of [...folder.children]) child.dispose();
+    grid.textContent = "";
+    chips = presets.list(scope).map((preset) => {
+      const el = document.createElement("button");
+      el.type = "button";
+      el.className = "pset-chip";
+      el.textContent = preset.name;
+      el.title = preset.name;
+      el.addEventListener("click", () => presets.apply(scope, preset.name));
+      grid.appendChild(el);
+      return { el, name: preset.name };
+    });
+    paint();
+  };
 
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    folder.addBinding(status, "value", {
-      label: "preset",
-      readonly: true,
-      interval: 200,
-    } as any);
-
+  // Fill encodes the state: white = this preset is loaded and matches the live
+  // params, gray = loaded but edited since, black = not loaded.
+  const paint = () => {
     const current = presets.current(scope);
-    for (const preset of presets.list(scope)) {
-      const active = preset.name === current;
-      const b = folder.addButton({ title: active ? `● ${preset.name}` : preset.name });
-      b.on("click", () => presets.apply(scope, preset.name));
+    const dirty = current !== null && presets.isDirty(scope);
+    for (const chip of chips) {
+      const isCurrent = chip.name === current;
+      chip.el.classList.toggle("current", isCurrent && !dirty);
+      chip.el.classList.toggle("dirty", isCurrent && dirty);
     }
-
-    const saveBtn = folder.addButton({ title: "save" });
-    saveBtn.on("click", () => {
-      const name = presets.current(scope);
-      if (name) presets.save(scope, name);
-      else promptName(saveBtn, (n) => presets.save(scope, n));
-    });
-
-    const newBtn = folder.addButton({ title: "+ new preset" });
-    newBtn.on("click", () => promptName(newBtn, (n) => presets.save(scope, n)));
-
-    const delBtn = folder.addButton({ title: "delete" });
     delBtn.disabled = current === null;
-    delBtn.on("click", () => {
-      const name = presets.current(scope);
-      if (name) presets.remove(scope, name);
-    });
   };
 
   rebuild();
-  // Deferred: the store emits from inside a button's own click handler, and
-  // rebuild() disposes that button.
-  const unsub = presets.subscribe((s) => {
-    if (s === scope.id) queueMicrotask(rebuild);
+  // Dirty can flip on any param write anywhere in the scope, and ParamStore has
+  // no aggregate change event — poll, like the tweakpane monitor this replaced.
+  const timer = setInterval(paint, 200);
+  // Deferred: the store emits from inside a chip's own click handler, and
+  // rebuild() replaces the chip that is mid-dispatch.
+  const unsub = presets.subscribe((id) => {
+    if (id === scope.id) queueMicrotask(rebuild);
   });
 
-  return { dispose: unsub };
+  return {
+    dispose: () => {
+      unsub();
+      clearInterval(timer);
+      grid.remove();
+      actions.remove();
+    },
+  };
 }
 
-function promptName(anchor: ButtonApi, onOk: (name: string) => void): void {
+// Small floating name input anchored under a button. Shared with the
+// system-preset grid.
+export function promptName(anchor: HTMLElement, onOk: (name: string) => void): void {
   ensureCss();
   const root = document.createElement("div");
   root.className = "preset-prompt gui-el";
@@ -119,11 +137,35 @@ function promptName(anchor: ButtonApi, onOk: (name: string) => void): void {
     else if (e.key === "Escape") close();
   });
 
-  const r = anchor.element.getBoundingClientRect();
+  const r = anchor.getBoundingClientRect();
   root.style.left = `${Math.min(r.left, window.innerWidth - root.offsetWidth - 4)}px`;
   root.style.top = `${Math.min(r.bottom + 2, window.innerHeight - root.offsetHeight - 4)}px`;
   input.focus();
 }
+
+function iconButton(svg: string, name: string, tip: string): HTMLButtonElement {
+  const b = document.createElement("button");
+  b.type = "button";
+  b.className = "pset-icon";
+  b.title = tip;
+  // Queried by name in tests and useful for assistive tech — the label itself
+  // is never painted (the SVG is).
+  b.setAttribute("aria-label", name);
+  b.innerHTML = svg;
+  return b;
+}
+
+// Inline SVG rather than glyphs or emoji: renders identically everywhere and
+// inherits currentColor for the hover state.
+const ICON_SAVE =
+  '<svg viewBox="0 0 16 16" width="11" height="11" fill="none" stroke="currentColor" stroke-width="1.2">' +
+  '<path d="M2.6 2.6h8.2l2.6 2.6v8.2H2.6z"/><path d="M5.4 2.6v4h4.4v-4"/><path d="M5 13.4V9.4h6v4"/></svg>';
+const ICON_PLUS =
+  '<svg viewBox="0 0 16 16" width="11" height="11" fill="none" stroke="currentColor" stroke-width="1.6">' +
+  '<path d="M8 3.2v9.6M3.2 8h9.6"/></svg>';
+const ICON_TRASH =
+  '<svg viewBox="0 0 16 16" width="11" height="11" fill="none" stroke="currentColor" stroke-width="1.2">' +
+  '<path d="M2.8 4.4h10.4"/><path d="M6.4 4.4V2.6h3.2v1.8"/><path d="M4.4 4.4l.6 9h6l.6-9"/></svg>';
 
 let cssInjected = false;
 function ensureCss(): void {
@@ -131,6 +173,29 @@ function ensureCss(): void {
   cssInjected = true;
   const style = document.createElement("style");
   style.textContent = `
+.pset-grid {
+  display: grid; grid-template-columns: 1fr 1fr; gap: 2px; padding: 2px 4px 0;
+}
+.pset-chip {
+  padding: 1px 4px; min-width: 0; cursor: pointer;
+  font: 10px/14px system-ui, sans-serif; text-align: left;
+  color: #bbb; background: #000; border: 1px solid #3a3a3a; border-radius: 2px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.pset-chip:hover { border-color: #777; color: #fff; }
+/* Loaded and unmodified. */
+.pset-chip.current { background: #fff; color: #111; border-color: #fff; }
+/* Loaded, but the live params have drifted from it. */
+.pset-chip.dirty { background: #888; color: #111; border-color: #888; }
+.pset-actions { display: flex; gap: 2px; padding: 3px 4px 4px; }
+.pset-icon {
+  flex: 1; height: 16px; padding: 0; cursor: pointer;
+  display: flex; align-items: center; justify-content: center;
+  color: #999; background: #2a2a2a; border: 1px solid #444; border-radius: 2px;
+}
+.pset-icon:hover { color: #fff; border-color: #777; }
+.pset-icon:disabled { opacity: 0.35; cursor: default; }
+.pset-icon:disabled:hover { color: #999; border-color: #444; }
 .preset-prompt {
   position: fixed; z-index: 1001; width: 180px; padding: 6px;
   background: #1c1c1c; border: 1px solid #444; border-radius: 4px;

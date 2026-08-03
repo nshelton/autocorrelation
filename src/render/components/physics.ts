@@ -38,3 +38,9 @@ export function stepPhysics(timescale: number, gravityY: number): void {
   if (world.gravity.y !== gravityY) world.gravity = { x: 0, y: gravityY, z: 0 };
   world.step();
 }
+
+export function physicsStats(): { bodies: number; colliders: number } {
+  return world
+    ? { bodies: world.bodies.len(), colliders: world.colliders.len() }
+    : { bodies: 0, colliders: 0 };
+}

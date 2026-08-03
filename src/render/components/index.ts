@@ -4,6 +4,7 @@ import { ParticleView } from "./ParticleView";
 import { OrbitalCloud } from "./OrbitalCloud";
 import { OrbitalVolume } from "./OrbitalVolume";
 import { Spawner } from "./Spawner";
+import { Serpent } from "./Serpent";
 import { Grid } from "./Grid";
 import type { ComponentClass } from "./Component";
 
@@ -16,5 +17,6 @@ export const COMPONENTS: readonly ComponentClass[] = [
   OrbitalCloud as unknown as ComponentClass,
   OrbitalVolume as unknown as ComponentClass,
   Spawner as unknown as ComponentClass,
+  Serpent as unknown as ComponentClass,
   Grid as unknown as ComponentClass,
 ];

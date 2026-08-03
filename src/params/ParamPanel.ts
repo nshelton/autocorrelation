@@ -9,6 +9,8 @@ import { persistFold } from "./foldState";
 // spreads across the top instead of growing into one very long column. Each
 // column scrolls independently if it gets tall.
 export class ParamPanel {
+  // Far-left box. App injects the system-preset thumbnail grid here.
+  public system: FolderApi;
   public scenes: FolderApi;
   public camera: FolderApi;
   public post: FolderApi;
@@ -36,6 +38,7 @@ export class ParamPanel {
     // presentation control, registered for persistence but built as a plain
     // binding (no audio-mod button). Press 'h' to hide the GUI entirely.
     const system = firstPane.addFolder({ title: "System", expanded: true });
+    this.system = system;
     persistFold(system, "System");
     store.register({
       key: "system.guiTransparency",

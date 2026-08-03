@@ -19,10 +19,6 @@ const RATE: ParamSchema = {
 
 const SPAWNER: PresetScope = { id: "spawner", prefixes: ["spawner"] };
 
-function buttonTitles(el: HTMLElement): string[] {
-  return [...el.querySelectorAll("button")].map((b) => b.textContent?.trim() ?? "");
-}
-
 describe("addPresetSection", () => {
   let container: HTMLElement;
   let pane: Pane;
@@ -49,56 +45,74 @@ describe("addPresetSection", () => {
     return { store, presets, folder, section };
   }
 
-  it("renders the action buttons and no preset entries when empty", () => {
-    const { folder } = setup();
-    // "Spawner" is the parent folder's own title bar button.
-    const titles = buttonTitles(folder.element);
-    expect(titles).toEqual(["Spawner", "Presets", "save", "+ new preset", "delete"]);
+  const chips = () => [...container.querySelectorAll<HTMLElement>(".pset-chip")];
+  const icon = (name: string) =>
+    container.querySelector<HTMLButtonElement>(`.pset-icon[aria-label="${name}"]`)!;
+
+  it("renders the three icon actions on one row and no chips when empty", () => {
+    setup();
+    const row = container.querySelector(".pset-actions")!;
+    expect([...row.querySelectorAll("button")].map((b) => b.getAttribute("aria-label"))).toEqual([
+      "save",
+      "new preset",
+      "delete",
+    ]);
+    expect(chips()).toHaveLength(0);
+    expect(icon("delete").disabled).toBe(true);
   });
 
-  it("lists saved presets and marks the current one", async () => {
-    const { presets, folder } = setup();
-    presets.save(SPAWNER, "fast");
-    await Promise.resolve(); // rebuild is deferred to a microtask
+  it("shows one chip per preset, white for the loaded one", async () => {
+    const { presets } = setup();
+    presets.save(SPAWNER, "one");
+    presets.save(SPAWNER, "two");
+    await Promise.resolve();
 
-    expect(buttonTitles(folder.element)).toContain("● fast");
+    expect(chips().map((c) => c.textContent)).toEqual(["one", "two"]);
+    expect(chips()[0].className).not.toContain("current");
+    expect(chips()[1].className).toContain("current");
+    expect(chips()[1].className).not.toContain("dirty");
   });
 
-  it("loads a preset when its button is clicked", async () => {
-    const { store, presets, folder } = setup();
+  it("marks the loaded chip dirty once params drift", async () => {
+    const { store, presets, section } = setup();
+    presets.save(SPAWNER, "one");
+    await Promise.resolve();
+    expect(chips()[0].className).toContain("current");
+
+    store.set("spawner.rate", 5);
+    // paint() is polled; drive it directly rather than waiting on the timer.
+    await new Promise((r) => setTimeout(r, 250));
+    expect(chips()[0].className).toContain("dirty");
+    expect(chips()[0].className).not.toContain("current");
+    section.dispose();
+  });
+
+  it("loads a preset when its chip is clicked", async () => {
+    const { store, presets } = setup();
     presets.save(SPAWNER, "one");
     store.set("spawner.rate", 8);
     presets.save(SPAWNER, "two");
     await Promise.resolve();
 
-    const one = [...folder.element.querySelectorAll("button")].find(
-      (b) => b.textContent?.trim() === "one",
-    );
-    one!.click();
+    chips()[0].click();
     expect(store.get("spawner.rate")).toBe(1);
     expect(presets.current(SPAWNER)).toBe("one");
   });
 
-  it("save overwrites the current preset in place", async () => {
-    const { store, presets, folder } = setup();
+  it("save overwrites the loaded preset in place", async () => {
+    const { store, presets } = setup();
     presets.save(SPAWNER, "one");
     store.set("spawner.rate", 5);
     await Promise.resolve();
 
-    const save = [...folder.element.querySelectorAll("button")].find(
-      (b) => b.textContent?.trim() === "save",
-    );
-    save!.click();
+    icon("save").click();
     expect(presets.list(SPAWNER)).toHaveLength(1);
     expect(presets.isDirty(SPAWNER)).toBe(false);
   });
 
-  it("+ new preset opens a name dialog that saves on Enter", async () => {
-    const { presets, folder } = setup();
-    const add = [...folder.element.querySelectorAll("button")].find(
-      (b) => b.textContent?.trim() === "+ new preset",
-    );
-    add!.click();
+  it("the + icon opens a name dialog that saves on Enter", async () => {
+    const { presets } = setup();
+    icon("new preset").click();
 
     const input = document.querySelector<HTMLInputElement>(".preset-prompt input");
     expect(input).not.toBeNull();
@@ -108,20 +122,23 @@ describe("addPresetSection", () => {
     expect(presets.list(SPAWNER).map((p) => p.name)).toEqual(["swirly"]);
     expect(document.querySelector(".preset-prompt")).toBeNull();
     await Promise.resolve();
-    expect(buttonTitles(folder.element)).toContain("● swirly");
+    expect(chips().map((c) => c.textContent)).toEqual(["swirly"]);
   });
 
-  it("delete is disabled with no current preset and removes it otherwise", async () => {
-    const { presets, folder } = setup();
-    const del = () =>
-      [...folder.element.querySelectorAll("button")].find(
-        (b) => b.textContent?.trim() === "delete",
-      )!;
-    expect(del().disabled).toBe(true);
-
+  it("the trash icon deletes the loaded preset", async () => {
+    const { presets } = setup();
     presets.save(SPAWNER, "one");
     await Promise.resolve();
-    del().click();
+    icon("delete").click();
     expect(presets.list(SPAWNER)).toHaveLength(0);
+  });
+
+  it("dispose stops the dirty poll and removes the DOM", async () => {
+    const { presets, section } = setup();
+    presets.save(SPAWNER, "one");
+    await Promise.resolve();
+    section.dispose();
+    expect(container.querySelector(".pset-grid")).toBeNull();
+    expect(container.querySelector(".pset-actions")).toBeNull();
   });
 });

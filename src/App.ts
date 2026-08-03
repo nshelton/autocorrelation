@@ -1,14 +1,15 @@
-import { DirectionalLight, Scene, Vector3 } from "three";
+import { AmbientLight, DirectionalLight, Scene, Vector3 } from "three";
 import { createSceneAndCamera } from "./render/Scene";
 import { CameraRig } from "./render/CameraRig";
 import { PostStack } from "./render/post/PostStack";
 import { buildPostEffects } from "./render/post";
 import { FeatureStore } from "./store/FeatureStore";
-import { FpsOverlay } from "./ui/Stats";
 import { PerfOverlay } from "./ui/PerfOverlay";
 import { ComponentManager } from "./render/components/ComponentManager";
 import { COMPONENTS } from "./render/components";
-import { stepPhysics } from "./render/components/physics";
+import { stepPhysics, physicsStats } from "./render/components/physics";
+import { snapshotCanvas } from "./render/thumbnail";
+import { addSystemPresets } from "./params/SystemPresets";
 import { shTween } from "./render/orbital/ShTween";
 
 import { Modulator } from "./params/Modulator";
@@ -71,7 +72,6 @@ export class App {
   private rig!: CameraRig;
   private store = new FeatureStore();
   private last = 0;
-  private fps = new FpsOverlay();
   private perf = new PerfOverlay();
   private rafHandle: number | null = null;
   private keydownHandler: (e: KeyboardEvent) => void = () => {};
@@ -84,6 +84,8 @@ export class App {
   // are owned by ComponentManager.
   private presetSections: Array<{ dispose(): void }> = [];
   private cameraUnsub: (() => void) | null = null;
+  // Set by captureThumbnail(); the RAF loop resolves it after the next frame.
+  private thumbRequest: ((dataUrl: string) => void) | null = null;
   private directionalLight!: DirectionalLight;
   private scene!: Scene;
 
@@ -95,14 +97,32 @@ export class App {
     const { scene, camera } = createSceneAndCamera();
     this.scene = scene;
 
-    // Direction matches OrbitalCloud's previous hardcoded lightDir so when
-    // its cube/splat modes eventually consume this uniform their look stays
+    // Direction matches the lightDir the component materials hardcoded before
+    // they went lit: 0.7 directional + 0.3 ambient reproduces the old
+    // hand-rolled `ndotl*0.7 + 0.3` lambert exactly, so the look is
     // continuous. Toggle adds/removes from scene in the bindCameraUI handler.
-    this.directionalLight = new DirectionalLight(0xffffff, 1.0);
+    this.directionalLight = new DirectionalLight(0xffffff, 0.7);
     this.directionalLight.position.set(4.08, 8.66, 3.06);
+    this.directionalLight.castShadow = true;
+    const shadow = this.directionalLight.shadow;
+    shadow.mapSize.set(2048, 2048);
+    // Ortho box sized to the play area (CONTAINER_HALF/zone scale ~ a few
+    // units); light sits ~10 out, so [1, 25] brackets the scene depth.
+    shadow.camera.near = 1;
+    shadow.camera.far = 25;
+    shadow.camera.left = -5;
+    shadow.camera.right = 5;
+    shadow.camera.top = 5;
+    shadow.camera.bottom = -5;
+    // Curved instanced surfaces (spheres, capsules) acne under plain depth
+    // bias; normal bias pushes samples along the surface normal instead.
+    shadow.normalBias = 0.02;
     if (paramStore.get("light.directional.enabled") as boolean) {
       scene.add(this.directionalLight);
     }
+    // Always on — the lit materials' shadow/ambient floor. Without it,
+    // toggling the directional light off would black out every lit mesh.
+    scene.add(new AmbientLight(0xffffff, 0.3));
 
     this.components = new ComponentManager(
       {
@@ -157,7 +177,6 @@ export class App {
       saveCameraPose(this.rig.getPose());
     });
 
-    this.fps.mount();
     this.perf.mount();
 
     let toggled = false;
@@ -209,7 +228,6 @@ export class App {
     };
 
     const loop = (now: number) => {
-      this.fps.begin();
       const dt = this.last === 0 ? 0 : (now - this.last) / 1000;
       this.last = now;
 
@@ -228,28 +246,42 @@ export class App {
       const t1 = performance.now();
       shTween.tick(dt, this.deps.paramStore);
       this.modulator.tick();
+      const t2 = performance.now();
       // Single step for the shared world, before any component reads a body
       // transform. Components never step it themselves.
       stepPhysics(
         paramStore.get("physics.timescale") as number,
         -(paramStore.get("physics.gravity") as number),
       );
-      this.components.update();
-      const t2 = performance.now();
-      void this.postStack.renderAsync();
       const t3 = performance.now();
+      this.components.update();
+      const t4 = performance.now();
+      const frame = this.postStack.renderAsync();
+      // A WebGPU canvas keeps no preserved drawing buffer, so a thumbnail has
+      // to be read right after the frame lands — not whenever the button was
+      // clicked, which would sample a black canvas.
+      const pending = this.thumbRequest;
+      if (pending) {
+        this.thumbRequest = null;
+        void frame.then(() => pending(snapshotCanvas(renderer.domElement)));
+      }
+      const t5 = performance.now();
 
       const dsp = this.store.get("dspPerf");
+      const phys = physicsStats();
       this.perf.sample({
+        fps: dt > 0 ? 1 / dt : NaN,
         cameraMs: t1 - t0,
-        componentsMs: t2 - t1,
-        submitMs: t3 - t2,
+        physicsMs: t3 - t2,
+        componentsMs: t2 - t1 + (t4 - t3),
+        submitMs: t5 - t4,
         analysisMs: dsp.length > 0 ? dsp[0] : NaN,
         analysisHz: dsp.length > 1 ? dsp[1] : NaN,
+        bodies: phys.bodies,
+        colliders: phys.colliders,
         now,
       });
 
-      this.fps.end();
       this.rafHandle = requestAnimationFrame(loop);
     };
     this.rafHandle = requestAnimationFrame(loop);
@@ -279,6 +311,21 @@ export class App {
     );
 
     this.components.bindUI(parent, this.modulator, this.presets);
+  }
+
+  // System presets: every param and every modulation in one snapshot, with a
+  // thumbnail of the scene. Lives in the far-left System box.
+  bindSystemUI(folder: FolderApi): void {
+    this.presetSections.push(
+      addSystemPresets(folder, this.presets, () => this.captureThumbnail()),
+    );
+  }
+
+  // Resolves with a JPEG data URL of the scene after the next rendered frame.
+  captureThumbnail(): Promise<string> {
+    return new Promise((resolve) => {
+      this.thumbRequest = resolve;
+    });
   }
 
   bindPostUI(folder: FolderApi): void {
@@ -383,7 +430,6 @@ export class App {
     this.modulator?.dispose();
     this.postStack?.dispose();
     this.rig?.dispose();
-    this.fps.unmount();
     this.perf.unmount();
     this.cameraUnsub?.();
     this.cameraUnsub = null;

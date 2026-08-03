@@ -381,3 +381,64 @@ describe("Modulator", () => {
     expect(mod2.getTrigger(TRIG)).toEqual({ source: "beat.1x saw", threshold: 0.3 });
   });
 });
+
+describe("Modulator phase offset + flux source", () => {
+  beforeEach(() => localStorage.clear());
+
+  it("exposes spectral flux from the onset buffer", () => {
+    const { features, mod } = setup();
+    features.set("onset", new Float32Array([0.1, 0.2, 0.75]));
+    expect(mod.readSource("onset.flux")).toBeCloseTo(0.75);
+  });
+
+  it("phase slides the saw within the beat and wraps", () => {
+    const { features, mod } = setup();
+    features.set("beatPulses", new Float32Array([0.25, 0, 0, 0]));
+    expect(mod.readSource("beat.1x saw", 0)).toBeCloseTo(0.25);
+    expect(mod.readSource("beat.1x saw", 0.5)).toBeCloseTo(0.75);
+    // 0.25 + 0.9 = 1.15 -> wraps to 0.15, never leaves 0..1.
+    expect(mod.readSource("beat.1x saw", 0.9)).toBeCloseTo(0.15);
+    expect(mod.readSource("beat.1x saw", 1)).toBeCloseTo(0.25);
+  });
+
+  it("phase shifts the sin source", () => {
+    const { features, mod } = setup();
+    features.set("beatPulses", new Float32Array([0, 0, 0, 0]));
+    expect(mod.readSource("beat.1x sin", 0)).toBeCloseTo(0.5);
+    expect(mod.readSource("beat.1x sin", 0.25)).toBeCloseTo(1.0);
+    expect(mod.readSource("beat.1x sin", 0.75)).toBeCloseTo(0.0);
+  });
+
+  it("level sources ignore phase", () => {
+    const { features, mod } = setup();
+    features.set("rmsLow", new Float32Array([0.4]));
+    expect(mod.readSource("rms.low", 0.37)).toBeCloseTo(0.4);
+  });
+
+  it("a NaN beat phase still reads as 0 with an offset applied", () => {
+    const { features, mod } = setup();
+    features.set("beatPulses", new Float32Array([NaN, NaN, NaN, NaN]));
+    expect(mod.readSource("beat.1x saw", 0.3)).toBe(0);
+    expect(mod.readSource("beat.1x sin", 0.3)).toBe(0);
+  });
+
+  it("tick() drives a param through the phase-offset saw", () => {
+    const { store, features, mod } = setup();
+    features.set("beatPulses", new Float32Array([0.5, 0, 0, 0]));
+    mod.setBinding("camera.fov", { source: "beat.1x saw", lo: 0, hi: 100, phase: 0.25 });
+    const seen: number[] = [];
+    store.subscribe((k, v) => { if (k === "camera.fov") seen.push(v as number); });
+    mod.tick();
+    // 0.5 + 0.25 = 0.75 of the 0..100 range.
+    expect(seen.at(-1)).toBeCloseTo(75);
+  });
+
+  it("persists phase across a reload", () => {
+    const { store, features, mod } = setup();
+    mod.setBinding("camera.fov", { source: "beat.1x sin", phase: 0.4 });
+    mod.setTrigger("btn.x", { source: "onset.flux", threshold: 0.5, phase: 0.1 });
+    const reloaded = new Modulator(store, features);
+    expect(reloaded.getBinding("camera.fov")?.phase).toBe(0.4);
+    expect(reloaded.getTrigger("btn.x")?.phase).toBe(0.1);
+  });
+});

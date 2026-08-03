@@ -8,6 +8,8 @@ import type { ModBinding, Modulator, TriggerBinding } from "./Modulator";
 // components: loading a preset shouldn't toggle the module on or off.
 export interface PresetScope {
   id: string;
+  // EMPTY = the whole system: every registered param and every modulation,
+  // component enable flags included. That's the system-preset scope.
   prefixes: string[];
 }
 
@@ -16,6 +18,10 @@ export interface Preset {
   params: Record<string, ParamValue>;
   mods: Record<string, ModBinding>;
   triggers: Record<string, TriggerBinding>;
+  // Small JPEG data URL of the scene at save time. System presets only —
+  // module presets carry no image. Kept tiny (see render/thumbnail.ts)
+  // because every preset shares one localStorage key.
+  thumb?: string;
 }
 
 type ScopeState = { current: string | null; list: Preset[] };
@@ -43,10 +49,11 @@ export class PresetStore {
 
   // Overwrites the preset of the same name, otherwise appends. Either way the
   // saved preset becomes current, so the UI immediately reads back clean.
-  save(scope: PresetScope, name: string): void {
+  save(scope: PresetScope, name: string, thumb?: string): void {
     const st = this.state(scope.id);
-    const preset: Preset = { name, ...this.capture(scope) };
     const i = st.list.findIndex((p) => p.name === name);
+    // Overwriting without a fresh capture keeps the existing image.
+    const preset: Preset = { name, ...this.capture(scope), thumb: thumb ?? st.list[i]?.thumb };
     if (i >= 0) st.list[i] = preset;
     else st.list.push(preset);
     st.current = name;
@@ -168,13 +175,17 @@ export class PresetStore {
   private persist(): void {
     try {
       localStorage.setItem(STORAGE_KEY, JSON.stringify(Object.fromEntries(this.scopes)));
-    } catch {
-      // localStorage unavailable; presets stay in-memory for the session
+    } catch (e) {
+      // Unavailable or over quota (thumbnails are the bulk of it) — the preset
+      // lives for this session only. Loud, because silently losing a save the
+      // user just made looks like the feature is broken.
+      console.warn("PresetStore: could not persist presets", e);
     }
   }
 }
 
 function inScope(scope: PresetScope, key: string): boolean {
+  if (scope.prefixes.length === 0) return true; // whole-system scope
   return scope.prefixes.some((p) => key.startsWith(`${p}.`));
 }
 
